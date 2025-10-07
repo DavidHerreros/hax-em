@@ -106,10 +106,11 @@ class Server:
 
         # Load model
         if "server_functions_path" in self.metadata and self.mode != "FromFiles":
-            self.load_model = load_module_from_path(self.metadata["server_functions_path"], "load_model")
+            self.loaded_module = load_module_from_path(self.metadata["server_functions_path"], "loaded_module")
 
             # This function always takes kwargs as only input, and uses them to prepare a given program to decode states
-            self.model = self.load_model.prepare_heterogeneity_program(**self.metadata)
+            self.heterogeneity_program_interface = self.loaded_module.HeterogeneityProgramInterface(_path_template=self.outPath,
+                                                                                                    _program_loading_params=self.metadata)
 
     def generateMap(self, raw_msglen):
         msglen = struct.unpack('>I', raw_msglen)[0]
@@ -120,7 +121,7 @@ class Server:
             z = np.loadtxt(z_file)
             z = z[None, ...] if z.ndim == 1 else z
 
-            self.load_model.decode_state_from_latent(z, self.model, self.outPath)
+            self.heterogeneity_program_interface.decode_state_from_latent(latent=z)
         else:
             with open(z_file, 'r') as f:
                 volumesPaths = f.read().splitlines()

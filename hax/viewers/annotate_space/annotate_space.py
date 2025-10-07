@@ -1246,11 +1246,11 @@ def main():
                              "where that software is installed")
     parser.add_argument('--server_functions_path', type=str, required=False,
                         help=f"When parameter {bcolors.ITALIC}env_name{bcolors.ENDC} is provided, you must provide as well this parameter. Here, you must specify "
-                             f"a path to a Python {bcolors.ITALIC}.py{bcolors.ENDC} file containing two functions: {bcolors.ITALIC}prepare_heterogeneity_program{bcolors.ENDC} and "
-                             f"{bcolors.ITALIC}decode_state_from_latent{bcolors.ENDC}. These funcitons allows to setup and execute the heterogeneity method used to "
+                             f"a path to a Python {bcolors.ITALIC}.py{bcolors.ENDC} file containing a class with two methods: {bcolors.ITALIC}prepare_heterogeneity_program{bcolors.ENDC}"
+                             f" and {bcolors.ITALIC}decode_state_from_latent{bcolors.ENDC}. These funcitons allows to setup and execute the heterogeneity method used to "
                              f"estimate the landscape provided through {bcolors.ITALIC}z_space{bcolors.ENDC}, so that the viewer can generate conformations directly "
-                             f"from this method. An example on how these functions must be defined ca be found in this package source code available at: XXX "
-                             f"(path: {bcolors.ITALIC}hax/viewers/server_loading_functions/load_model.py{bcolors.ENDC}).")
+                             f"from this method. An example on how this class must be defined ca be found in this package source code available at: "
+                             f"{bcolors.ITALIC}hax/viewers/server_loading_functions/load_model.py{bcolors.ENDC}.")
     parser.add_argument('--volumes_path', type=str, required=False,
                         help=f"If {bcolors.ITALIC}env_name{bcolors.ENDC} is not provided, you can still visualize a set of pre-saved conformation using this parameter. Here "
                              f"you will pass a path to a {bcolors.ITALIC}.txt{bcolors.ENDC} file containing as many volume paths as points has the landscape provided in "
@@ -1263,9 +1263,9 @@ def main():
                                           f"input through {bcolors.ITALIC}server_functions_path{bcolors.ENDC}.")
 
     # We can pass any additional argument to the viewer so that it can be easily adapted to any software.
-    # In these cases, the parameter "server_functions_path" is MANDATORY, as it contains the path to two functions
+    # In these cases, the parameter "server_functions_path" is MANDATORY, as it contains the path to a class with two methods
     # "prepare_heterogeneity_program" and "decode_state_from_latent" needed by the viewer to load/generate states in real
-    # time for any method. The path MUST point always to a .py file containing the previous two functions
+    # time for any method. The path MUST point always to a .py file containing the previous class.
 
     def float_or_str(s):
         try:
