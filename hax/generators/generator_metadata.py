@@ -1,12 +1,19 @@
+import os
+import sys
+
 import numpy as np
 import random
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
 from jax import numpy as jnp
 from jax.tree_util import tree_map
 from xmipp_metadata.metadata import XmippMetaData
+from hax.utils.loggers import bcolors
 
 
 class MetaDataGenerator:
     def __init__(self, file, mode=None):
+        self.file = file
         self.md = XmippMetaData(file)
         self.mode = mode
 
@@ -26,7 +33,7 @@ class MetaDataGenerator:
         else:
             return self.md.getMetaDataImage(idx)[..., None], idx
 
-    def return_tf_dataset(self, preShuffle=False, shuffle=True, prefetch=5, batch_size=8):
+    def return_tf_dataset(self, preShuffle=False, shuffle=True, prefetch=-1, batch_size=8, mmap=True, mmap_output_dir=None):
         import tensorflow_datasets as tfds
         import tensorflow as tf
         tf.config.set_visible_devices([], device_type='GPU')
@@ -34,16 +41,87 @@ class MetaDataGenerator:
             file_idx = np.arange(len(self.md))
             if preShuffle:
                 np.random.shuffle(file_idx)
-            images = self.md.getMetaDataImage(file_idx)[..., None]
-            if self.mode == "tomo":
-                subtomo_labels = self.sinusoid_table[self.md[file_idx, "subtomo_labels"].astype(int) - 1]
-                dataset = tf.data.Dataset.from_tensor_slices(((images, subtomo_labels), (file_idx, file_idx)))
+            if mmap:
+                drop_reminder = True
+                from mmap_ninja import numpy as np_ninja
+
+                if mmap_output_dir is None:
+                    mmap_output_dir = os.path.join(os.path.dirname(self.file), "images_mmap")
+                else:
+                    mmap_output_dir = os.path.join(mmap_output_dir, "images_mmap")
+
+                if not os.path.isdir(mmap_output_dir):
+                    print(f"{bcolors.OKCYAN}\n###### Creating MMAP from images... ######")
+                    np_ninja.from_generator(
+                        out_dir=mmap_output_dir,
+                        sample_generator=map(self.md.getMetaDataImage, file_idx),
+                        batch_size=1024,
+                        verbose=True
+                    )
+                images = np_ninja.open_existing(mmap_output_dir)
+
+                def _load_image(idx):
+                    idx = idx.astype(np.int64)
+                    image = images[idx][..., None]
+                    if self.mode == "tomo":
+                        subtomo_label = self.sinusoid_table[self.md[idx, "subtomo_labels"].astype(int) - 1]
+                        return (image, subtomo_label), (idx, idx)
+                    else:
+                        return image, idx
+
+                def map_fn(i):
+                    if self.mode == "tomo":
+                        (image, subtomo_labels), (idx, idl) = tf.numpy_function(_load_image, [i], (tf.float32, tf.int64, tf.int64, tf.int64))
+                        image.set_shape((batch_size,) + images[0][..., None].shape)
+                        idx.set_shape([batch_size,])
+                        subtomo_labels.set_shape([batch_size,])
+                        idl.set_shape([batch_size,])
+                        return (image, subtomo_labels), (idx, idx)
+                    else:
+                        image, idx = tf.numpy_function(_load_image, [i], (tf.float32, tf.int64))
+                        image.set_shape((batch_size,) + images[0][..., None].shape)
+                        idx.set_shape([batch_size,])
+                        return image, idx
+
+                dataset = tf.data.Dataset.from_tensor_slices(file_idx)
             else:
-                dataset = tf.data.Dataset.from_tensor_slices((images, file_idx))
+                drop_reminder = False
+
+                def build_ram_slab(N, H, W, batch_size=4096, threads=16):
+                    X = np.empty((N, H, W), dtype=np.float32)
+
+                    def _ranges():
+                        for s in range(0, N, batch_size):
+                            e = min(s + batch_size, N)
+                            yield s, e, np.arange(s, e, dtype=np.int64)
+
+                    with ThreadPoolExecutor(max_workers=threads) as ex:
+                        futs = []
+                        for s, e, idx in _ranges():
+                            futs.append((s, e, ex.submit(self.md.getMetaDataImage, idx)))
+                        with tqdm(total=N, file=sys.stdout, ascii=" >=", colour="green") as pbar:
+                            for s, e, fut in futs:
+                                X[s:e] = fut.result()
+                                pbar.update(e - s)
+                    return X
+
+                print(f"{bcolors.OKCYAN}\n###### Loading images to RAM... ######")
+                H, W = self.md.getMetaDataImage(0).shape
+                images = build_ram_slab(len(self.md), H, W, batch_size=4096, threads=8)[..., None]
+                images = images[file_idx]  # Reorder according to preShuffle
+                if self.mode == "tomo":
+                    subtomo_labels = self.sinusoid_table[self.md[file_idx, "subtomo_labels"].astype(int) - 1]
+                    dataset = tf.data.Dataset.from_tensor_slices(((images, subtomo_labels), (file_idx, file_idx)))
+                else:
+                    dataset = tf.data.Dataset.from_tensor_slices((images, file_idx))
             if shuffle:
                 dataset = dataset.shuffle(len(file_idx))
-            # dataset = dataset.map(lambda image, label: (self.data_augmentation(image), label))
-            return tfds.as_numpy(dataset.batch(batch_size).prefetch(prefetch))
+            if prefetch == -1:
+                prefetch = tf.data.AUTOTUNE
+            dataset = dataset.batch(batch_size, drop_remainder=drop_reminder)
+            if mmap:
+                dataset = dataset.map(map_fn, num_parallel_calls=tf.data.AUTOTUNE, deterministic=False)
+            return tfds.as_numpy(dataset.prefetch(prefetch))
 
     def return_torch_dataset(self, shuffle=True, batch_size=8):
         from torch.utils.data import default_collate, DataLoader
