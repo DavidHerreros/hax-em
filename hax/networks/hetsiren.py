@@ -868,7 +868,7 @@ def main():
         data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False,
                                                   mmap=mmap, mmap_output_dir=mmap_output_dir)
 
-        # Jitted prediciton function
+        # Jitted prediction function
         predict_fn = jax.jit(hetsiren.__call__)
 
         # Predict loop
