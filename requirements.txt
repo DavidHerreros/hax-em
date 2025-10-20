@@ -25,3 +25,4 @@ python_tsp
 torch
 cuml-cu12==25.6.*
 umap-learn
+mmap_ninja
