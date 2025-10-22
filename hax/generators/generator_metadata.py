@@ -19,6 +19,7 @@ class MetaDataGenerator:
 
         # Generator mode
         if mode == "tomo" or self.md.isMetaDataLabel("subtomo_labels"):
+            self.mode = "tomo"
             unique_labels = np.unique(self.md[:, "subtomo_labels"]).astype(int)
             self.sinusoid_table = get_sinusoid_encoding_table(np.amax(unique_labels), 100)
         else:
