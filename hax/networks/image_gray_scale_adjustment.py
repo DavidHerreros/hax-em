@@ -313,7 +313,7 @@ def main():
         for idx in range(len(md)):
             image_id, _ = md["image"].split('@')
             md[idx, "image"] = "@".join([image_id, output_images_path])
-        md.write(os.path.join(args.output_path, "adjusted_images.xmd"))
+        md.write(os.path.join(args.output_path, "adjusted_images" +  os.path.splitext(args.md)[1]))
 
 if __name__ == "__main__":
     main()

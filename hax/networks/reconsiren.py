@@ -996,7 +996,7 @@ def main():
             md_pred[labels, 'shiftX'] = shifts[:, 0]
             md_pred[labels, 'shiftY'] = shifts[:, 1]
 
-        md_pred.write(os.path.join(args.output_path, "predicted_latents.xmd"))
+        md_pred.write(os.path.join(args.output_path, "predicted_pose_shifts" +  + os.path.splitext(args.md)[1]))
 
 if __name__ == "__main__":
     main()

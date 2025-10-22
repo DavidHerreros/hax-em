@@ -1010,7 +1010,7 @@ def main():
         # Save latents in metadata
         md = generator.md
         md[:, 'latent_space'] = np.asarray([",".join(item) for item in latents.astype(str)])
-        md.write(os.path.join(args.output_path, "predicted_latents.xmd"))
+        md.write(os.path.join(args.output_path, "predicted_latents" + os.path.splitext(args.md)[1]))
 
     # If exists, clean MMAP
     if mmap and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap")):
