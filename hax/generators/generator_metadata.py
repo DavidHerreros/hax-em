@@ -20,9 +20,9 @@ class MetaDataGenerator:
         # Generator mode
         if mode == "tomo" or self.md.isMetaDataLabel("subtomo_labels"):
             unique_labels = np.unique(self.md[:, "subtomo_labels"]).astype(int)
-            self.sinusoid_tabled = get_sinusoid_encoding_table(np.amax(unique_labels), 100)
+            self.sinusoid_table = get_sinusoid_encoding_table(np.amax(unique_labels), 100)
         else:
-            self.sinusoid_tabled = np.zeros(len(self.md))
+            self.sinusoid_table = np.zeros(len(self.md), dtype=np.float32)
 
     def __len__(self):
         return len(self.md)
@@ -101,18 +101,17 @@ class MetaDataGenerator:
                     image = images[idx][..., None]
                     if self.mode == "tomo":
                         subtomo_label = self.sinusoid_table[self.md[idx, "subtomo_labels"].astype(int) - 1]
-                        return (image, subtomo_label), (idx, idx)
+                        return image, subtomo_label, idx
                     else:
                         return image, idx
 
                 def map_fn(i):
                     if self.mode == "tomo":
-                        (image, subtomo_labels), (idx, idl) = tf.numpy_function(_load_image, [i], (tf.float32, tf.int64, tf.int64, tf.int64))
+                        (image, subtomo_labels, idx) = tf.numpy_function(_load_image, [i], (tf.float32, tf.float32, tf.int64))
                         image.set_shape((batch_size,) + images[0][..., None].shape)
                         idx.set_shape([batch_size,])
-                        subtomo_labels.set_shape([batch_size,])
-                        idl.set_shape([batch_size,])
-                        return (image, subtomo_labels), (idx, idx)
+                        subtomo_labels.set_shape([batch_size, 100])
+                        return (image, subtomo_labels), idx
                     else:
                         image, idx = tf.numpy_function(_load_image, [i], (tf.float32, tf.int64))
                         image.set_shape((batch_size,) + images[0][..., None].shape)
@@ -126,7 +125,7 @@ class MetaDataGenerator:
 
                 if self.mode == "tomo":
                     subtomo_labels = self.sinusoid_table[self.md[file_idx, "subtomo_labels"].astype(int) - 1]
-                    dataset = tf.data.Dataset.from_tensor_slices(((images, subtomo_labels), (file_idx, file_idx)))
+                    dataset = tf.data.Dataset.from_tensor_slices(((images, subtomo_labels), file_idx))
                 else:
                     dataset = tf.data.Dataset.from_tensor_slices((images, file_idx))
 
@@ -159,7 +158,11 @@ class MetaDataGenerator:
             drop_last = False
             images = self.load_images_to_ram(images_order=file_idx)
 
-        dataset = TensorDataset(torch.from_numpy(images), torch.from_numpy(file_idx))
+        if self.mode == "tomo":
+            subtomo_labels = self.sinusoid_table[self.md[file_idx, "subtomo_labels"].astype(int) - 1]
+            dataset = TensorDataset(torch.from_numpy(images), torch.from_numpy(subtomo_labels), torch.from_numpy(file_idx))
+        else:
+            dataset = TensorDataset(torch.from_numpy(images), torch.from_numpy(file_idx))
 
         def numpy_collate(batch):
             return tree_map(np.asarray, default_collate(batch))
@@ -207,8 +210,9 @@ class MetaDataGenerator:
             dataset = dataset.shuffle(seed=seed)
         return dataset.to_iter_dataset().batch(batch_size, drop_remainder=drop_remainder)
 
-def extract_columns(md, hasCTF=None):
+def extract_columns(md, hasCTF=None, isTomo=None):
     hasCTF = md.isMetaDataLabel("ctfDefocusU") if hasCTF is None else hasCTF
+    isTomo = md.isMetaDataLabel("subtomo_labels") if isTomo is None else isTomo
 
     columns = {}
     columns["euler_angles"] = jnp.array(md.getMetaDataColumns(["angleRot", "angleTilt", "anglePsi"]).astype(jnp.float32))
@@ -219,6 +223,8 @@ def extract_columns(md, hasCTF=None):
         columns["ctfDefocusAngle"] = jnp.array(md.getMetaDataColumns("ctfDefocusAngle").astype(jnp.float32))
         columns["ctfSphericalAberration"] = jnp.array(md.getMetaDataColumns("ctfSphericalAberration").astype(jnp.float32))
         columns["ctfVoltage"] = jnp.array(md.getMetaDataColumns("ctfVoltage").astype(jnp.float32))
+    if isTomo:
+        columns["subtomo_labels"] = jnp.array(md.getMetaDataColumns("subtomo_labels").astype(jnp.float32))
     return columns
 
 
@@ -248,4 +254,4 @@ def get_sinusoid_encoding_table(n_position, d_hid, padding_idx=None):
         # zero vector for padding dimension
         sinusoid_table[padding_idx] = 0.
 
-    return sinusoid_table
+    return sinusoid_table.astype(np.float32)
