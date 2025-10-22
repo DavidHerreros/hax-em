@@ -372,8 +372,8 @@ class HetSIREN(nnx.Module):
             [(ptr + current_batch_size) % self.bank_size]
         )
 
-    def decode_image(self, x, labels, md, ctf_type=None, return_latent=False):
-        # Precompute batch aligments
+    def decode_image(self, x, labels, md, ctf_type=None, return_latent=False, corrupt_projection_with_ctf=False):
+        # Precompute batch alignments
         euler_angles = md["euler_angles"][labels]
 
         # Precompute batch shifts
@@ -392,21 +392,28 @@ class HetSIREN(nnx.Module):
         else:
             ctf = jnp.ones([x.shape[0], 2 * self.xsize, int(2.0 * 0.5 * self.xsize + 1)], dtype=x.dtype)
 
-        if self.ctf_type == "precorrect":
-            # Wiener filter
-            x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
+        if x.ndim == 4:
+            if self.ctf_type == "precorrect":
+                # Wiener filter
+                x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
-        # Encode images
-        latent = self(x)
+            # Encode images
+            latents = self(x)
+        else:
+            latents = x
 
         # Decode volumes
-        coords, values = self.delta_volume_decoder(latent)
+        coords, values = self.delta_volume_decoder(latents)
+
+        # CTF corruption
+        if not corrupt_projection_with_ctf:
+            ctf_type = None
 
         # Generate projections
         images_corrected = self.phys_decoder(x, values, coords, self.xsize, euler_angles, shifts, ctf, ctf_type)
 
         if return_latent:
-            return images_corrected, latent
+            return images_corrected, latents
         else:
             return images_corrected
 
@@ -541,7 +548,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md):
         else:
             decoupling_loss = 0.0
 
-        loss = recon_loss + 0.0001 * kl_loss + 0.001 * decoupling_loss + l1_loss  + 0.001 * (l1_grad_loss + l2_grad_loss) + 100. * hist_loss
+        loss = recon_loss + 0.0001 * kl_loss + 0.001 * decoupling_loss + l1_loss  + 0.1 * (l1_grad_loss + l2_grad_loss) + 100. * hist_loss
         return loss, (recon_loss, latent)
 
     # Precompute batch aligments
@@ -601,10 +608,12 @@ def main():
     import random
     import numpy as np
     import argparse
+    import shutil
     from xmipp_metadata.image_handler import ImageHandler
     import optax
+    import torch
     from hax.checkpointer import NeuralNetworkCheckpointer
-    from hax.generators import MetaDataGenerator, extract_columns
+    from hax.generators import MetaDataGenerator, extract_columns, NumpyGenerator
     from hax.networks import train_step_hetsiren
     from hax.metrics import JaxSummaryWriter
     from hax.networks import VolumeAdjustment, train_step_volume_adjustment
@@ -689,6 +698,10 @@ def main():
     else:
         mmap = True
         mmap_output_dir = args.output_path
+
+    # If exists, clean MMAP
+    if mmap and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap")):
+        shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap"))
 
     # Random keys
     rng = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
@@ -784,9 +797,20 @@ def main():
             hetsiren.delta_volume_decoder.reference_values = values
 
         # Optimizers (HetSIREN)
-        params = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('delta_volume_decoder')))
-        optimizer = nnx.Optimizer(hetsiren, optax.adam(1e-5), wrt=params)
+        optimizer = nnx.Optimizer(hetsiren, optax.adam(1e-4))
         graphdef, state = nnx.split((hetsiren, optimizer))
+
+        # Jitted functions to improve performance
+        @partial(jax.jit, static_argnames=["ctf_type", "return_latent", "corrupt_projection_with_ctf"])
+        def hetsiren_decode_image(graphdef, state, x, labels, md, ctf_type=None, return_latent=False, corrupt_projection_with_ctf=False):
+            model, _ = nnx.merge(graphdef, state)
+            return model.decode_image(x, labels, md, ctf_type=ctf_type, return_latent=return_latent,
+                                      corrupt_projection_with_ctf=corrupt_projection_with_ctf)
+
+        @jax.jit
+        def hetsiren_decode_volume(graphdef, state, x):
+            model, _ = nnx.merge(graphdef, state)
+            return model.decode_volume(x)
 
         # Training loop (HetSIREN)
         print(f"{bcolors.OKCYAN}\n###### Training variability... ######")
@@ -809,8 +833,6 @@ def main():
 
                 # Summary writer (training loss)
                 if step % int(0.1 * len(data_loader)) == 0:
-                    hetsiren_intermediate, _ = nnx.merge(graphdef, state)
-
                     writer.add_scalar('Training loss (HetSIREN)',
                                       total_loss / step,
                                       i * len(data_loader) + step)
@@ -825,33 +847,42 @@ def main():
             x_for_tb = x[:5]
             labels_for_tb = labels[:5]
 
-            # Prepare images
-            if args.ctf_type == "precorrect":
-                defocusU = md_columns["ctfDefocusU"][labels_for_tb]
-                defocusV = md_columns["ctfDefocusV"][labels_for_tb]
-                defocusAngle = md_columns["ctfDefocusAngle"][labels_for_tb]
-                cs = md_columns["ctfSphericalAberration"][labels_for_tb]
-                kv = md_columns["ctfVoltage"][labels_for_tb][0]
-                ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
-                                 args.sr,
-                                 [2 * hetsiren_intermediate.xsize, int(2 * 0.5 * hetsiren_intermediate.xsize + 1)],
-                                 x_for_tb.shape[0], True)
-                x_for_tb = wiener2DFilter(jnp.squeeze(x_for_tb), ctf)[..., None]
-
             # Decode some images and show them in Tensorboard
-            x_pred_intermediate, latents_intermediate = hetsiren_intermediate.decode_image(x_for_tb, labels_for_tb, md_columns,
-                                                                                           ctf_type=args.ctf_type, return_latent=True)
+            x_pred_intermediate, latents_intermediate = hetsiren_decode_image(graphdef, state, x_for_tb,
+                                                                              labels_for_tb, md_columns,
+                                                                              ctf_type=args.ctf_type, return_latent=True,
+                                                                              corrupt_projection_with_ctf=True)
             x_pred_intermediate = jax.vmap(min_max_scale)(x_pred_intermediate[..., None])
             writer.add_images("Predicted images batch", x_pred_intermediate, dataformats="NHWC")
 
             # Decode some states and show them in Tensorboard
-            volumes_intermediate = hetsiren_intermediate.decode_volume(latents_intermediate)
+            volumes_intermediate = hetsiren_decode_volume(graphdef, state, latents_intermediate)
             writer.add_volumes_slices(volumes_intermediate)
+
+            # Log landscape stored in memory bank
+            if i % 5 == 0:
+                hetsiren_intermediate, _ = nnx.merge(graphdef, state)
+                random_indices = jnr.choice(hetsiren_intermediate.choice_key, a=jnp.arange(hetsiren_intermediate.bank_size), shape=(hetsiren_intermediate.subset_size,), replace=False)
+                latents_intermediate = hetsiren_intermediate.memory_bank.value[random_indices]
+                latents_data_loader = NumpyGenerator(latents_intermediate).return_tf_dataset(preShuffle=False, shuffle=False, batch_size=args.batch_size)
+                latents_images = []
+                for (latents, _) in latents_data_loader:
+                    x_pred_intermediate = hetsiren_decode_image(graphdef, state, latents,
+                                                                jnp.zeros((latents.shape[0],), dtype=jnp.int32),
+                                                                md_columns, ctf_type=None, return_latent=False,
+                                                                corrupt_projection_with_ctf=False)
+                    latents_images.append(np.asarray(x_pred_intermediate))
+                latents_images = np.concatenate(latents_images, axis=0)
+                latent_images_min = latents_images.min(axis=(1, 2), keepdims=True)
+                latent_images_max = latents_images.max(axis=(1, 2), keepdims=True)
+                latents_images = (latents_images - latent_images_min) / (latent_images_max - latent_images_min)
+                latents_images = torch.from_numpy(latents_images)[:, None, ...]
+                writer.add_embedding(latents_intermediate, label_img=latents_images, tag="HetSIREN latent space", global_step=i)
 
         hetsiren, optimizer = nnx.merge(graphdef, state)
 
         # Example of predicted data for Tensorboard
-        x_pred_example = hetsiren.decode_image(x_example, labels_example, md_columns, ctf_type=None, return_latent=False)
+        x_pred_example = hetsiren_decode_image(graphdef, state, x_example, labels_example, md_columns, ctf_type=args.ctf_type, return_latent=False, corrupt_projection_with_ctf=True)
         x_pred_example = jax.vmap(min_max_scale)(x_pred_example[..., None])
         writer.add_images("Predicted images batch", x_pred_example, dataformats="NHWC")
 
@@ -899,6 +930,10 @@ def main():
         md = generator.md
         md[:, 'latent_space'] = np.asarray([",".join(item) for item in latents.astype(str)])
         md.write(os.path.join(args.output_path, "predicted_latents.xmd"))
+
+    # If exists, clean MMAP
+    if mmap and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap")):
+        shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap"))
 
 if __name__ == "__main__":
     main()

@@ -2,6 +2,7 @@
 
 
 import random
+from functools import partial
 
 import jax
 from jax import random as jnr, numpy as jnp
@@ -367,7 +368,7 @@ class Zernike3Deep(nnx.Module):
             [(ptr + current_batch_size) % self.bank_size]
         )
 
-    def decode_image(self, x, labels, md, ctf_type=None, return_latent=False):
+    def decode_image(self, x, labels, md, ctf_type=None, return_latent=False, corrupt_projection_with_ctf=False):
         # Precompute batch aligments
         euler_angles = md["euler_angles"][labels]
 
@@ -387,15 +388,22 @@ class Zernike3Deep(nnx.Module):
         else:
             ctf = jnp.ones([x.shape[0], 2 * self.xsize, int(2.0 * 0.5 * self.xsize + 1)], dtype=x.dtype)
 
-        if self.ctf_type == "precorrect":
-            # Wiener filter
-            x = wiener2DFilter(x[..., 0], ctf)[..., None]
+        if x.ndim == 4:
+            if self.ctf_type == "precorrect":
+                # Wiener filter
+                x = wiener2DFilter(x[..., 0], ctf)[..., None]
 
-        # Encode images
-        latent = self(x)
+            # Encode images
+            latent = self(x)
+        else:
+            latent = x
 
         # Decode flow field
         flow, _, _, _ = self.flow_decoder(latent, self.inds, self.xsize)
+
+        # Check if CTF corruption is needed
+        if not corrupt_projection_with_ctf:
+            ctf_type = None
 
         # Generate projections
         images_corrected = self.phys_decoder(flow, x, self.inds, self.values, self.xsize, euler_angles, shifts, ctf, ctf_type)
@@ -573,10 +581,12 @@ def main():
     import random
     import numpy as np
     import argparse
+    import shutil
     from xmipp_metadata.image_handler import ImageHandler
     import optax
+    import torch
     from hax.checkpointer import NeuralNetworkCheckpointer
-    from hax.generators import MetaDataGenerator, extract_columns
+    from hax.generators import MetaDataGenerator, extract_columns, NumpyGenerator
     from hax.networks import train_step_zernike3deep, train_step_volume_adjustment, VolumeAdjustment
     from hax.metrics import JaxSummaryWriter
 
@@ -636,6 +646,10 @@ def main():
     else:
         mmap = True
         mmap_output_dir = args.output_path
+
+    # If exists, clean MMAP
+    if mmap and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap")):
+        shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap"))
 
     inds = np.asarray(np.where(mask > 0.0)).T
     values = vol[inds[:, 0], inds[:, 1], inds[:, 2]]
@@ -730,6 +744,19 @@ def main():
         optimizer_grays = nnx.Optimizer(zernike3deep, optax.adam(1e-5), wrt=params_grays)
         graphdef, state = nnx.split((zernike3deep, optimizer, optimizer_grays))
 
+        # Jitted functions to improve performance
+        @partial(jax.jit, static_argnames=["ctf_type", "return_latent", "corrupt_projection_with_ctf"])
+        def zernike3deep_decode_image(graphdef, state, x, labels, md, ctf_type=None, return_latent=False,
+                                  corrupt_projection_with_ctf=False):
+            model, _ = nnx.merge(graphdef, state)
+            return model.decode_image(x, labels, md, ctf_type=ctf_type, return_latent=return_latent,
+                                      corrupt_projection_with_ctf=corrupt_projection_with_ctf)
+
+        @jax.jit
+        def zernike3deep_decode_volume(graphdef, state, x):
+            model, _ = nnx.merge(graphdef, state)
+            return model.decode_volume(x)
+
         # Training loop (Zernike3Deep)
         print(f"{bcolors.OKCYAN}\n###### Training variability... ######")
         for i in range(args.epochs):
@@ -761,33 +788,46 @@ def main():
             x_for_tb = x[:5]
             labels_for_tb = labels[:5]
 
-            # Prepare images
-            if args.ctf_type == "precorrect":
-                defocusU = md_columns["ctfDefocusU"][labels_for_tb]
-                defocusV = md_columns["ctfDefocusV"][labels_for_tb]
-                defocusAngle = md_columns["ctfDefocusAngle"][labels_for_tb]
-                cs = md_columns["ctfSphericalAberration"][labels_for_tb]
-                kv = md_columns["ctfVoltage"][labels_for_tb][0]
-                ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
-                                 args.sr, [2 * zernike3deep_intermediate.xsize,
-                                           int(2 * 0.5 * zernike3deep_intermediate.xsize + 1)],
-                                 x_for_tb.shape[0], True)
-                x_for_tb = wiener2DFilter(jnp.squeeze(x_for_tb), ctf)[..., None]
-
             # Decode some images and show them in Tensorboard
-            x_pred_intermediate, latents_intermediate = zernike3deep_intermediate.decode_image(x_for_tb, labels_for_tb, md_columns,
-                                                                                               ctf_type=args.ctf_type, return_latent=True)
+            x_pred_intermediate, latents_intermediate = zernike3deep_decode_image(graphdef, state, x_for_tb,
+                                                                                  labels_for_tb, md_columns,
+                                                                                  ctf_type=args.ctf_type, return_latent=True,
+                                                                                  corrupt_projection_with_ctf=True)
             x_pred_intermediate = jax.vmap(min_max_scale)(x_pred_intermediate[..., None])
             writer.add_images("Predicted images batch", x_pred_intermediate, dataformats="NHWC")
 
             # Decode some states and show them in Tensorboard
-            volumes_intermediate = zernike3deep_intermediate.decode_volume(latents_intermediate)
+            volumes_intermediate = zernike3deep_decode_volume(latents_intermediate)
             writer.add_volumes_slices(volumes_intermediate)
+
+            # Log landscape stored in memory bank
+            if i % 5 == 0:
+                hetsiren_intermediate, _ = nnx.merge(graphdef, state)
+                random_indices = jnr.choice(hetsiren_intermediate.choice_key,
+                                            a=jnp.arange(hetsiren_intermediate.bank_size),
+                                            shape=(hetsiren_intermediate.subset_size,), replace=False)
+                latents_intermediate = hetsiren_intermediate.memory_bank.value[random_indices]
+                latents_data_loader = NumpyGenerator(latents_intermediate).return_tf_dataset(preShuffle=False,
+                                                                                             shuffle=False,
+                                                                                             batch_size=args.batch_size)
+                latents_images = []
+                for (latents, _) in latents_data_loader:
+                    x_pred_intermediate = zernike3deep_decode_image(graphdef, state, latents,
+                                                                    jnp.zeros((latents.shape[0],), dtype=jnp.int32),
+                                                                    md_columns, ctf_type=None, return_latent=False,
+                                                                    corrupt_projection_with_ctf=False)
+                    latents_images.append(np.asarray(x_pred_intermediate))
+                latents_images = np.concatenate(latents_images, axis=0)
+                latent_images_min = latents_images.min(axis=(1, 2), keepdims=True)
+                latent_images_max = latents_images.max(axis=(1, 2), keepdims=True)
+                latents_images = (latents_images - latent_images_min) / (latent_images_max - latent_images_min)
+                latents_images = torch.from_numpy(latents_images)[:, None, ...]
+                writer.add_embedding(latents_intermediate, label_img=latents_images, tag="Zernike3Deep latent space", global_step=i)
 
         zernike3deep, optimizer, optimizer_grays = nnx.merge(graphdef, state)
 
         # Example of predicted data for Tensorboard
-        x_pred_example = zernike3deep.decode_image(x_example, labels_example, md_columns, ctf_type=None, return_latent=False)
+        x_pred_example = zernike3deep_decode_image(graphdef, state, x_example, labels_example, md_columns, ctf_type=args.ctf_type, return_latent=False, corrupt_projection_with_ctf=True)
         x_pred_example = jax.vmap(min_max_scale)(x_pred_example[..., None])
         writer.add_images("Predicted images batch", x_pred_example, dataformats="NHWC")
 
@@ -844,6 +884,10 @@ def main():
 
         # Save mode to pickle
         NeuralNetworkCheckpointer.save(zernike3deep, os.path.join(args.output_path, "Zernike3Deep"), mode="pickle")
+
+    # If exists, clean MMAP
+    if mmap and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap")):
+        shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap"))
 
 if __name__ == "__main__":
     main()
