@@ -749,6 +749,16 @@ def main():
         x_example = jax.vmap(min_max_scale)(x_example)
         writer.add_images("Training data batch", x_example, dataformats="NHWC")
 
+        # Projector help text in Tensorboard
+        legend_projector = """
+                <h3>WARNING: Images shown in projector</h3>
+                <ul>
+                    <li>The pose of the images shown in the projector is random and not related to the real pose of your data. 
+                    Therefore, DO NOT consider this images as a representation on how poses are classified in the latent space.</li>
+                </ul>
+                """
+        writer.add_text("Projector warning", legend_projector)
+
         if args.vol is not None:
             # Optimizers (Volume Adjustment)
             optimizer_vol = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5))
@@ -867,8 +877,8 @@ def main():
                 latents_data_loader = NumpyGenerator(latents_intermediate).return_tf_dataset(preShuffle=False, shuffle=False, batch_size=args.batch_size)
                 latents_images = []
                 for (latents, _) in latents_data_loader:
-                    x_pred_intermediate = hetsiren_decode_image(graphdef, state, latents,
-                                                                jnp.zeros((latents.shape[0],), dtype=jnp.int32),
+                    random_labels = jnp.asarray(np.random.randint(low=0, high=len(generator.md), size=(latents.shape[0],)), dtype=jnp.int32)
+                    x_pred_intermediate = hetsiren_decode_image(graphdef, state, latents, random_labels,
                                                                 md_columns, ctf_type=None, return_latent=False,
                                                                 corrupt_projection_with_ctf=False)
                     latents_images.append(np.asarray(x_pred_intermediate))
