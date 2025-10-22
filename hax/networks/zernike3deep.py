@@ -592,7 +592,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--md", required=True, type=str,
-                        help="Xmipp metadata file with the images (+ alignments / CTF) to be analyzed")
+                        help="Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed")
     parser.add_argument("--vol", required=True, type=str,
                         help="Volume to be warped toward the images")
     parser.add_argument("--mask", required=False, type=str,

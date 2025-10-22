@@ -620,7 +620,10 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--md", required=True, type=str,
-                        help="Xmipp metadata file with the images (+ alignments / CTF) to be analyzed")
+                        help=f"Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed. {bcolors.WARNING}NOTE{bcolors.ENDC}: If the metadata "
+                             f"includes the label {bcolors.ITALIC}subtomo_labels{bcolors.ENDC}, then TomoSIREN network will be trained (i.e., HetSIREN for "
+                             f"tomography data). In this case, the parameter {bcolors.ITALIC}decoupling{bcolors.ENDC} will not have any effect as pose/CTF "
+                             f"decoupling is already handled by TomoSIREN.")
     parser.add_argument("--vol", required=False, type=str,
                         help="If provided, the neural network will learn how to refine this volume towards the heterogeneous states present in the images")
     parser.add_argument("--mask", required=False, type=str,
