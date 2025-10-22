@@ -303,7 +303,7 @@ def main():
 
             for (x, labels) in pbar:
                 a, b = predict_fn(x)
-                imgs_adjusted.append(a * x + b)
+                imgs_adjusted.append((x - b) / a)
         imgs_adjusted = np.asarray(imgs_adjusted)
 
         # Save new images
