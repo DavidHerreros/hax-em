@@ -710,6 +710,8 @@ def main():
                 <ul>
                     <li>The pose of the images shown in the projector is random and not related to the real pose of your data. 
                     Therefore, DO NOT consider this images as a representation on how poses are classified in the latent space.</li>
+                    <li>WARNING: The projector tab does not update its data even if the Tensorboard page is refreshed. To update the latent 
+                    spaces shown in the projector, please, restart completely the Tensorboard server and open it again in the browser.</li>
                 </ul>
                 """
         writer.add_text("Projector warning", legend_projector)
