@@ -196,6 +196,12 @@ def main():
                         help="Determines how many images will be load in the GPU at any moment during training (set by default to 8 - "
                              f"you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like {bcolors.UNDERLINE}nvidia-smi{bcolors.ENDC} "
                              f"to monitor and/or measure memory usage and adjust this value")
+    parser.add_argument("--learning_rate", required=False, type=float, default=1e-5,
+                        help=f"The learning rate ({bcolors.ITALIC}lr{bcolors.ENDC}) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the {bcolors.ITALIC}lr{bcolors.ENDC} "
+                             f"is the size of the step it takes on each attempt. A large {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}0.01{bcolors.ENDC}) is like taking huge leaps — it's fast but can be unstable, "
+                             f"overshoot the lowest point, or cause {bcolors.ITALIC}NAN{bcolors.ENDC} errors. A small {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}1e-6{bcolors.ENDC}) is like taking tiny "
+                             f"shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often {bcolors.ITALIC}0.0001{bcolors.ENDC}. If training fails or errors explode, "
+                             f"try making the {bcolors.ITALIC}lr{bcolors.ENDC} 10 times smaller (e.g., {bcolors.ITALIC}0.001{bcolors.ENDC} --> {bcolors.ITALIC}0.0001{bcolors.ENDC}).")
     parser.add_argument("--output_path", required=True, type=str,
                         help="Path to save the results (trained neural network, adjusted volume...)")
     parser.add_argument("--reload", required=False, type=str,
@@ -246,7 +252,7 @@ def main():
                                                   mmap=mmap, mmap_output_dir=mmap_output_dir)
 
         # Optimizers
-        optimizer = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5))
+        optimizer = nnx.Optimizer(volumeAdjustment, optax.adam(args.learning_rate))
         graphdef, state = nnx.split((volumeAdjustment, optimizer))
 
         # Training loop
