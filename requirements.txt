@@ -14,6 +14,7 @@ tensorflow-datasets<=4.9.9
 # tfp-nightly[jax]<0.27.0
 jaxkd<=0.1.2
 orbax<=0.1.9
+orbax-checkpoint<=0.11.25
 cloudpickle<=3.1.1
 dm_pix<=0.4.4
 tensorboard<=2.19.0
