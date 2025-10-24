@@ -942,11 +942,11 @@ def main():
                 x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
             latents.append(predict_fn(x))
-        latents = np.asarray(latents)
+        latents = np.asarray(jnp.concatenate(latents, axis=0))
 
         # Save latents in metadata
         md = generator.md
-        md[:, 'latent_space'] = np.asarray([",".join(item) for item in latents.astype(str)])
+        md[:, 'latent_space'] = np.asarray([",".join(np.char.mod('%f', item)) for item in latents])
         md.write(os.path.join(args.output_path, "predicted_latents.xmd"))
 
     # If exists, clean MMAP
