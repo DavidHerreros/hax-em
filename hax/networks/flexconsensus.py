@@ -106,9 +106,9 @@ class FlexConsensus(nnx.Module):
         self.consensus_space = nnx.Linear(1024, lat_dim, rngs=rngs)
 
     def __call__(self, x, space_name_encoder, space_name_decoder=None):
-        encoded = self.encoders[space_name_encoder](x)
+        encoded = self.encoders[space_name_encoder + "_encoder"](x)
         if space_name_decoder is not None:
-            decoded = self.decoders[space_name_decoder](encoded)
+            decoded = self.decoders[space_name_decoder + "_decoder"](encoded)
             return encoded, decoded
         else:
             return encoded
@@ -201,7 +201,6 @@ def train_step_flexconsensus(graphdef, state, x):
 
 def main():
     import os
-    from pathlib import Path
     import sys
     from tqdm import tqdm
     import random
@@ -354,7 +353,7 @@ def main():
         flexconsensus.train()
 
         # Jitted prediction function
-        predict_fn = jax.jit(flexconsensus.__call__)
+        predict_fn = jax.jit(flexconsensus.__call__, static_argnums=[1, 2])
 
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting consensus latents... ######")
@@ -363,7 +362,7 @@ def main():
             print(f"Predicting input space {idx + 1}/{len(input_spaces)}")
 
             # Prepare data loader
-            data_loader = NumpyGenerator(input_spaces[idx]).return_tf_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False, prefetch=20)
+            data_loader = NumpyGenerator(input_spaces[idx]).return_tf_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False)
 
             if input_spaces_name is not None and input_spaces_name[idx] in flexconsensus.input_spaces_name:
                 print(f"Valid identifier {input_spaces_name[idx]} provided for this input")
@@ -372,7 +371,7 @@ def main():
                 pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green")
 
                 for (x, _) in pbar:
-                    consensus_latents.append(predict_fn(x, space_name_encoder=input_spaces_name[idx]))
+                    consensus_latents.append(predict_fn(x, input_spaces_name[idx]))
             else:
                 print(f"Matching and detecting best possible prediction (due to missing or not valid identifier)")
                 representation_error = jnp.inf
@@ -386,7 +385,7 @@ def main():
                     pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green")
 
                     for (x, _) in pbar:
-                        encoded, decoded = predict_fn(x, space_name_encoder=input_space_name, space_name_decoder=input_space_name)
+                        encoded, decoded = predict_fn(x, input_space_name, input_space_name)
                         consensus_latents_trial.append(encoded)
                         representation_error_trial += jnp.mean(jnp.square(x - decoded), axis=-1).mean()
 
@@ -395,11 +394,11 @@ def main():
                     if representation_error_trial < representation_error:
                         consensus_latents = consensus_latents_trial
 
-            latents.append(np.array(consensus_latents))
+            latents.append(np.array(jnp.concatenate(consensus_latents, axis=0)))
 
         # Save consensus latents
-        for latent, input_file in zip(latents, args.input_spaces):
-            output_file = os.path.join(args.output_path, str(Path(input_file).stem) + "_consensus.npy")
+        for latent, input_space_name in zip(latents, input_spaces_name):
+            output_file = os.path.join(args.output_path, input_space_name + "_consensus.npy")
             np.save(output_file, latent)
 
 if __name__ == "__main__":
