@@ -293,7 +293,7 @@ def main():
                 pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
 
                 # Summary writer (training loss)
-                if step % np.ceil(int(0.1 * len(data_loader))) == 0:
+                if step % int(np.ceil(0.1 * len(data_loader))) == 0:
                     writer.add_scalar('Training loss (image adjustment)',
                                       total_loss / step,
                                       i * len(data_loader) + step)
