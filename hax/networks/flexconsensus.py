@@ -106,7 +106,7 @@ class FlexConsensus(nnx.Module):
         self.consensus_space = nnx.Linear(1024, lat_dim, rngs=rngs)
 
     def __call__(self, x, space_name_encoder, space_name_decoder=None):
-        encoded = self.encoders[space_name_encoder + "_encoder"](x)
+        encoded = self.consensus_space(self.encoders[space_name_encoder + "_encoder"](x))
         if space_name_decoder is not None:
             decoded = self.decoders[space_name_decoder + "_decoder"](encoded)
             return encoded, decoded
@@ -398,6 +398,7 @@ def main():
 
         # Save consensus latents
         for latent, input_space_name in zip(latents, input_spaces_name):
+            print(latent.dtype, flush=True)
             output_file = os.path.join(args.output_path, input_space_name + "_consensus.npy")
             np.save(output_file, latent)
 
