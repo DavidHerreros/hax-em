@@ -46,7 +46,7 @@ class ArrayListGenerator:
             idx = np.arange(self.data[0].shape[0])
             if preShuffle:
                 np.random.shuffle(idx)
-            dataset = tf.data.Dataset.from_tensor_slices(((np_array, idx) for np_array in self.data))
+            dataset = tf.data.Dataset.from_tensor_slices((tuple(self.data), idx))
             if shuffle:
                 dataset = dataset.shuffle(len(idx))
             if prefetch == -1:
