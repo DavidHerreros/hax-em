@@ -398,7 +398,6 @@ def main():
 
         # Save consensus latents
         for latent, input_space_name in zip(latents, input_spaces_name):
-            print(latent.dtype, flush=True)
             output_file = os.path.join(args.output_path, input_space_name + "_consensus.npy")
             np.save(output_file, latent)
 
