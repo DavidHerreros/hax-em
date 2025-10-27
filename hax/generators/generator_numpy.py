@@ -13,7 +13,7 @@ class NumpyGenerator:
     def __getitem__(self, idx):
         return self.data[idx]
 
-    def return_tf_dataset(self, preShuffle=False, shuffle=True, prefetch=5, batch_size=8):
+    def return_tf_dataset(self, preShuffle=False, shuffle=True, prefetch=-1, batch_size=8):
         import tensorflow_datasets as tfds
         import tensorflow as tf
         tf.config.set_visible_devices([], device_type='GPU')
@@ -24,6 +24,8 @@ class NumpyGenerator:
             dataset = tf.data.Dataset.from_tensor_slices((self.data, idx))
             if shuffle:
                 dataset = dataset.shuffle(len(idx))
+            if prefetch == -1:
+                prefetch = tf.data.AUTOTUNE
             return tfds.as_numpy(dataset.batch(batch_size).prefetch(prefetch))
 
 
