@@ -902,7 +902,7 @@ def main():
                     pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
 
                     # Summary writer (training loss)
-                    if step % int(0.1 * len(data_loader)) == 0:
+                    if step % np.ceil(int(0.1 * len(data_loader))) == 0:
                         writer.add_scalar('Training loss (volume adjustment)',
                                           total_loss / step,
                                           i * len(data_loader) + step)
@@ -946,7 +946,7 @@ def main():
                 pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss / step:.5f}")
 
                 # Summary writer (training loss)
-                if step % int(0.1 * len(data_loader)) == 0:
+                if step % np.ceil(int(0.1 * len(data_loader))) == 0:
                     writer.add_scalar('Training loss (ReconSIREN)',
                                       total_loss / step,
                                       i * len(data_loader) + step)
