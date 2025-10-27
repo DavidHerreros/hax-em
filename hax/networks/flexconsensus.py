@@ -123,7 +123,12 @@ def train_step_flexconsensus(graphdef, state, x):
     total_losses = 0.0
     decoder_losses = {input_space_name: 0.0 for input_space_name in model.input_spaces_name}
 
+    # VMAP functions for later
+    pairwise_distances_batch = jax.vmap(pairwise_distances)
+
     def loss_fn(model, x, input_space_idx):
+        x_jnp = jnp.array(x)
+
         # Encode space
         consensus_spaces = [model.consensus_space(model.encoders[input_space_name + "_encoder"](input_space)) for input_space, input_space_name in zip(x, model.input_spaces_name)]  # TODO: Can we find the matching better?
 
@@ -131,48 +136,42 @@ def train_step_flexconsensus(graphdef, state, x):
         decoded_spaces = [model.decoders[input_space_name + "_decoder"](consensus_spaces[input_space_idx]) for input_space_name in model.input_spaces_name]
 
         # Consensus loss (single space)
-        single_space_loss = 0.0
-        for consensus_space_1 in consensus_spaces:
-            for consensus_space_2 in consensus_spaces:
-                single_space_loss += jnp.mean(jnp.square(consensus_space_1 - consensus_space_2), axis=-1).mean()
+        diffs = x_jnp[:, None, :, :] - x_jnp[None, :, :, :]
+        feature_mse_loss = jnp.mean(diffs ** 2, axis=(2, 3))
 
-                # Distance matrix for Wasserstein distance
-                distance_matrix_1 = pairwise_distances(consensus_space_1)
-                distance_matrix_2 = pairwise_distances(consensus_space_2)
-                distance_matrix_1 = (distance_matrix_1 - distance_matrix_1.mean(axis=(0, 1), keepdims=True)) / distance_matrix_1.std(axis=(0, 1), keepdims=True)
-                distance_matrix_2 = (distance_matrix_2 - distance_matrix_2.mean(axis=(0, 1), keepdims=True)) / distance_matrix_2.std(axis=(0, 1), keepdims=True)
+        # Distance matrix for Wasserstein distance
+        distance_matrices = pairwise_distances_batch(jnp.array(consensus_spaces))
+        mean = distance_matrices.mean(axis=(1, 2), keepdims=True)
+        std = distance_matrices.std(axis=(1, 2), keepdims=True) + 1e-12
+        distance_matrices = (distance_matrices - mean) / std
 
-                # Upper triangular indices
-                indices = jnp.triu_indices(distance_matrix_1.shape[0], k=1)
-                distance_matrix_1 = distance_matrix_1[indices]
-                distance_matrix_2 = distance_matrix_2[indices]
+        # Upper triangular indices
+        iu, ju = jnp.triu_indices(distance_matrices.shape[-1], k=1)
+        distances = distance_matrices[:, iu, ju]
+        distances_sorted = jnp.sort(distances, axis=1)
 
-                # Sorting of the distances
-                distance_matrix_1_sorted = jnp.sort(distance_matrix_1)
-                distance_matrix_2_sorted = jnp.sort(distance_matrix_2)
+        # Wasserstein distance
+        wdiff = jnp.abs(distances_sorted[:, None, :] - distances_sorted[None, :, :])
+        wasserstein_loss = wdiff.mean(axis=-1)
 
-                # Wasserstein distance
-                single_space_loss += jnp.mean(jnp.abs(distance_matrix_1_sorted - distance_matrix_2_sorted))
+        # Combine losses
+        single_space_loss = feature_mse_loss.mean() + wasserstein_loss.mean()
 
         # Consensus loss (Shannon mapping)
         shannon_mapping_loss = 0.0
-        for input_space in x:
-            distances_consensus_space = pairwise_distances(consensus_spaces[input_space_idx])
-            distances_input_space = pairwise_distances(input_space)
-            triu_consensus_space = jnp.triu(distances_consensus_space, k=1)
-            triu_distances_input_space = jnp.triu(distances_input_space, k=1)
-            denominator_without_zeros = jnp.where(triu_distances_input_space == 0, 1.0, triu_distances_input_space)
-            shannon_mapping_loss += (jnp.where(triu_distances_input_space == 0., 0.0, jnp.square(triu_distances_input_space - triu_consensus_space) / denominator_without_zeros).sum(axis=(0, 1))
-                                     * 1. / triu_distances_input_space.sum(axis=(0, 1))).mean()
+        distances_consensus_space = pairwise_distances(consensus_spaces[input_space_idx])[None, ...]
+        distances_input_space = pairwise_distances_batch(x_jnp)
+        triu_consensus_space = jnp.triu(distances_consensus_space, k=1)
+        triu_distances_input_space = jnp.triu(distances_input_space, k=1)
+        denominator_without_zeros = jnp.where(triu_distances_input_space == 0, 1.0, triu_distances_input_space)
+        shannon_mapping_loss += (jnp.where(triu_distances_input_space == 0., 0.0, jnp.square(triu_distances_input_space - triu_consensus_space) / denominator_without_zeros).sum(axis=(1, 2))
+                                 * 1. / triu_distances_input_space.sum(axis=(1, 2))).mean()
 
         # Consensus loss (Center of mass)
         center_of_mass_loss = jnp.square(consensus_spaces[input_space_idx].mean(axis=0)).sum()
 
         # Decoder loss
-        representation_loss = 0.0
-        for input_space, decoded_space in zip(x, decoded_spaces):
-            representation_loss += jnp.mean(jnp.square(input_space - decoded_space), axis=-1).mean()
-        representation_loss /= len(x)
+        representation_loss = jnp.mean(jnp.square(x_jnp - jnp.array(decoded_spaces)), axis=-1).mean()
 
         # Compute total loss
         loss = single_space_loss + shannon_mapping_loss + center_of_mass_loss + representation_loss
