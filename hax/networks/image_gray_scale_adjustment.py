@@ -174,6 +174,7 @@ def main():
     from hax.checkpointer import NeuralNetworkCheckpointer
     from hax.generators import MetaDataGenerator, extract_columns
     from hax.networks import train_step_image_adjustment
+    from hax.metrics import JaxSummaryWriter
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--md", required=True, type=str,
@@ -257,9 +258,17 @@ def main():
 
         imageAdjustment.train()
 
+        # Prepare summary writer
+        writer = JaxSummaryWriter(os.path.join(args.output_path, "Image_adjustment_metrics"))
+
         # Prepare data loader
         data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
                                                   mmap=mmap, mmap_output_dir=mmap_output_dir)
+
+        # Example of training data for Tensorboard
+        x_example, labels_example = next(iter(data_loader))
+        x_example = jax.vmap(min_max_scale)(x_example)
+        writer.add_images("Training data batch", x_example, dataformats="NHWC")
 
         # Optimizers
         optimizer = nnx.Optimizer(imageAdjustment, optax.adam(args.learning_rate))
@@ -282,6 +291,13 @@ def main():
 
                 # Progress bar update  (TQDM)
                 pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
+
+                # Summary writer (training loss)
+                if step % np.ceil(int(0.1 * len(data_loader))) == 0:
+                    writer.add_scalar('Training loss (image adjustment)',
+                                      total_loss / step,
+                                      i * len(data_loader) + step)
+
                 step += 1
         imageAdjustment, optimizer = nnx.merge(graphdef, state)
 
