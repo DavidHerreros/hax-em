@@ -1,18 +1,13 @@
 #!/usr/bin/env python
 
 
-import random
+from functools import partial
 
 import jax
-from jax import random as jnr, numpy as jnp
+from jax import numpy as jnp
 from flax import nnx
-import dm_pix
-
-from einops import rearrange
 
 from hax.utils import *
-from hax.layers import siren_init_first, siren_init
-from hax.networks import ImageAdjustment
 
 
 def pairwise_distances(embeddings: jnp.ndarray, squared: bool = False) -> jnp.ndarray:
@@ -52,6 +47,37 @@ def pairwise_distances(embeddings: jnp.ndarray, squared: bool = False) -> jnp.nd
         distances = distances * (~mask).astype(embeddings.dtype)
 
     return distances
+
+
+def logistic_transform_std_shift(errors, mu=None, sigma=None):
+    """
+    Transforms a 1D array of errors to a 0-1 scale using a logistic function,
+    such that a value of 0.5 corresponds to errors that are +1 standard deviation away from the mean.
+
+    The transformation is defined as:
+        f(x) = 1 / (1 + exp(-k*(x - (mu+sigma))))
+    with k chosen so that:
+        f(mu)   ~ 0.25  and  f(mu+2*sigma) ~ 0.75.
+
+    Parameters:
+        errors (np.array): 1D array of error values.
+
+    Returns:
+        np.array: Transformed error values in the interval (0, 1).
+    """
+    # Compute the mean and standard deviation
+    mu = jnp.mean(errors, axis=-1, keepdims=True) if mu is None else mu
+    sigma = jnp.std(errors, axis=-1, keepdims=True) if sigma is None else sigma
+
+    # Prevent division by zero in case sigma is zero
+    # sigma = jnp.where(sigma == 0, 0.5, sigma)
+
+    # Choose k such that one std below and above the center give 0.25 and 0.75 respectively.
+    k = jnp.log(3.) / sigma
+
+    # Shift the logistic function center to mu + sigma so that f(mu+sigma) = 0.5
+    transformed = 1. / (1. + jnp.exp(-k * (errors - (mu + sigma))))
+    return transformed
 
 
 class Encoder(nnx.Module):
@@ -105,13 +131,21 @@ class FlexConsensus(nnx.Module):
         self.decoders = {input_space_name + "_decoder": Decoder(lat_dim, input_space_dim, rngs=rngs) for input_space_dim, input_space_name in zip(input_spaces_dim, self.input_spaces_name)}
         self.consensus_space = nnx.Linear(1024, lat_dim, rngs=rngs)
 
-    def __call__(self, x, space_name_encoder, space_name_decoder=None):
-        encoded = self.consensus_space(self.encoders[space_name_encoder + "_encoder"](x))
-        if space_name_decoder is not None:
-            decoded = self.decoders[space_name_decoder + "_decoder"](encoded)
-            return encoded, decoded
+    def __call__(self, x, space_name_encoder=None, space_name_decoder=None):
+        if space_name_encoder is not None:
+            encoded = self.consensus_space(self.encoders[space_name_encoder + "_encoder"](x))
+            if space_name_decoder is None:
+                return encoded
+            else:
+                decoded = self.decoders[space_name_decoder + "_decoder"](encoded)
+                return encoded, decoded
+        elif space_name_decoder is not None:
+            if space_name_encoder is None:
+                decoded = self.decoders[space_name_decoder + "_decoder"](x)
+                return decoded
         else:
-            return encoded
+            raise ValueError(f"At least the input {bcolors.ITALIC}space_name_encoder{bcolors.ENDC} or "
+                             f"{bcolors.ITALIC}space_name_decoder{bcolors.ENDC} must be provided.")
 
 
 @jax.jit
@@ -136,14 +170,12 @@ def train_step_flexconsensus(graphdef, state, x):
         decoded_spaces = [model.decoders[input_space_name + "_decoder"](consensus_spaces[input_space_idx]) for input_space_name in model.input_spaces_name]
 
         # Consensus loss (single space)
-        diffs = x_jnp[:, None, :, :] - x_jnp[None, :, :, :]
+        diffs = jnp.array(consensus_spaces)[:, None, :, :] - jnp.array(consensus_spaces)[None, :, :, :]
         feature_mse_loss = jnp.mean(diffs ** 2, axis=(2, 3))
 
         # Distance matrix for Wasserstein distance
         distance_matrices = pairwise_distances_batch(jnp.array(consensus_spaces))
-        mean = distance_matrices.mean(axis=(1, 2), keepdims=True)
-        std = distance_matrices.std(axis=(1, 2), keepdims=True) + 1e-12
-        distance_matrices = (distance_matrices - mean) / std
+        distance_matrices = distance_matrices / (distance_matrices.sum(axis=(1, 2), keepdims=True) + 1e-12)
 
         # Upper triangular indices
         iu, ju = jnp.triu_indices(distance_matrices.shape[-1], k=1)
@@ -152,7 +184,7 @@ def train_step_flexconsensus(graphdef, state, x):
 
         # Wasserstein distance
         wdiff = jnp.abs(distances_sorted[:, None, :] - distances_sorted[None, :, :])
-        wasserstein_loss = wdiff.mean(axis=-1)
+        wasserstein_loss = 0.1 * wdiff.mean(axis=-1)
 
         # Combine losses
         single_space_loss = feature_mse_loss.mean() + wasserstein_loss.mean()
@@ -189,8 +221,8 @@ def train_step_flexconsensus(graphdef, state, x):
         decoder_losses[model.input_spaces_name[input_space_idx]] = decoder_loss
         total_losses += loss
 
-    encoder_losses /= len(x)
-    total_losses /= len(x)
+    encoder_losses /= len(model.input_spaces_name)
+    total_losses /= len(model.input_spaces_name)
 
     state = nnx.state((model, optimizer))
 
@@ -300,6 +332,12 @@ def main():
         # Prepare summary writer
         writer = JaxSummaryWriter(os.path.join(args.output_path, "FlexConsensus_metrics"))
 
+        # Jitted functions for Tensorboard logging
+        @partial(jax.jit, static_argnames=("space_name_encoder", "space_name_decoder"))
+        def predict_flexconsensus(graphdef, state, x, space_name_encoder=None, space_name_decoder=None):
+            model, _ = nnx.merge(graphdef, state)
+            return model(x, space_name_encoder, space_name_decoder)
+
         # Prepare data loader
         data_loader = ArrayListGenerator(input_spaces).return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True)
 
@@ -343,6 +381,19 @@ def main():
                                           i * len(data_loader) + step)
                 step += 1
 
+            if i % 5 == 0:
+                tensorboard_latents = []
+                labels_tensorboard = []
+                for input_space, input_space_name in zip(input_spaces, input_spaces_name):
+                    max_idx = min(2048, input_space.shape[0])
+                    input_space = input_space[:max_idx]
+                    encoded = predict_flexconsensus(graphdef, state, input_space, space_name_encoder=input_space_name, space_name_decoder=None)
+                    tensorboard_latents.append(np.array(encoded))
+                    labels_tensorboard += [f"{input_space_name}" for _ in range(max_idx)]
+                tensorboard_latents = np.concatenate(tensorboard_latents, axis=0)
+                writer.add_embedding(tensorboard_latents, metadata=labels_tensorboard,
+                                     tag="FlexConsensus latent space", global_step=i)
+
         flexconsensus, optimizer = nnx.merge(graphdef, state)
 
         # Save model
@@ -358,6 +409,7 @@ def main():
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting consensus latents... ######")
         latents = []
+        latents_decoded = []
         for idx in range(len(input_spaces)):
             print(f"Predicting input space {idx + 1}/{len(input_spaces)}")
 
@@ -367,17 +419,22 @@ def main():
             if input_spaces_name is not None and input_spaces_name[idx] in flexconsensus.input_spaces_name:
                 print(f"Valid identifier {input_spaces_name[idx]} provided for this input")
                 consensus_latents = []
+                decoded_latents = []
                 # For progress bar (TQDM)
                 pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green")
 
                 for (x, _) in pbar:
-                    consensus_latents.append(predict_fn(x, input_spaces_name[idx]))
+                    encoded, decoded = predict_fn(x, input_spaces_name[idx], input_spaces_name[idx])
+                    consensus_latents.append(encoded)
+                    decoded_latents.append(decoded)
             else:
                 print(f"Matching and detecting best possible prediction (due to missing or not valid identifier)")
                 representation_error = jnp.inf
                 consensus_latents = None
-                for input_space_name in flexconsensus.input_spaces_name:
+                decoded_latents = None
+                for input_space_name in input_spaces_name:
                     consensus_latents_trial = []
+                    decoded_latents_trial = []
                     representation_error_trial = 0
                     print(f"Trying with {input_space_name}")
 
@@ -387,19 +444,58 @@ def main():
                     for (x, _) in pbar:
                         encoded, decoded = predict_fn(x, input_space_name, input_space_name)
                         consensus_latents_trial.append(encoded)
+                        decoded_latents_trial.append(decoded)
                         representation_error_trial += jnp.mean(jnp.square(x - decoded), axis=-1).mean()
 
                     representation_error_trial /= len(data_loader)
 
                     if representation_error_trial < representation_error:
                         consensus_latents = consensus_latents_trial
+                        decoded_latents = decoded_latents_trial
+                        representation_error = representation_error_trial
 
             latents.append(np.array(jnp.concatenate(consensus_latents, axis=0)))
+            latents_decoded.append(np.array(jnp.concatenate(decoded_latents, axis=0)))
+
+        # Compute normalized error between latent space
+        latents_error = []
+        representation_errors = []
+        print(f"{bcolors.OKCYAN}\n###### Estimating consensus and representation errors... ######")
+        pbar = tqdm(zip(latents, latents_decoded, input_spaces), desc="Progress", file=sys.stdout, ascii=" >=", colour="green")
+        for consensus_latent, decoded_latent, input_spaces in pbar:
+            latent_error = 0.0
+
+            # Representation error
+            representation_error = jnp.sqrt(jnp.mean((decoded_latent - input_spaces) ** 2, axis=-1))
+            representation_error = np.array(logistic_transform_std_shift(representation_error))
+
+            # Consensus error
+            for input_space_name in input_spaces_name:
+                # [1] Decode current consensus space with one of the decoders
+                data_loader = NumpyGenerator(consensus_latent).return_tf_dataset(batch_size=args.batch_size,
+                                                                                  shuffle=False, preShuffle=False)
+                decoded = jnp.concatenate([predict_fn(x, None, input_space_name) for (x, _) in data_loader], axis=0)
+
+                # [2] Encode the decoded space using the same encoder ID as the decoder previously used
+                data_loader = NumpyGenerator(np.array(decoded)).return_tf_dataset(batch_size=args.batch_size,
+                                                                                  shuffle=False, preShuffle=False)
+                encoded = jnp.concatenate([predict_fn(x, input_space_name, None) for (x, _) in data_loader], axis=0)
+
+                # [3] Compute consensus error for the current consensus - encoded pair
+                diffs = consensus_latent - encoded
+                latents_rmse = jnp.sqrt(jnp.mean(diffs ** 2, axis=-1))
+                latent_error += np.array(logistic_transform_std_shift(latents_rmse))
+            latents_error.append(latent_error)
+            representation_errors.append(representation_error)
 
         # Save consensus latents
-        for latent, input_space_name in zip(latents, input_spaces_name):
-            output_file = os.path.join(args.output_path, input_space_name + "_consensus.npy")
-            np.save(output_file, latent)
+        for latent, latent_error, representation_error, input_space_name in zip(latents, latents_error, representation_errors, input_spaces_name):
+            output_file_consensus = os.path.join(args.output_path, input_space_name + "_consensus.npy")
+            output_file_consensus_errors = os.path.join(args.output_path, input_space_name + "_consensus_error.npy")
+            output_file_representation_errors = os.path.join(args.output_path, input_space_name + "_representation_error.npy")
+            np.save(output_file_consensus, latent)
+            np.save(output_file_consensus_errors, latent_error)
+            np.save(output_file_representation_errors, representation_error)
 
 if __name__ == "__main__":
     main()
