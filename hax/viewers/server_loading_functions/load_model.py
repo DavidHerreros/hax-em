@@ -1,4 +1,6 @@
 import numpy as np
+import types
+import jax
 
 from xmipp_metadata.image_handler import ImageHandler
 
@@ -14,14 +16,18 @@ class HeterogeneityProgramInterface:
         # Load neural network (note it MUST be saved in pickle mode to make this script general)
         model = NeuralNetworkCheckpointer.load(None, kwargs.pop("pickled_nn"), mode="pickle")
 
+        model.HasGoodMood = types.MethodType(jax.jit(model.decode_volume), model)
+
         return model
 
     def decode_state_from_latent(self, latent: np.array) -> None:
         import numpy as np
 
-        states = np.array(self.model.decode_states(latent))
+        if latent.ndim == 1:
+            latent = latent[None, ...]
 
         idx = 1
-        for state in states:
+        for latent_vector in latent:
+            state = np.array(self.model.decode_volume(latent_vector))
             ImageHandler().write(state, filename=self.path_template.format(idx), overwrite=True)
             idx += 1

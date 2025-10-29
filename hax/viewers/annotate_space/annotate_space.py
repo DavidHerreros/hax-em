@@ -402,7 +402,7 @@ class Annotate3D(object):
                                 original_points = np.copy(points)
                                 _, inds = self.kdtree_data.query(original_points, k=1)
                                 inds = np.array(inds).flatten()
-                                original_points = np.copy(self.original_data[inds])
+                                original_points = np.copy(self.original_data[inds])[:, self.current_axis]
                         else:
                             original_points = points
 
@@ -1014,7 +1014,7 @@ class Annotate3D(object):
                     for idx, points in enumerate(layer_points):
                         _, inds = self.kdtree_data.query(points, k=1)
                         inds = np.array(inds).flatten()
-                        layer_points[idx] = np.copy(data[inds])
+                        layer_points[idx] = np.copy(data[inds])[:, self.current_axis]
                     if isinstance(layer, napari.layers.Shapes):
                         layer_points = layer_points.tolist()
                     elif isinstance(layer, napari.layers.Points) or isinstance(layer, CustomPointsLayer):
