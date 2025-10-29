@@ -161,13 +161,20 @@ def train_step_flexconsensus(graphdef, state, x):
     pairwise_distances_batch = jax.vmap(pairwise_distances)
 
     def loss_fn(model, x, input_space_idx):
-        x_jnp = jnp.array(x)
+        # Pad array in x so they have the same dimensions
+        max_dimensions = max(arr.shape[1] for arr in x)
+        x_jnp = [jnp.pad(arr, ((0, 0), (0, max_dimensions - arr.shape[1])), mode='constant', constant_values=0.0 ) for arr in x]
+        x_jnp = jnp.array(x_jnp)
 
         # Encode space
         consensus_spaces = [model.consensus_space(model.encoders[input_space_name + "_encoder"](input_space)) for input_space, input_space_name in zip(x, model.input_spaces_name)]  # TODO: Can we find the matching better?
 
         # Decode spaces
         decoded_spaces = [model.decoders[input_space_name + "_decoder"](consensus_spaces[input_space_idx]) for input_space_name in model.input_spaces_name]
+
+        # Pad decoded spaces so they have the same dimensions
+        decoded_spaces = [jnp.pad(arr, ((0, 0), (0, max_dimensions - arr.shape[1])), mode='constant', constant_values=0.0) for arr in decoded_spaces]
+        decoded_spaces_jnp = jnp.array(decoded_spaces)
 
         # Consensus loss (single space)
         diffs = jnp.array(consensus_spaces)[:, None, :, :] - jnp.array(consensus_spaces)[None, :, :, :]
@@ -203,7 +210,7 @@ def train_step_flexconsensus(graphdef, state, x):
         center_of_mass_loss = jnp.square(consensus_spaces[input_space_idx].mean(axis=0)).sum()
 
         # Decoder loss
-        representation_loss = jnp.mean(jnp.square(x_jnp - jnp.array(decoded_spaces)), axis=-1).mean()
+        representation_loss = jnp.mean(jnp.square(x_jnp - decoded_spaces_jnp), axis=-1).mean()
 
         # Compute total loss
         loss = single_space_loss + shannon_mapping_loss + center_of_mass_loss + representation_loss
