@@ -163,8 +163,9 @@ class MultiEncoder(nnx.Module):
         # Rigid alignment to place volumes in registration
         self.rigid_6d_rotation = nnx.Linear(256, 6, rngs=rngs, kernel_init=nnx.initializers.zeros,
                                             bias_init=nnx.initializers.zeros)
-        self.rigid_shifts = nnx.Linear(256, 2, rngs=rngs, bias_init=nnx.initializers.zeros)
-        self.alpha = nnx.Param(jnp.array(1e-4))
+        self.rigid_shifts = nnx.Linear(256, 2, rngs=rngs, kernel_init=nnx.initializers.zeros, bias_init=nnx.initializers.zeros)
+        self.alpha_rotations = nnx.Param(jnp.array(1e-4))
+        self.alpha_shifts = nnx.Param(jnp.array(1e-4))
 
     def sample_gaussian(self, mean, logstd):
         return logstd * jnr.normal(self.normal_key, shape=mean.shape) + mean
@@ -176,7 +177,7 @@ class MultiEncoder(nnx.Module):
             # Particle pose refinement
             rotations_6d = self.rigid_6d_rotation(x)
             identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...].repeat(rotations_6d.shape[0], axis=0)
-            rotation_6d = identity_6d + self.alpha * rotations_6d
+            rotation_6d = identity_6d + self.alpha_rotations * rotations_6d
             a1, a2 = jnp.split(rotation_6d, 2, axis=-1)
             b1 = a1 / jnp.clip(jnp.linalg.norm(a1, axis=-1, keepdims=True), a_min=1e-6)
             a2_ortho = a2 - jnp.sum(a2 * b1, axis=-1, keepdims=True) * b1
@@ -185,7 +186,7 @@ class MultiEncoder(nnx.Module):
             rotations = jnp.stack([b1, b2, b3], axis=-1)
 
             # Particle shift refinement
-            shifts = self.rigid_shifts(x)
+            shifts = self.alpha_shifts * self.rigid_shifts(x)
 
         if self.isVae:
             mean = self.mean_x(x)
@@ -205,7 +206,7 @@ class MultiEncoder(nnx.Module):
             latent = self.latent(x)
             if return_last:
                 if return_alignment_refinement:
-                    return latent, (rotations, shifts)
+                    return latent, (rotations, shifts), x
                 else:
                     return latent, x
             else:
@@ -246,8 +247,11 @@ class DeltaVolumeDecoder(nnx.Module):
 
         # Rigid alignment to place volumes in registration
         self.rigid_6d_rotation = nnx.Linear(8, 6, rngs=rngs, kernel_init=nnx.initializers.zeros, bias_init=nnx.initializers.zeros)
-        self.rigid_shifts = nnx.Linear(8, 3, rngs=rngs, bias_init=nnx.initializers.zeros)
-        self.alpha = nnx.Param(jnp.array(1e-4))
+        # self.rigid_shifts = nnx.Linear(8, 3, rngs=rngs, bias_init=nnx.initializers.zeros)  # TODO: Using this without alpha_shifts give "perfect" results on simulated but does not work on tomo
+        self.rigid_shifts = nnx.Linear(8, 3, rngs=rngs, kernel_init=nnx.initializers.zeros, bias_init=nnx.initializers.zeros)
+        # self.rigid_shifts = nnx.Linear(8, 3, rngs=rngs, kernel_init=normal_initializer_mean(mean=0.0, stddev=1e-4), bias_init=nnx.initializers.zeros)
+        self.alpha_rotations = nnx.Param(jnp.array(1e-4))
+        self.alpha_shifts = nnx.Param(jnp.array(1e-4))
 
     def __call__(self, x):
         # Decode voxel values
@@ -278,7 +282,7 @@ class DeltaVolumeDecoder(nnx.Module):
         # Estimate rotations for volume registration
         rotations_6d = self.rigid_6d_rotation(x)
         identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...].repeat(rotations_6d.shape[0], axis=0)
-        rotation_6d = identity_6d + self.alpha * rotations_6d
+        rotation_6d = identity_6d + self.alpha_rotations * rotations_6d
         a1, a2 = jnp.split(rotation_6d, 2, axis=-1)
         b1 = a1 / jnp.clip(jnp.linalg.norm(a1, axis=-1, keepdims=True), a_min=1e-6)
         a2_ortho = a2 - jnp.sum(a2 * b1, axis=-1, keepdims=True) * b1
@@ -287,10 +291,10 @@ class DeltaVolumeDecoder(nnx.Module):
         rotations = jnp.stack([b1, b2, b3], axis=-1)
 
         # Estimate shifts for volume registration
-        shifts = self.factor * self.rigid_shifts(x)
+        shifts = self.factor * self.alpha_shifts * self.rigid_shifts(x)
 
         # Register coordinates
-        coords = jnp.matmul(coords, rearrange(rotations, "b r c -> b c r")) - shifts[:, None, :]
+        coords = jnp.matmul(coords, rotations) + shifts[:, None, :]
 
         return coords, values
 
@@ -639,9 +643,8 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
         else:
             # Expectation over values and rotations for speed (convergence is almost guaranteed)
             coords_swd = jnr.choice(distributions_key, coords, axis=1, shape=(100,), replace=False) / model.delta_volume_decoder.factor
-            values_swd = jnr.choice(distributions_key, values, axis=1, shape=(100,), replace=False)
-            random_rotations_swd = random_rotation_matrices(x.shape[0], distributions_key)
-            volume_registration_loss = compute_swd_matrix(coords_swd, values_swd, random_rotations_swd).mean()
+            values_swd = jnr.choice(distributions_key, nnx.relu(values), axis=1, shape=(100,), replace=False)
+            volume_registration_loss = compute_swd_matrix(coords_swd, values_swd, 32, distributions_key).mean()
 
         # Variational loss
         if model.isVae:
