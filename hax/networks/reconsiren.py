@@ -509,12 +509,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
         rotations = rotations[jnp.arange(images_corrected.shape[0]), min_indices, :]
 
         # Rotations to Euler angles (ZYZ)
-        tilt = jnp.arccos(jnp.clip(rotations[:, 2, 2], -1.0, 1.0))
-        is_singular = jnp.logical_or(jnp.abs(tilt) < 1e-6, jnp.abs(tilt - jnp.pi) < 1e-6)
-        rot_reg = jnp.arctan2(rotations[:, 1, 2], rotations[:, 0, 2])
-        rot_sing = jnp.arctan2(-rotations[:, 0, 1], rotations[:, 0, 0])
-        rot = jnp.where(is_singular, rot_sing, rot_reg)
-        euler_angles = jnp.stack([rot, tilt], axis=1)
+        euler_angles = euler_from_matrix_batch(rotations)[..., :2]
 
         # L1 based denoising
         if not model.delta_volume_decoder.transport_mass:
@@ -716,6 +711,7 @@ def main():
     import random
     import numpy as np
     import argparse
+    import matplotlib.pyplot as plt
     from xmipp_metadata.image_handler import ImageHandler
     import optax
     from hax.checkpointer import NeuralNetworkCheckpointer
@@ -779,6 +775,17 @@ def main():
     parser.add_argument("--reload", required=False, type=str,
                         help=f"Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data).")
     args = parser.parse_args()
+
+    # Matplotlib plot style
+    plt.style.use('dark_background')  # This sets many defaults for a dark theme
+    plt.rcParams['text.color'] = 'white'
+    plt.rcParams['axes.labelcolor'] = 'white'
+    plt.rcParams['xtick.color'] = 'white'
+    plt.rcParams['ytick.color'] = 'white'
+    plt.rcParams['axes.edgecolor'] = 'white'
+    plt.rcParams['figure.facecolor'] = 'black'
+    plt.rcParams['axes.facecolor'] = 'black'
+    plt.rcParams['savefig.facecolor'] = 'black'
 
     # Prepare metadata
     generator = MetaDataGenerator(args.md)
@@ -907,7 +914,7 @@ def main():
         params_pose = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('alpha_uniform')))
         params_volume = nnx.All(nnx.Param, nnx.PathContains('delta_volume_decoder'))
         optimizer_pose = nnx.Optimizer(reconsiren, optax.adam(args.learning_rate), wrt=params_pose)
-        optimizer_volume = nnx.Optimizer(reconsiren, optax.adam(min(10. * args.learning_rate, 1e-3)), wrt=params_volume)
+        optimizer_volume = nnx.Optimizer(reconsiren, optax.adam(1e-3), wrt=params_volume)
         graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_volume))
 
         # Training loop (ReconSIREN)
@@ -941,18 +948,24 @@ def main():
                 step += 1
 
             if i % 5 == 0:
+                # Example of predicted data for Tensorboard
                 volume = decode_volume(graphdef, state)
+                middle_slize = int(np.round(0.5 * volume.shape[-1]))
                 ImageHandler().write(np.array(volume), os.path.join(args.output_path, "reconsiren_map_intermediate.mrc"),
                                      overwrite=True)
+                slice_xy, slice_xz, slice_yz = (min_max_scale(volume[0, middle_slize, :, :]),
+                                                min_max_scale(volume[0, :, middle_slize, :]),
+                                                min_max_scale(volume[0, :, :, middle_slize]))
+                slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
+                writer.add_images("Predicted volume (slices)", slices, dataformats="NHWC", global_step=i)
+
+                # Plot angular distribution
+                reconsiren_intermediate, _, _ = nnx.merge(graphdef, state)
+                euler_angles = np.array(reconsiren_intermediate.memory_bank.value)
+                fig, _ = plot_angular_distribution(euler_angles)
+                writer.add_figure("Angular distribution density", fig, global_step=i)
 
         reconsiren, optimizer_pose, optimizer_volume = nnx.merge(graphdef, state)
-
-        # Example of predicted data for Tensorboard
-        # if not args.do_not_learn_volume:
-        #     volume = reconsiren.delta_volume_decoder.decode_volume()
-        #     volume_example = jax.vmap(min_max_scale)(volume[..., None])
-        #     writer.add_images("Predicted volume (slices)", volume_example, dataformats="NHWC")
-        #     ImageHandler().write(np.array(volume), os.path.join(args.output_path, "reconsiren_volume.mrc"))
 
         # Save model
         NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "ReconSIREN"), mode="pickle")

@@ -13,3 +13,4 @@ from .loggers import bcolors
 from .symmetry_groups import symmetry_matrices
 from .reconstruction import reconstruct_volume_streaming
 from .optimal_transport_functions import compute_swd_matrix
+from .plots import plot_angular_distribution
