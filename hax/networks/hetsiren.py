@@ -536,7 +536,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
     distributions_key, rot_sample_key, key = jnr.split(key, 3)
 
     # TODO: Explore sampling the posterior with M>1
-    M = 1
+    M = 4
 
     if M > 1:
         # VMAP functions
@@ -733,7 +733,8 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
         else:
             decoupling_loss = 0.0
 
-        loss = nll + 0.0001 * kl_loss + 0.001 * kl_pose + 0.001 * decoupling_loss + 0.01 * l1_loss  + 0.01 * (l1_grad_loss + l2_grad_loss) + 100. * hist_loss # + volumes_in_place_loss # + volume_registration_loss
+        loss = (nll + 0.0001 * kl_loss + 0.001 * kl_pose + 0.001 * decoupling_loss
+                + 0.01 * l1_loss  + 0.01 * (l1_grad_loss + l2_grad_loss) + 100. * hist_loss)
         return loss, (recon_loss.mean(), latent)
 
     # Check if Tomo mode
