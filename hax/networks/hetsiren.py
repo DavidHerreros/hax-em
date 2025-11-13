@@ -1018,11 +1018,6 @@ def main():
                 volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
                 values = volumeAdjustment()
 
-            # Place values on grid and replace HetSIREN reference volume
-            grid = jnp.zeros_like(vol)
-            grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2]].set(values)
-            hetsiren.reference_volume = grid
-            hetsiren.delta_volume_decoder.reference_values = values
                 # Place values on grid and replace HetSIREN reference volume
                 grid = jnp.zeros_like(vol)
                 grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2]].set(values)
@@ -1059,7 +1054,7 @@ def main():
 
         # Training loop (HetSIREN)
         print(f"{bcolors.OKCYAN}\n###### Training variability... ######")
-        for i in range(args.epochs):
+        for i in range(resume_epoch, args.epochs):
             total_loss = 0
             total_recon_loss = 0
 

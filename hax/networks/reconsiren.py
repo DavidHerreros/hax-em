@@ -909,11 +909,6 @@ def main():
                 volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
                 values = volumeAdjustment()
 
-            # Place values on grid and replace ReconSIREN reference volume
-            grid = jnp.zeros_like(vol)
-            grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2]].set(values)
-            reconsiren.reference_volume = grid
-            reconsiren.delta_volume_decoder.reference_values = values
                 # Place values on grid and replace ReconSIREN reference volume
                 grid = jnp.zeros_like(vol)
                 grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2]].set(values)
