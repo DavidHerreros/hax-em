@@ -439,27 +439,33 @@ def main():
                 representation_error = jnp.inf
                 consensus_latents = None
                 decoded_latents = None
-                for input_space_name in input_spaces_name:
+                best_match_name = None
+                for input_space_name, input_space_dim in zip(flexconsensus.input_spaces_name, flexconsensus.input_spaces_dim):
                     consensus_latents_trial = []
                     decoded_latents_trial = []
                     representation_error_trial = 0
-                    print(f"Trying with {input_space_name}")
 
-                    # For progress bar (TQDM)
-                    pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green")
+                    if input_spaces[idx].shape[1] == input_space_dim:
+                        print(f"Trying with {input_space_name}")
 
-                    for (x, _) in pbar:
-                        encoded, decoded = predict_fn(x, input_space_name, input_space_name)
-                        consensus_latents_trial.append(encoded)
-                        decoded_latents_trial.append(decoded)
-                        representation_error_trial += jnp.mean(jnp.square(x - decoded), axis=-1).mean()
+                        # For progress bar (TQDM)
+                        pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green")
 
-                    representation_error_trial /= len(data_loader)
+                        for (x, _) in pbar:
+                            encoded, decoded = predict_fn(x, input_space_name, input_space_name)
+                            consensus_latents_trial.append(encoded)
+                            decoded_latents_trial.append(decoded)
+                            representation_error_trial += jnp.mean(jnp.square(x - decoded), axis=-1).mean()
 
-                    if representation_error_trial < representation_error:
-                        consensus_latents = consensus_latents_trial
-                        decoded_latents = decoded_latents_trial
-                        representation_error = representation_error_trial
+                        representation_error_trial /= len(data_loader)
+
+                        if representation_error_trial < representation_error:
+                            consensus_latents = consensus_latents_trial
+                            decoded_latents = decoded_latents_trial
+                            representation_error = representation_error_trial
+                            best_match_name = input_space_name
+
+                print(f"\nBest match for input {idx + 1} was {best_match_name}")
 
             latents.append(np.array(jnp.concatenate(consensus_latents, axis=0)))
             latents_decoded.append(np.array(jnp.concatenate(decoded_latents, axis=0)))
@@ -477,7 +483,7 @@ def main():
             representation_error = np.array(logistic_transform_std_shift(representation_error))
 
             # Consensus error
-            for input_space_name in input_spaces_name:
+            for input_space_name in flexconsensus.input_spaces_name:
                 # [1] Decode current consensus space with one of the decoders
                 data_loader = NumpyGenerator(consensus_latent).return_tf_dataset(batch_size=args.batch_size,
                                                                                   shuffle=False, preShuffle=False)
@@ -491,8 +497,8 @@ def main():
                 # [3] Compute consensus error for the current consensus - encoded pair
                 diffs = consensus_latent - encoded
                 latents_rmse = jnp.sqrt(jnp.mean(diffs ** 2, axis=-1))
-                latent_error += np.array(logistic_transform_std_shift(latents_rmse))
-            latents_error.append(latent_error)
+                latent_error += np.array(latents_rmse)
+            latents_error.append(logistic_transform_std_shift(latent_error))
             representation_errors.append(representation_error)
 
         # Save consensus latents
