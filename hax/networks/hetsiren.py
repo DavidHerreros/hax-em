@@ -536,7 +536,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
     distributions_key, rot_sample_key, key = jnr.split(key, 3)
 
     # TODO: Explore sampling the posterior with M>1
-    M = 4
+    M = 1
 
     if M > 1:
         # VMAP functions
