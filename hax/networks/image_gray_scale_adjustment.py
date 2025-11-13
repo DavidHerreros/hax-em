@@ -60,7 +60,7 @@ class ImageAdjustment(nnx.Module):
         return a, b
 
 
-@partial(jax.jit, static_argnames=["sr", "ctf_type", "coords", "values"])
+@partial(jax.jit, static_argnames=["sr", "ctf_type"])
 def train_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_type, coords, values):
     model, optimizer = nnx.merge(graphdef, state)
 
@@ -108,11 +108,9 @@ def train_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_type, co
 
         # Apply gray level correction
         # images = (a * images + b) * (images != 0).astype(images.dtype)  # FIXME: Check this masking
-        images = a * images + b
-
-        # Prepare data for losses
-        images = jnp.squeeze(images)
-        x = jnp.squeeze(x)
+        a_reshaped = jnp.broadcast_to(a[:, None, None], images.shape)
+        b_reshaped = jnp.broadcast_to(b[:, None, None], images.shape)
+        images = a_reshaped * images + b_reshaped
 
         # Consider CTF
         if ctf_type == "apply":
@@ -151,6 +149,8 @@ def train_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_type, co
         x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
     grad_fn = nnx.value_and_grad(loss_fn)
+
+    x = x.squeeze()
     loss, grads = grad_fn(model, x, coords, values)
 
     optimizer.update(grads)
@@ -191,7 +191,7 @@ def main():
                         help="Sampling rate of the images/volume")
     parser.add_argument("--ctf_type", required=True, type=str, choices=["None", "apply", "wiener", "precorrect"],
                         help="Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)")
-    parser.add_argument("--predicts_value", action='store_true',
+    parser.add_argument("--predict_value", action='store_true',
                         help="If not provided, the adjustment will be estimated per pixel - otherwise, adjustment will be estimated per projection")
     parser.add_argument("--lat_dim", required=False, type=int, default=3,
                         help="Dimensionality of the latent space of the network (set by default to 3)")
@@ -324,8 +324,12 @@ def main():
                         colour="green")
 
             for (x, labels) in pbar:
+                x = x.squeeze()
                 a, b = predict_fn(x)
-                imgs_adjusted.append((x - b) / a)
+                a_reshaped = jnp.broadcast_to(a[:, None, None], x.shape)
+                b_reshaped = jnp.broadcast_to(b[:, None, None], x.shape)
+                imgs_adjusted.append((x - b_reshaped) / a_reshaped)
+
         imgs_adjusted = np.asarray(imgs_adjusted)
 
         # Save new images
@@ -333,7 +337,7 @@ def main():
         ImageHandler().write(imgs_adjusted, output_images_path, sr=args.sr)
         md = generator.md
         for idx in range(len(md)):
-            image_id, _ = md["image"].split('@')
+            image_id, _ = md[idx, "image"].split('@')
             md[idx, "image"] = "@".join([image_id, output_images_path])
         md.write(os.path.join(args.output_path, "adjusted_images" +  os.path.splitext(args.md)[1]))
 
