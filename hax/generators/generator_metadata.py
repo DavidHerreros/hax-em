@@ -77,12 +77,12 @@ class MetaDataGenerator:
             np_ninja.from_generator(
                 out_dir=mmap_output_dir,
                 sample_generator=map(self.md.getMetaDataImage, images_order),
-                batch_size=1024,
+                batch_size=4096,
                 verbose=True
             )
         return np_ninja.open_existing(mmap_output_dir)
 
-    def return_tf_dataset(self, preShuffle=False, shuffle=True, prefetch=-1, batch_size=8, mmap=True, mmap_output_dir=None):
+    def return_tf_dataset(self, preShuffle=False, shuffle=True, prefetch=-1, batch_size=8, mmap=True, mmap_output_dir=None, split_fraction=None):
         import tensorflow_datasets as tfds
         import tensorflow as tf
 
@@ -128,18 +128,39 @@ class MetaDataGenerator:
                 else:
                     dataset = tf.data.Dataset.from_tensor_slices((images, file_idx))
 
-            if shuffle:
-                dataset = dataset.shuffle(len(file_idx))
-
             if prefetch == -1:
                 prefetch = tf.data.AUTOTUNE
 
-            dataset = dataset.batch(batch_size)
+            if split_fraction is None:
+                if shuffle:
+                    dataset = dataset.shuffle(len(file_idx))
 
-            if mmap:
-                dataset = dataset.map(map_fn, num_parallel_calls=tf.data.AUTOTUNE, deterministic=False)
+                dataset = dataset.batch(batch_size)
 
-            return tfds.as_numpy(dataset.prefetch(prefetch))
+                if mmap:
+                    dataset = dataset.map(map_fn, num_parallel_calls=tf.data.AUTOTUNE, deterministic=False)
+
+                return tfds.as_numpy(dataset.prefetch(prefetch))
+            else:
+                split_at = int(split_fraction[0] * len(file_idx))
+                dataset_train = dataset.take(split_at)
+                dataset_validation = dataset.skip(split_at)
+
+                if shuffle:
+                    dataset = dataset.shuffle(len(file_idx))
+                    dataset_train = dataset_train.shuffle(split_at)
+
+                dataset = dataset.batch(batch_size)
+                dataset_train = dataset_train.batch(batch_size)
+                dataset_validation = dataset_validation.batch(batch_size)
+
+                if mmap:
+                    dataset = dataset.map(map_fn, num_parallel_calls=tf.data.AUTOTUNE, deterministic=False)
+                    dataset_train = dataset_train.map(map_fn, num_parallel_calls=tf.data.AUTOTUNE, deterministic=False)
+                    dataset_validation = dataset_validation.map(map_fn, num_parallel_calls=tf.data.AUTOTUNE, deterministic=False)
+
+                return tfds.as_numpy(dataset.prefetch(prefetch)), tfds.as_numpy(dataset_train.prefetch(prefetch)), tfds.as_numpy(dataset_validation.prefetch(prefetch))
+
 
     def return_torch_dataset(self, shuffle=True, preShuffle=True, batch_size=8, mmap=True, mmap_output_dir=None):
         import torch

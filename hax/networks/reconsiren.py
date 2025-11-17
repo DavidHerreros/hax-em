@@ -590,6 +590,124 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
 
     return loss, recon_loss, state, key
 
+
+@jax.jit
+def validation_step_reconsiren(graphdef, state, x, labels, md, key):
+    model, optimizer_pose, optimizer_volume = nnx.merge(graphdef, state)
+
+    # Random keys
+    key, choice_key = jax.random.split(key, 2)
+
+    def loss_fn(model, x):
+        # Correct CTF in images for encoder if needed
+        if model.ctf_type == "apply":
+            x_ctf_corrected = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
+        else:
+            x_ctf_corrected = x
+
+        # Get euler angles and shifts
+        rotations, shifts, _ = model.encoder(x_ctf_corrected, return_diversity_loss=True)
+
+        # Decode volume
+        coords, values = model.delta_volume_decoder()
+
+        # Refine current assignment (if provided)
+        # rotations = jnp.matmul(rotations, current_rotations[:, None, :, :])
+        rotations = jnp.matmul(current_rotations[:, None, :, :], rotations)  # TODO: The two options seem to work?
+        shifts = current_shifts[:, None, :] + shifts
+
+        # Random symmetry matrices
+        random_indices = jax.random.choice(choice_key, jnp.arange(model.symmetry_matrices.shape[0]), shape=(rotations.shape[0],))
+        rotations = jnp.matmul(jnp.transpose(model.symmetry_matrices[random_indices], (0, 2, 1))[:, None, :, :], rotations)
+
+        # Generate projections
+        images_corrected = model.phys_decoder(x, values, coords, model.xsize, rotations, shifts, ctf, model.ctf_type)
+
+        # Losses
+        images_corrected_loss = images_corrected[..., 0] if images_corrected.shape[-1] == 1 else images_corrected
+        x_loss = x[..., 0] if x.shape[-1] == 1 else x
+
+        # Consider CTF if Wiener/Squared mode (only for loss)
+        if model.ctf_type == "wiener":
+            ctf_broadcasted = jnp.broadcast_to(ctf[:, None, :], (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
+            ctf_broadcasted = rearrange(ctf_broadcasted, "b n w h -> (b n) w h")
+
+            x_loss = wiener2DFilter(x_loss, ctf, pad_factor=2)
+
+            images_corrected_loss = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
+            images_corrected_loss = wiener2DFilter(images_corrected_loss, ctf_broadcasted, pad_factor=2)
+            images_corrected_loss = rearrange(images_corrected_loss, "(b n) w h -> b n w h")
+        elif model.ctf_type == "squared":
+            ctf_broadcasted = jnp.broadcast_to(ctf[:, None, :], (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
+            ctf_broadcasted = rearrange(ctf_broadcasted, "b n w h -> (b n) w h")
+
+            x_loss = ctfFilter(x_loss, ctf, pad_factor=2)
+
+            images_corrected_loss = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
+            images_corrected_loss = ctfFilter(images_corrected_loss, ctf_broadcasted, pad_factor=2)
+            images_corrected_loss = rearrange(images_corrected_loss, "(b n) w h -> b n w h")
+
+        # Broadcast input images to right size
+        x_loss = jnp.broadcast_to(x_loss[:, None, ...], (x_loss.shape[0], images_corrected.shape[1], x_loss.shape[1], x_loss.shape[2]))
+
+        # Project "mask"
+        if not model.delta_volume_decoder.transport_mass:
+            projected_mask = model.phys_decoder(x, jnp.ones_like(values), coords, model.xsize, rotations, shifts, ctf, None, False)
+            projected_mask = jnp.where(projected_mask > 1, 1.0, projected_mask)
+        else:
+            projected_mask = jnp.ones_like(images_corrected)
+
+        # Projection mask
+        projected_mask = projected_mask[..., 0] if projected_mask.shape[-1] == 1 else projected_mask
+        x_loss = x_loss * projected_mask
+        images_corrected_loss = images_corrected_loss * projected_mask
+
+        x_flat = rearrange(x_loss, "b n w h -> (b n) w h")
+        images_corrected_flat = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
+        recon_loss = dm_pix.mse(images_corrected_flat[..., None], x_flat[..., None])
+        recon_loss = rearrange(recon_loss, "(b n) -> b n", b=images_corrected_loss.shape[0], n=images_corrected_loss.shape[1])
+
+        # Get minimum indices
+        min_indices = jnp.argmin(recon_loss, axis=1)
+
+        # Index losses and rotations based on extracted indices
+        recon_loss = recon_loss[jnp.arange(images_corrected.shape[0]), min_indices].mean()
+
+        return recon_loss
+
+    if model.refine_current_assignment:
+        # Precompute batch aligments
+        current_euler_angles = md["euler_angles"][labels]
+        current_rotations = euler_matrix_batch(current_euler_angles[..., 0], current_euler_angles[..., 1], current_euler_angles[..., 2])
+
+        # Precompute batch shifts
+        current_shifts = md["shifts"][labels]
+    else:
+        current_rotations = jnp.tile(jnp.eye(3)[None, ...], (x.shape[0], 1, 1))
+        current_shifts = jnp.zeros((x.shape[0], 2))
+
+    # Precompute batch CTFs
+    if model.ctf_type is not None:
+        defocusU = md["ctfDefocusU"][labels]
+        defocusV = md["ctfDefocusV"][labels]
+        defocusAngle = md["ctfDefocusAngle"][labels]
+        cs = md["ctfSphericalAberration"][labels]
+        kv = md["ctfVoltage"][labels][0]
+        ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
+                         model.sr, [2 * model.xsize, int(2 * 0.5 * model.xsize + 1)],
+                         x.shape[0], True)
+    else:
+        ctf = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
+
+    if model.ctf_type == "precorrect":
+        # Wiener filter
+        x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
+
+    loss = loss_fn(model, x)
+
+    return loss
+
+
 @jax.jit
 def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md):
     model = nnx.merge(graphdef, state)
@@ -719,6 +837,8 @@ def main():
     from hax.generators import MetaDataGenerator, extract_columns
     from hax.metrics import JaxSummaryWriter
     from hax.networks import VolumeAdjustment, train_step_volume_adjustment
+    def list_of_floats(arg):
+        return list(map(float, arg.split(',')))
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--md", required=True, type=str,
@@ -770,6 +890,11 @@ def main():
                              f"overshoot the lowest point, or cause {bcolors.ITALIC}NAN{bcolors.ENDC} errors. A small {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}1e-6{bcolors.ENDC}) is like taking tiny "
                              f"shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often {bcolors.ITALIC}0.0001{bcolors.ENDC}. If training fails or errors explode, "
                              f"try making the {bcolors.ITALIC}lr{bcolors.ENDC} 10 times smaller (e.g., {bcolors.ITALIC}0.001{bcolors.ENDC} --> {bcolors.ITALIC}0.0001{bcolors.ENDC}).")
+    parser.add_argument("-dataset_split_fraction", required=False, type=list_of_floats, default=[0.8, 0.2],
+                        help=f"Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: {bcolors.ITALIC}training_fraction{bcolors.ENDC},"
+                             f"{bcolors.ITALIC}validation_fraction{bcolors.ENDC}. While the training subset will be used to train/update the network parameters, the validation subset will only be used to evaluate the "
+                             f"accuracy of the network when faced with new data. Therefore, the validation subset will never be used to update the networks parameters. {bcolors.WARNING}NOTE{bcolors.ENDC}: the sum of "
+                             f"{bcolors.ITALIC}training_fraction{bcolors.ENDC} and {bcolors.ITALIC}validation_fraction{bcolors.ENDC} must be equal to one.")
     parser.add_argument("--output_path", required=True, type=str,
                         help="Path to save the results (trained neural network, new metadata...)")
     parser.add_argument("--reload", required=False, type=str,
@@ -786,6 +911,12 @@ def main():
     plt.rcParams['figure.facecolor'] = 'black'
     plt.rcParams['axes.facecolor'] = 'black'
     plt.rcParams['savefig.facecolor'] = 'black'
+
+    # Check that training and validation fractions add up to one
+    if sum(args.dataset_split_fraction) != 1:
+        raise ValueError(
+            f"The sum of {bcolors.ITALIC}training_fraction{bcolors.ENDC} and {bcolors.ITALIC}validation_fraction{bcolors.ENDC} is not equal one. Please, update the values "
+            f"to fulfill this requirement.")
 
     # Prepare metadata
     generator = MetaDataGenerator(args.md)
@@ -859,8 +990,8 @@ def main():
             return model.delta_volume_decoder.decode_volume()
 
         # Prepare data loader
-        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
-                                                  mmap=mmap, mmap_output_dir=mmap_output_dir)
+        data_loader_full, data_loader, data_loader_validation = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
+                                                                                            mmap=mmap, mmap_output_dir=mmap_output_dir, split_fraction=args.dataset_split_fraction)
 
         # Example of training data for Tensorboard
         x_example, labels_example = next(iter(data_loader))
@@ -887,7 +1018,7 @@ def main():
                     # For progress bar (TQDM)
                     step = 1
                     print(f'\nTraining epoch {i + 1}/{num_epochs_vol} |')
-                    pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{num_epochs_vol}", file=sys.stdout, ascii=" >=",
+                    pbar = tqdm(data_loader_full, desc=f"Epoch {i + 1}/{num_epochs_vol}", file=sys.stdout, ascii=" >=",
                                 colour="green")
 
                     for (x, labels) in pbar:
@@ -899,10 +1030,10 @@ def main():
                         pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
 
                         # Summary writer (training loss)
-                        if step % int(np.ceil(0.1 * len(data_loader))) == 0:
+                        if step % int(np.ceil(0.1 * len(data_loader_full))) == 0:
                             writer.add_scalar('Training loss (volume adjustment)',
                                               total_loss / step,
-                                              i * len(data_loader) + step)
+                                              i * len(data_loader_full) + step)
 
                         step += 1
 
@@ -938,9 +1069,11 @@ def main():
         for i in range(resume_epoch, args.epochs):
             total_loss = 0
             total_recon_loss = 0
+            total_validation_loss = 0
 
             # For progress bar (TQDM)
             step = 1
+            step_validation = 1
             print(f'\nTraining epoch {i + 1}/{args.epochs} |')
             pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{args.epochs}", file=sys.stdout, ascii=" >=", colour="green")
 
@@ -957,9 +1090,26 @@ def main():
                     writer.add_scalar('Training loss (ReconSIREN)',
                                       total_loss / step,
                                       i * len(data_loader) + step)
-                    writer.add_scalar('Reconstruction loss (ReconSIREN)',
-                                      total_recon_loss / step,
-                                      i * len(data_loader) + step)
+
+                    writer.add_scalars('Reconstruction loss (ReconSIREN)',
+                                       {"train": total_recon_loss / step},
+                                       i * len(data_loader) + step)
+
+                # Summary writer (validation loss)
+                if step % int(np.ceil(0.5 * len(data_loader))) == 0:
+                    # Run validation step
+                    print(f"\n{bcolors.WARNING}Running validation step...{bcolors.ENDC}\n")
+                    for (x_validation, labels_validation) in data_loader_validation:
+                        loss_validation = validation_step_reconsiren(graphdef, state, x_validation, labels_validation,
+                                                                   md_columns, rng)
+                        total_validation_loss += loss_validation
+
+                        step_validation += 1
+
+                    writer.add_scalars('Reconstruction loss (ReconSIREN)',
+                                       {"validation": total_validation_loss / step_validation},
+                                       i * len(data_loader) + step)
+
                 step += 1
 
             if i % 5 == 0:

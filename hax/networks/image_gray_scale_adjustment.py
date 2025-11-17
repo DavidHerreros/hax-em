@@ -160,6 +160,98 @@ def train_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_type, co
     return loss, state
 
 
+@partial(jax.jit, static_argnames=["sr", "ctf_type", "coords", "values"])
+def validation_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_type, coords, values):
+    model, optimizer = nnx.merge(graphdef, state)
+
+    def loss_fn(model, x, coords, values):
+        factor = 0.5 * model.xsize
+
+        # Gray level adjustment
+        a, b = model(x)
+
+        # Rotate grid
+        rotations = euler_matrix_batch(euler_angles[:, 0], euler_angles[:, 1], euler_angles[:, 2])
+        coords = jnp.matmul(factor * coords, rearrange(rotations, "b r c -> b c r"))
+
+        # Apply shifts
+        coords = coords[..., :-1] - shifts[:, None, :] + factor
+
+        # Scatter image
+        B = x.shape[0]
+        c_sampling = jnp.stack([coords[..., 1], coords[..., 0]], axis=2)
+        images = jnp.zeros((B, model.xsize, model.xsize), dtype=x.dtype)
+
+        bamp = values[None, ...]
+
+        bposf = jnp.floor(c_sampling)
+        bposi = bposf.astype(jnp.int32)
+        bposf = c_sampling - bposf
+
+        bamp0 = bamp * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1])
+        bamp1 = bamp * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1])
+        bamp2 = bamp * (bposf[:, :, 0]) * (bposf[:, :, 1])
+        bamp3 = bamp * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1])
+        bamp = jnp.concat([bamp0, bamp1, bamp2, bamp3], axis=1)
+        bposi = jnp.concat([bposi, bposi + jnp.array((1, 0)), bposi + jnp.array((1, 1)), bposi + jnp.array((0, 1))],
+                           axis=1)
+
+        def scatter_img(image, bpos_i, bamp_i):
+            return image.at[bpos_i[..., 0], bpos_i[..., 1]].add(bamp_i)
+
+        images = jax.vmap(scatter_img)(images, bposi, bamp)
+
+        # Gaussian filter (needed by forward interpolation)
+        images = jnp.squeeze(dm_pix.gaussian_blur(images[..., None], 1.0, kernel_size=3))
+
+        # Apply gray level correction
+        # images = (a * images + b) * (images != 0).astype(images.dtype)  # FIXME: Check this masking
+        images = a * images + b
+
+        # Prepare data for losses
+        images = jnp.squeeze(images)
+        x = jnp.squeeze(x)
+
+        # Consider CTF
+        if ctf_type == "apply":
+            images = ctfFilter(images, ctf, pad_factor=2)
+        elif ctf_type == "wiener":
+            x = wiener2DFilter(x, ctf, pad_factor=2)
+        elif ctf_type == "squared":
+            x = ctfFilter(x, ctf, pad_factor=2)
+            images = ctfFilter(images, ctf * ctf, pad_factor=2)
+
+        # Loss
+        loss = dm_pix.mse(images[..., None], x[..., None]).mean()
+        return loss
+
+    # Precompute batch aligments
+    euler_angles = md["euler_angles"][labels]
+
+    # Precompute batch shifts
+    shifts = md["shifts"][labels]
+
+    # Precompute batch CTFs
+    if ctf_type is not None:
+        defocusU = md["ctfDefocusU"][labels]
+        defocusV = md["ctfDefocusV"][labels]
+        defocusAngle = md["ctfDefocusAngle"][labels]
+        cs = md["ctfSphericalAberration"][labels]
+        kv = md["ctfVoltage"][labels][0]
+        ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
+                         sr, [2 * model.xsize, int(2 * 0.5 * model.xsize + 1)],
+                         x.shape[0], True)
+    else:
+        ctf = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
+
+    if ctf_type == "precorrect":
+        # Wiener filter
+        x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
+
+    loss = loss_fn(model, x, coords, values)
+
+    return loss
+
 
 
 def main():
@@ -176,6 +268,8 @@ def main():
     from hax.generators import MetaDataGenerator, extract_columns
     from hax.networks import train_step_image_adjustment
     from hax.metrics import JaxSummaryWriter
+    def list_of_floats(arg):
+        return list(map(float, arg.split(',')))
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--md", required=True, type=str,
@@ -212,11 +306,22 @@ def main():
                              f"overshoot the lowest point, or cause {bcolors.ITALIC}NAN{bcolors.ENDC} errors. A small {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}1e-6{bcolors.ENDC}) is like taking tiny "
                              f"shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often {bcolors.ITALIC}0.0001{bcolors.ENDC}. If training fails or errors explode, "
                              f"try making the {bcolors.ITALIC}lr{bcolors.ENDC} 10 times smaller (e.g., {bcolors.ITALIC}0.001{bcolors.ENDC} --> {bcolors.ITALIC}0.0001{bcolors.ENDC}).")
+    parser.add_argument("-dataset_split_fraction", required=False, type=list_of_floats, default=[0.8, 0.2],
+                        help=f"Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: {bcolors.ITALIC}training_fraction{bcolors.ENDC},"
+                             f"{bcolors.ITALIC}validation_fraction{bcolors.ENDC}. While the training subset will be used to train/update the network parameters, the validation subset will only be used to evaluate the "
+                             f"accuracy of the network when faced with new data. Therefore, the validation subset will never be used to update the networks parameters. {bcolors.WARNING}NOTE{bcolors.ENDC}: the sum of "
+                             f"{bcolors.ITALIC}training_fraction{bcolors.ENDC} and {bcolors.ITALIC}validation_fraction{bcolors.ENDC} must be equal to one.")
     parser.add_argument("--output_path", required=True, type=str,
                         help="Path to save the results (trained neural network, new metadata...)")
     parser.add_argument("--reload", required=False, type=str,
                         help="Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data)")
     args = parser.parse_args()
+
+    # Check that training and validation fractions add up to one
+    if sum(args.dataset_split_fraction) != 1:
+        raise ValueError(
+            f"The sum of {bcolors.ITALIC}training_fraction{bcolors.ENDC} and {bcolors.ITALIC}validation_fraction{bcolors.ENDC} is not equal one. Please, update the values "
+            f"to fulfill this requirement.")
 
     # Preprocess volume (and mask)
     vol = ImageHandler(args.vol).getData()
@@ -263,8 +368,8 @@ def main():
         writer = JaxSummaryWriter(os.path.join(args.output_path, "Image_adjustment_metrics"))
 
         # Prepare data loader
-        data_loader = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
-                                                  mmap=mmap, mmap_output_dir=mmap_output_dir)
+        _, data_loader, data_loader_validation = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
+                                                                             mmap=mmap, mmap_output_dir=mmap_output_dir, split_fraction=args.dataset_split_fraction)
 
         # Example of training data for Tensorboard
         x_example, labels_example = next(iter(data_loader))
@@ -286,9 +391,11 @@ def main():
         print(f"{bcolors.OKCYAN}\n###### Training image adjustment... ######")
         for i in range(resume_epoch, args.epochs):
             total_loss = 0
+            total_validation_loss = 0
 
             # For progress bar (TQDM)
             step = 1
+            step_validation = 1
             print(f'\nTraining epoch {i + 1}/{args.epochs} |')
             pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{args.epochs}", file=sys.stdout, ascii=" >=",
                         colour="green")
@@ -302,9 +409,25 @@ def main():
 
                 # Summary writer (training loss)
                 if step % int(np.ceil(0.1 * len(data_loader))) == 0:
-                    writer.add_scalar('Training loss (image adjustment)',
-                                      total_loss / step,
-                                      i * len(data_loader) + step)
+                    writer.add_scalars('Training loss (image adjustment)',
+                                       {"train": total_loss / step},
+                                       i * len(data_loader) + step)
+
+                # Summary writer (validation loss)
+                if step % int(np.ceil(0.5 * len(data_loader))) == 0:
+                    # Run validation step
+                    print(f"\n{bcolors.WARNING}Running validation step...{bcolors.ENDC}\n")
+                    for (x_validation, labels_validation) in data_loader_validation:
+                        loss_validation = validation_step_image_adjustment(graphdef, state, x_validation,
+                                                                           labels_validation,
+                                                                           md_columns, rng)
+                        total_validation_loss += loss_validation
+
+                        step_validation += 1
+
+                    writer.add_scalars('Training loss (image adjustment)',
+                                       {"validation": total_validation_loss / step_validation},
+                                       i * len(data_loader) + step)
 
                 step += 1
 
