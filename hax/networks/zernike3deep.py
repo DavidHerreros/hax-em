@@ -436,7 +436,7 @@ class Zernike3Deep(nnx.Module):
 @jax.jit
 def train_step_zernike3deep(graphdef, state, x, labels, md, key):
     model, optimizer, optimizer_grays = nnx.merge(graphdef, state)
-    distributions_key, key = jax.split(key)
+    distributions_key, key = jax.random.split(key)
 
     def loss_fn_ot(model, x):
         # Encode latent E(z)
