@@ -534,7 +534,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
         uniform_angular_distribution_loss = sliced_wasserstein_loss(memory_bank_subset, uniform_distributed_samples, key)
 
         # loss = recon_loss + l1_loss  + 0.001 * (l1_grad_loss + l2_grad_loss) # + 0.001 * uniform_angular_distribution_loss
-        loss = recon_loss + l1_loss + 0.001 * (l1_grad_loss + l2_grad_loss) + nnx.relu(model.alpha_uniform.value) * uniform_angular_distribution_loss + nnx.relu(model.alpha_uniform.value) * diversity_loss
+        loss = recon_loss + 0.001 * l1_loss + 0.001 * (l1_grad_loss + l2_grad_loss) + nnx.relu(model.alpha_uniform.value) * uniform_angular_distribution_loss + nnx.relu(model.alpha_uniform.value) * diversity_loss
         return loss, (recon_loss, euler_angles)
 
 
