@@ -837,6 +837,8 @@ def main():
     from hax.generators import MetaDataGenerator, extract_columns
     from hax.metrics import JaxSummaryWriter
     from hax.networks import VolumeAdjustment, train_step_volume_adjustment
+    from hax.schedulers import CosineAnnealingScheduler
+
     def list_of_floats(arg):
         return list(map(float, arg.split(',')))
 
@@ -1049,11 +1051,16 @@ def main():
                 # Save model
                 NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "volumeAdjustment"), mode="pickle")
 
+        # Learning rate scheduler
+        total_steps = args.epochs * len(data_loader)
+        lr_schedule_pose = CosineAnnealingScheduler.getScheduler(peak_value=4. * args.learning_rate, total_steps=total_steps, warmup_frac=0.1, init_value=args.learning_rate, end_value=0.0)
+        lr_schedule_volume = CosineAnnealingScheduler.getScheduler(peak_value=4. * 1e-3, total_steps=total_steps, warmup_frac=0.1, init_value=1e-3, end_value=0.0)
+
         # Optimizers (ReconSIREN)
         params_pose = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('alpha_uniform')))
         params_volume = nnx.All(nnx.Param, nnx.PathContains('delta_volume_decoder'))
-        optimizer_pose = nnx.Optimizer(reconsiren, optax.adam(args.learning_rate), wrt=params_pose)
-        optimizer_volume = nnx.Optimizer(reconsiren, optax.adam(1e-3), wrt=params_volume)
+        optimizer_pose = nnx.Optimizer(reconsiren, optax.adam(lr_schedule_pose), wrt=params_pose)
+        optimizer_volume = nnx.Optimizer(reconsiren, optax.adam(lr_schedule_volume), wrt=params_volume)
         graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_volume))
 
         # Resume if checkpoint exists

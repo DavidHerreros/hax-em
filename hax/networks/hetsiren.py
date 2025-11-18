@@ -1150,8 +1150,12 @@ def main():
                 # Save model
                 NeuralNetworkCheckpointer.save(volumeAdjustment, os.path.join(args.output_path, "volumeAdjustment"), mode="pickle")
 
+        # Learning rate scheduler
+        total_steps = args.epochs * len(data_loader)
+        lr_schedule = CosineAnnealingScheduler.getScheduler(peak_value=args.learning_rate, total_steps=total_steps, warmup_frac=0.1, end_value=0.0, init_value=1e-5)
+
         # Optimizers (HetSIREN)
-        optimizer = nnx.Optimizer(hetsiren, optax.adam(args.learning_rate))
+        optimizer = nnx.Optimizer(hetsiren, optax.adam(lr_schedule))
         graphdef, state = nnx.split((hetsiren, optimizer))
 
         # Resume if checkpoint exists
