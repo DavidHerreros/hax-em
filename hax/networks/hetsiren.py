@@ -598,10 +598,10 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
 
         # Sample new rotations
         if M > 1:
-            rotations_rigid, omegas, log_q = sample_topM_R(rot_sample_key, rotations_rigid, rotations_logscale, M=M)
-
             # Consider refinement and rigid registration alignments (for delta_volume_decoder_rigid output)
-            rotations_refined = jnp.matmul(rotations[:, None, ...], rotations_rigid)
+            rotations_refined = jnp.matmul(rotations, rotations_rigid)
+
+            rotations_refined, omegas, log_q = sample_topM_R(rot_sample_key, rotations_refined, rotations_logscale, M=M)
         else:
             # Consider refinement and rigid registration alignments (for delta_volume_decoder_rigid output)
             rotations_refined = jnp.matmul(rotations, rotations_rigid)
@@ -666,10 +666,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
         recons_loss_all = 0.5 * (recon_loss + recon_loss_rigid)
 
         # L1 based denoising
-        if not model.delta_volume_decoder.transport_mass:
-            l1_loss = jnp.mean(jnp.abs(values))
-        else:
-            l1_loss = 0.0
+        l1_loss = jnp.mean(jnp.abs(values))
 
         # L1 and L2 total variation
         # diff_x = volumes[:, 1:, :, :] - volumes[:, :-1, :, :]
@@ -713,7 +710,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
                 rotations_random_matrix = euler_matrix_batch(rotations_random[:, 0], rotations_random[:, 1], rotations_random[:, 2])
                 if M > 1:
                     images_corrected = images_corrected[:, 0, ...]
-                    rotations_random_refined = jnp.matmul(rotations_random_matrix, rotations_rigid[:, 0, ...])
+                    rotations_random_refined = jnp.matmul(rotations_random_matrix, rotations_rigid)
                 else:
                     rotations_random_refined = jnp.matmul(rotations_random_matrix, rotations_rigid)
                 shifts_random_refined = shifts + jnp.matmul(shifts_rigid[:, None, :], rearrange(rotations_random_matrix, "b m n -> b n m"))[:, 0, :2]
@@ -745,7 +742,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key):
             decoupling_loss = 0.0
 
         loss = (nll + 0.0001 * kl_loss + 0.001 * kl_pose + 0.001 * decoupling_loss
-                + 0.01 * l1_loss  + 0.01 * (l1_grad_loss + l2_grad_loss) + 100. * hist_loss)
+                + 0.001 * l1_loss  + 0.001 * (l1_grad_loss + l2_grad_loss) + 100. * hist_loss)
         return loss, (recon_loss.mean(), latent)
 
     # Check if Tomo mode
