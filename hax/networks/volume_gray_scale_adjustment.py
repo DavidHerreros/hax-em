@@ -17,6 +17,7 @@ class VolumeAdjustment(nnx.Module):
     def __init__(self, coords, values, lat_dim=10, predicts_value=True, *, rngs: nnx.Rngs):
         self.coords = coords
         self.values = values
+        self.predicts_value = predicts_value
         out_dim = 1 if predicts_value else self.values.shape[0]
 
         # Gray level adjustment (TODO: with 256 features OK)
@@ -51,7 +52,6 @@ class VolumeAdjustment(nnx.Module):
             return a, b
         else:
             values = a * self.values + b
-            # values = nnx.relu(values)  # FIXME: Review this
 
             return values
 
@@ -435,12 +435,18 @@ def main():
 
         volumeAdjustment.eval()
 
-        # Predict new values
-        values = np.array(volumeAdjustment())
+        if volumeAdjustment.predicts_value:
+            # Predict adjustment
+            a, b = volumeAdjustment(return_ab=True)
 
-        # Place new values in volume
-        adjusted_vol = np.zeros_like(vol)
-        adjusted_vol[inds[:, 0], inds[:, 1], inds[:, 2]] = values
+            adjusted_vol = np.array(a * vol + b)
+        else:
+            # Predict new values
+            values = np.array(volumeAdjustment())
+
+            # Place new values in volume
+            adjusted_vol = np.zeros_like(vol)
+            adjusted_vol[inds[:, 0], inds[:, 1], inds[:, 2]] = values
 
         # Save new volume
         ImageHandler().write(adjusted_vol, os.path.join(args.output_path, "adjusted_volume.mrc"), sr=args.sr)
