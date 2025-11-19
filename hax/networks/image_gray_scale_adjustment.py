@@ -36,6 +36,9 @@ class ImageAdjustment(nnx.Module):
             self.b = nnx.Linear(32, xsize * xsize, rngs=rngs, kernel_init=jax.nn.initializers.normal(stddev=0.001))
 
     def __call__(self, x):
+        if x.ndim == 4:
+            x = x[..., 0]
+
         x = rearrange(x, 'b h w -> b (h w)')
 
         partial_gray = nnx.relu(self.hidden_layers_ds[0](x))
@@ -60,7 +63,7 @@ class ImageAdjustment(nnx.Module):
         return a, b
 
 
-@partial(jax.jit, static_argnames=["sr", "ctf_type", "coords", "values"])
+@partial(jax.jit, static_argnames=["sr", "ctf_type"])
 def train_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_type, coords, values):
     model, optimizer = nnx.merge(graphdef, state)
 
@@ -69,6 +72,11 @@ def train_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_type, co
 
         # Gray level adjustment
         a, b = model(x)
+
+        # Adjust shapes of a and b
+        if model.predict_value:
+            a = a[:, None, None]
+            b = b[:, None, None]
 
         # Rotate grid
         rotations = euler_matrix_batch(euler_angles[:, 0], euler_angles[:, 1], euler_angles[:, 2])
@@ -104,15 +112,13 @@ def train_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_type, co
         images = jax.vmap(scatter_img)(images, bposi, bamp)
 
         # Gaussian filter (needed by forward interpolation)
-        images = jnp.squeeze(dm_pix.gaussian_blur(images[..., None], 1.0, kernel_size=3))
+        images = dm_pix.gaussian_blur(images[..., None], 1.0, kernel_size=3)[..., 0]
 
         # Apply gray level correction
-        # images = (a * images + b) * (images != 0).astype(images.dtype)  # FIXME: Check this masking
         images = a * images + b
 
         # Prepare data for losses
-        images = jnp.squeeze(images)
-        x = jnp.squeeze(x)
+        x = x[..., 0]
 
         # Consider CTF
         if ctf_type == "apply":
@@ -148,9 +154,10 @@ def train_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_type, co
 
     if ctf_type == "precorrect":
         # Wiener filter
-        x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
+        x = wiener2DFilter(x[..., 0], ctf)[..., None]
 
     grad_fn = nnx.value_and_grad(loss_fn)
+
     loss, grads = grad_fn(model, x, coords, values)
 
     optimizer.update(grads)
@@ -160,7 +167,7 @@ def train_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_type, co
     return loss, state
 
 
-@partial(jax.jit, static_argnames=["sr", "ctf_type", "coords", "values"])
+@partial(jax.jit, static_argnames=["sr", "ctf_type"])
 def validation_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_type, coords, values):
     model, optimizer = nnx.merge(graphdef, state)
 
@@ -169,6 +176,11 @@ def validation_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_typ
 
         # Gray level adjustment
         a, b = model(x)
+
+        # Adjust shapes of a and b
+        if model.predict_value:
+            a = a[:, None, None]
+            b = b[:, None, None]
 
         # Rotate grid
         rotations = euler_matrix_batch(euler_angles[:, 0], euler_angles[:, 1], euler_angles[:, 2])
@@ -202,15 +214,13 @@ def validation_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_typ
         images = jax.vmap(scatter_img)(images, bposi, bamp)
 
         # Gaussian filter (needed by forward interpolation)
-        images = jnp.squeeze(dm_pix.gaussian_blur(images[..., None], 1.0, kernel_size=3))
+        images = dm_pix.gaussian_blur(images[..., None], 1.0, kernel_size=3)[..., 0]
 
         # Apply gray level correction
-        # images = (a * images + b) * (images != 0).astype(images.dtype)  # FIXME: Check this masking
         images = a * images + b
 
         # Prepare data for losses
-        images = jnp.squeeze(images)
-        x = jnp.squeeze(x)
+        x = x[..., 0]
 
         # Consider CTF
         if ctf_type == "apply":
@@ -246,7 +256,7 @@ def validation_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_typ
 
     if ctf_type == "precorrect":
         # Wiener filter
-        x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
+        x = wiener2DFilter(x[..., 0], ctf)[..., None]
 
     loss = loss_fn(model, x, coords, values)
 
@@ -286,7 +296,7 @@ def main():
                         help="Sampling rate of the images/volume")
     parser.add_argument("--ctf_type", required=True, type=str, choices=["None", "apply", "wiener", "precorrect"],
                         help="Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)")
-    parser.add_argument("--predicts_value", action='store_true',
+    parser.add_argument("--predict_value", action='store_true',
                         help="If not provided, the adjustment will be estimated per pixel - otherwise, adjustment will be estimated per projection")
     parser.add_argument("--lat_dim", required=False, type=int, default=3,
                         help="Dimensionality of the latent space of the network (set by default to 3)")
@@ -418,9 +428,8 @@ def main():
                     # Run validation step
                     print(f"\n{bcolors.WARNING}Running validation step...{bcolors.ENDC}\n")
                     for (x_validation, labels_validation) in data_loader_validation:
-                        loss_validation = validation_step_image_adjustment(graphdef, state, x_validation,
-                                                                           labels_validation,
-                                                                           md_columns, rng)
+                        loss_validation = validation_step_image_adjustment(graphdef, state, x_validation, labels_validation,
+                                                                           md_columns, args.sr, args.ctf_type, coords, values)
                         total_validation_loss += loss_validation
 
                         step_validation += 1
@@ -456,23 +465,35 @@ def main():
 
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting image adjustment... ######")
-        imgs_adjusted = []
-        for i in range(args.epochs):
-            # For progress bar (TQDM)
-            pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=",
-                        colour="green")
+        pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=",
+                    colour="green")
 
-            for (x, labels) in pbar:
-                a, b = predict_fn(x)
-                imgs_adjusted.append((x - b) / a)
-        imgs_adjusted = np.asarray(imgs_adjusted)
+        imgs_adjusted = []
+        adjustment_a = []
+        adjustment_b = []
+        for (x, labels) in pbar:
+            a, b = predict_fn(x)
+
+            # Adjust shapes of a and b
+            if imageAdjustment.predict_value:
+                adjustment_a.append(1. / a)
+                adjustment_b.append(-b / a)
+                a = a[:, None, None]
+                b = b[:, None, None]
+
+            adjustment = np.nan_to_num(np.asarray((x[..., 0] - b) / a), nan=0.0, posinf=0.0, neginf=0.0)
+            imgs_adjusted.append(adjustment)
+        imgs_adjusted = np.concatenate(imgs_adjusted, axis=0)
 
         # Save new images
         output_images_path = os.path.join(args.output_path, "adjusted_images.mrcs")
         ImageHandler().write(imgs_adjusted, output_images_path, sr=args.sr)
         md = generator.md
+        if imageAdjustment.predict_value:
+            md[:, "adjustment_a"] = np.concatenate(adjustment_a, axis=0)
+            md[:, "adjustment_b"] = np.concatenate(adjustment_b, axis=0)
         for idx in range(len(md)):
-            image_id, _ = md["image"].split('@')
+            image_id, _ = md[idx, "image"].split('@')
             md[idx, "image"] = "@".join([image_id, output_images_path])
         md.write(os.path.join(args.output_path, "adjusted_images" +  os.path.splitext(args.md)[1]))
 
