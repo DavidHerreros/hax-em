@@ -1016,7 +1016,10 @@ def main():
 
             # Log intermediate results at the end of the epoch
             # Get first 5 images from batch
-            x_for_tb = x[:5]
+            if zernike3deep.isTomo:
+                x_for_tb = x[0][:5]
+            else:
+                x_for_tb = x[:5]
             labels_for_tb = labels[:5]
 
             # Decode some images and show them in Tensorboard
