@@ -339,7 +339,8 @@ def main():
     if args.mask is not None:
         mask = ImageHandler(args.mask).getData()
     else:
-        mask = ImageHandler().createCircularMask(boxSize=vol.shape[0], is3D=True)
+        mask = ImageHandler().generateMask(inputFn=vol, boxsize=64)
+        ImageHandler().write(mask, os.path.join(args.output_path, "mask.mrc"), sr=args.sr)
 
     # Data loading approach
     if args.load_images_to_ram:
