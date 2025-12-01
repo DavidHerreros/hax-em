@@ -288,7 +288,7 @@ def interpolate_image_field(graphdef, state, images, initial_inds_modart):
     xsize = images.shape[1]
     model = nnx.merge(graphdef, state)
     map_coordinates_vmap = jax.vmap(map_coordinates, in_axes=(-1, None, None), out_axes=-1)
-    factor = xsize.xsize / model.xsize
+    factor = xsize / model.xsize
 
     # Get coordinates and field
     fields, values = model.decode_field(images)
