@@ -168,12 +168,12 @@ class MultiEncoder(nnx.Module):
 
         # Hidden layers latent space
         self.hidden_layers_latent = [Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16)]
-        for _ in range(2):  # TODO: Test if 6 trains fine or go back to 2 (100 epochs)
+        for _ in range(2):
             self.hidden_layers_latent.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
 
         # Hidden layer refinement
         self.hidden_layers_refinement = [Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16)]
-        for _ in range(2):  # TODO: Test if 6 trains fine or go back to 2 (100 epochs)
+        for _ in range(2):
             self.hidden_layers_refinement.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
 
         # Rigid registration of volumes
