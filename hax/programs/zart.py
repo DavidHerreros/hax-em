@@ -23,12 +23,17 @@ class DeltaVolume(nnx.Module):
         self.reference_values = reference_values
         self.total_voxels = total_voxels
         self.num_maps = num_maps
-        initializer = jax.nn.initializers.glorot_uniform()
+        # initializer = jax.nn.initializers.glorot_uniform()
 
         # Indices to (normalized) coords
         self.factor = 0.5 * volume_size
         coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)[None, ...]
         self.coords = (coords - self.factor) / self.factor
+
+        if jnp.all(reference_values) == 0:
+            self.lambda_parameter = 1.0
+        else:
+            self.lambda_parameter = nnx.Param(1e-4)
 
         # Learnable parameters (keep this in case it is useful in the future)
         # if self.num_maps == 1:
@@ -39,9 +44,8 @@ class DeltaVolume(nnx.Module):
 
         self.hidden_linear = [Linear(in_features=total_voxels * 3, out_features=8, rngs=rngs, dtype=jnp.bfloat16,
                                      kernel_init=siren_init_first(c=1.))]
-        for _ in range(3):
+        for _ in range(4):
             self.hidden_linear.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=1.)))
-        self.hidden_linear.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=1.)))
 
         if self.num_maps == 1:
             self.params = Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs)
@@ -60,9 +64,8 @@ class DeltaVolume(nnx.Module):
 
         # Decode voxel values
         x = jnp.sin(1.0 * self.hidden_linear[0](coords))
-        for layer in self.hidden_linear[1:-1]:
-            x = x + jnp.sin(1.0 * layer(x))
-        x = self.hidden_linear[-1](x)
+        for layer in self.hidden_linear[1:]:
+            x = jnp.sin(x + 1.0 * layer(x))
 
         if self.num_maps == 1:
             params = self.params(x)
@@ -70,7 +73,7 @@ class DeltaVolume(nnx.Module):
             params = jnp.concatenate([self.params[0](x), self.params[1](x)], axis=0)
 
         # Extract delta_coords and values
-        x = jnp.reshape(params, (self.num_maps, self.total_voxels, 4))
+        x = jnp.reshape(self.lambda_parameter * params, (self.num_maps, self.total_voxels, 4))
         delta_coords, delta_values = x[..., :3], x[..., 3]
 
         # Recover volume values (TODO: Check if applying ReLu is really needed)
@@ -129,7 +132,7 @@ class PhysDecoder:
     def __init__(self, xsize):
         self.xsize = xsize
 
-    def __call__(self, x, values, coords, xsize, rotations, shifts, ctf, ctf_type,  filter=True):
+    def __call__(self, x, values, coords, xsize, rotations, shifts, ctf, ctf_type, filter=True):
         # Volume factor
         factor = 0.5 * xsize
 
@@ -192,14 +195,14 @@ class ZART(nnx.Module):
 
 
 @jax.jit
-def single_step_zart(graphdef, state, x, labels, md, key):
+def single_step_zart(graphdef, state, x, labels, md, fields_zart, values_zart, key):
     model, optimizer = nnx.merge(graphdef, state)
 
     # Random keys
-    key, swd_key, uniform_key, choice_key = jax.random.split(key, 4)
+    key, choice_key = jax.random.split(key, 2)
 
     # Vmap functions
-    phys_decoder = jax.vmap(model.phys_decoder, in_axes=(1, 0, 0, None, 1, 1, 1, None), out_axes=1)
+    phys_decoder = jax.vmap(model.phys_decoder, in_axes=(1, 1, 1, None, 1, 1, 1, None), out_axes=1)
     wiener2DFilter_vmap = jax.vmap(wiener2DFilter, in_axes=(1, 1, None), out_axes=1)
     ctfFilter_vmap = jax.vmap(ctfFilter, in_axes=(1, 1, None), out_axes=1)
 
@@ -212,7 +215,7 @@ def single_step_zart(graphdef, state, x, labels, md, key):
         rotations_sym = jnp.matmul(jnp.transpose(model.symmetry_matrices[random_indices], (0, 2, 1))[:, None, ...], rotations)
 
         # Generate projections
-        images_corrected = phys_decoder(x, values, coords, model.xsize, rotations_sym, shifts, ctf, model.ctf_type)
+        images_corrected = phys_decoder(x, values[None, ...], fields_zart + coords[None, ...], model.xsize, rotations_sym, shifts, ctf, model.ctf_type)
 
         # Losses
         images_corrected_loss = images_corrected[..., 0] if images_corrected.shape[-1] == 1 else images_corrected
@@ -236,7 +239,7 @@ def single_step_zart(graphdef, state, x, labels, md, key):
         l1_grad_loss = jnp.abs(diff_x).mean() + jnp.abs(diff_z).mean() + jnp.abs(diff_y).mean()
         l2_grad_loss = jnp.square(diff_x).mean() + jnp.square(diff_z).mean() + jnp.square(diff_y).mean()
 
-        loss = recon_loss.mean() + 0.01 * l1_loss + 0.01 * (l1_grad_loss + l2_grad_loss)
+        loss = recon_loss.mean() + 0.001 * l1_loss + 0.001 * (l1_grad_loss + l2_grad_loss)
         return loss, recon_loss.mean(axis=0)
 
     # Labels to single batch size
@@ -294,6 +297,7 @@ def main():
     from hax.metrics import JaxSummaryWriter
     from hax.networks import VolumeAdjustment, train_step_volume_adjustment
     from hax.schedulers import CosineAnnealingScheduler
+    from hax.checkpointer import NeuralNetworkCheckpointer
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--md", required=True, type=str,
@@ -315,21 +319,16 @@ def main():
                              f"the network will learn a {bcolors.ITALIC}symmetry broken{bcolors.ENDC} set of angles in c1. Therefore, the angles can be directly used in a reconstruction/refinement.)")
     parser.add_argument("--ctf_type", required=True, type=str, choices=["None", "apply", "wiener", "precorrect"],
                         help="Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)")
-    # parser.add_argument("--epochs", required=False, type=int, default=50,
-    #                     help="Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - "
-    #                          "as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it")
     parser.add_argument("--batch_size", required=False, type=int, default=8,
                         help="Determines how many images will be load in the GPU at any moment during training (set by default to 8 - "
                              f"you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like {bcolors.UNDERLINE}nvidia-smi{bcolors.ENDC} "
                              f"to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions")
-    # parser.add_argument("--learning_rate", required=False, type=float, default=1e-4,
-    #                     help=f"The learning rate ({bcolors.ITALIC}lr{bcolors.ENDC}) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the {bcolors.ITALIC}lr{bcolors.ENDC} "
-    #                          f"is the size of the step it takes on each attempt. A large {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}0.01{bcolors.ENDC}) is like taking huge leaps — it's fast but can be unstable, "
-    #                          f"overshoot the lowest point, or cause {bcolors.ITALIC}NAN{bcolors.ENDC} errors. A small {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}1e-6{bcolors.ENDC}) is like taking tiny "
-    #                          f"shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often {bcolors.ITALIC}0.0001{bcolors.ENDC}. If training fails or errors explode, "
-    #                          f"try making the {bcolors.ITALIC}lr{bcolors.ENDC} 10 times smaller (e.g., {bcolors.ITALIC}0.001{bcolors.ENDC} --> {bcolors.ITALIC}0.0001{bcolors.ENDC}).")
     parser.add_argument("--reconstruct_halves", action="store_true",
                         help="If not provided, ZART will reconstruct a single volume. Otherwise, ZART will reconstruct two half maps by splitting the dataset into even/odd parts.")
+    parser.add_argument("--motion_correction", type=str,
+                        help=f"If provided, ZART will perform a motion correction while reconstructing the volume to reduce motion blurring. Otherwise, a standard reconstruction is performed. "
+                             f"{bcolors.WARNING} NOTE {bcolors.ENDC}: When providing this parameter, you MUST give the path to a trained {bcolors.UNDERLINE} HetSIREN (with transport of mass) "
+                             f"{bcolors.ENDC} or {bcolors.UNDERLINE} Zernike3Deep {bcolors.ENDC} neural network.")
     parser.add_argument("--output_path", required=True, type=str,
                         help="Path to save the results (trained neural network, new metadata...)")
     args = parser.parse_args()
@@ -381,6 +380,11 @@ def main():
 
         # Define volume adjustment network
         volumeAdjustment = VolumeAdjustment(lat_dim=3, coords=coords, values=values, predicts_value=True, rngs=nnx.Rngs(model_key))
+
+    if args.motion_correction is not None:
+        # Reload network to perform motion correction
+        model = NeuralNetworkCheckpointer.load(None, args.motion_correction)
+        graphdef_motion_correction, state_motion_correction = nnx.split(model)
 
     # Prepare summary writer
     writer = JaxSummaryWriter(os.path.join(args.output_path, "ZART_metrics"))
@@ -480,7 +484,14 @@ def main():
                 x = jnp.stack([x_even, x_odd], axis=1)
                 labels = jnp.stack([labels_even, labels_odd], axis=1)
 
-                loss, recon_loss, state = single_step_zart(graphdef, state, x, labels, md_columns, rng)
+                if args.motion_correction is not None:
+                    x_interpolation = jnp.reshape(x, (-1, x.shape[2], x.shape[3], 1))
+                    field_zart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x_interpolation, zart.inds)
+                    field_zart = np.reshape(x, (x.shape[0], x.shape[1], field_zart.shape[1], field_zart.shape[2]))
+                else:
+                    field_zart = np.zeros((x.shape[0], zart.inds.shape[0], 4))[:, None, ...]
+
+                loss, recon_loss, state = single_step_zart(graphdef, state, x, labels, md_columns, field_zart, rng)
                 total_loss += loss
                 total_recon_loss += recon_loss
 
@@ -509,10 +520,16 @@ def main():
             pbar = tqdm(data_loader, desc=f"Epoch {i + 1}", file=sys.stdout, ascii=" >=", colour="green")
 
             for (x, labels) in pbar:
+                if args.motion_correction is not None:
+                    field_zart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x, zart.inds)
+                else:
+                    field_zart = np.zeros((x.shape[0], zart.inds.shape[0], 4))
+
                 x = x[:, None, ...]
                 labels = labels[:, None, ...]
+                field_zart = field_zart[:, None, ...]
 
-                loss, recon_loss, state = single_step_zart(graphdef, state, x, labels, md_columns, rng)
+                loss, recon_loss, state = single_step_zart(graphdef, state, x, labels, md_columns, field_zart, rng)
                 total_loss += loss
                 total_recon_loss += recon_loss[0]
 
