@@ -280,13 +280,13 @@ class DeltaVolumeDecoder(nnx.Module):
             # Decode values
             x_map = jnp.sin(30.0 * self.hidden_values[0](x_map))
             for layer in self.hidden_values[1:-1]:
-                x_map = jnp.sin(x + 1.0 * layer(x_map))
+                x_map = jnp.sin(x_map + 1.0 * layer(x_map))
             x_map = self.hidden_values[-1](x_map)
 
             # Decode coords
             x_coords = jnp.sin(30.0 * self.hidden_coords[0](x_coords))
             for layer in self.hidden_coords[1:-1]:
-                x_coords = jnp.sin(x + 1.0 * layer(x_coords))
+                x_coords = jnp.sin(x_coords + 1.0 * layer(x_coords))
             x_coords = self.hidden_coords[-1](x_coords)
 
             # Extract delta_coords and values
@@ -791,7 +791,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True):
             decoupling_loss = 0.0
 
         loss = (nll + 0.0001 * kl_loss + 0.001 * kl_pose + 0.001 * decoupling_loss
-                + 0.001 * l1_loss  + 0.0 * (l1_grad_loss + l2_grad_loss)
+                + 0.0001 * l1_loss  + 0.0 * (l1_grad_loss + l2_grad_loss)
                 + 0.0 * (l1_grad_field_loss + l2_grad_field_loss) + 100. * hist_loss)
         return loss, (recon_loss.mean(), latent)
 
