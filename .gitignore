@@ -7,6 +7,7 @@ toolkit/*.egg-info
 
 # IDE files
 .idea
+.vscode
 
 # Build files
 build
