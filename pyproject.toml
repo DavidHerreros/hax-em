@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=42", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling", "hatch-vcs", "hatch-requirements-txt"]
+build-backend = "hatchling.build"
 
 [project]
 name = "hax"
@@ -11,12 +11,20 @@ requires-python = ">=3.10,<3.12"
 [project.scripts]
 project_manager = "hax.cli:main"
 
-[tool.setuptools]
-packages = ["hax"]
+[tool.hatch.version]
+path = "hax/__init__.py"
 
-[tool.setuptools.dynamic]
-version = {attr = "hax.__version__"}
-dependencies = {file = ["requirements.txt"]}
+[tool.hatch.metadata.hooks.requirements_txt]
+files = ["requirements.txt"]
+
+# https://mypy.readthedocs.io/en/stable/config_file.html
+[tool.mypy]
+files = "src/**/"
+strict = true
+disallow_any_generics = false
+disallow_subclassing_any = false
+show_error_codes = true
+pretty = true
 
 [tool.uv.pip]
 extra-index-url = ["https://download.pytorch.org/whl/cpu", "https://download.pytorch.org/whl/cpu"]
