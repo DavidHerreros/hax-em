@@ -19,6 +19,9 @@ project_manager = "hax.cli:main"
 where = ["."]
 namespaces = false
 
+[tool.setuptools.package-data]
+"hax" = ["viewers/server_loading_functions/*", "viewers/annotate_space/media/*"]
+
 [tool.setuptools.dynamic]
 version = {attr = "hax.__version__"}
 dependencies = {file = ["requirements.txt"]}
