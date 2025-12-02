@@ -1,9 +1,6 @@
 [build-system]
-requires = ["hatchling", "hatch-vcs"]
+requires = ["hatchling", "hatch-vcs", "hatch-requirements-txt"]
 build-backend = "hatchling.build"
-
-[tool.hatch.version]
-source = "vcs"
 
 [project]
 name = "hax"
@@ -17,9 +14,11 @@ project_manager = "hax.cli:main"
 [tool.setuptools]
 packages = ["hax"]
 
-[tool.setuptools.dynamic]
-version = {attr = "hax.__version__"}
-dependencies = {file = ["requirements.txt"]}
+[tool.hatch.version]
+path = "hax/__init__.py"
+
+[tool.hatch.metadata.hooks.requirements_txt]
+files = ["requirements.txt"]
 
 # https://mypy.readthedocs.io/en/stable/config_file.html
 [tool.mypy]
