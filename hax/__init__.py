@@ -1,23 +1,11 @@
-from . import checkpointer
-from . import generators
-from . import layers
-from . import networks
-from . import programs
-from . import utils
-from . import metrics
-from . import viewers
-from . import schedulers
-
-__all__ = [
-    checkpointer,
-    generators,
-    layers,
-    networks,
-    programs,
-    utils,
-    metrics,
-    viewers,
-    schedulers
-]
+from .checkpointer import *
+from .generators import *
+from .layers import *
+from .networks import *
+from .programs import *
+from .utils import *
+from .metrics import *
+from .viewers import *
+from .schedulers import *
 
 __version__ = '0.1.0'
