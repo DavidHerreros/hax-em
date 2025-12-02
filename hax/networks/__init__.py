@@ -1,7 +1,7 @@
-from hax.networks.latent_space_deconvolution import Deconvolver, train_deconv_step
-from hax.networks.volume_gray_scale_adjustment import VolumeAdjustment, train_step_volume_adjustment
-from hax.networks.image_gray_scale_adjustment import ImageAdjustment, train_step_image_adjustment
-from hax.networks.zernike3deep import Zernike3Deep, train_step_zernike3deep
-from hax.networks.hetsiren import HetSIREN, train_step_hetsiren
-from hax.networks.flexconsensus import FlexConsensus, train_step_flexconsensus
-from hax.networks.reconsiren import ReconSIREN, train_step_reconsiren, predict_angular_assignment_step_reconsiren
+from .latent_space_deconvolution import Deconvolver, train_deconv_step
+from .volume_gray_scale_adjustment import VolumeAdjustment, train_step_volume_adjustment
+from .image_gray_scale_adjustment import ImageAdjustment, train_step_image_adjustment
+from .zernike3deep import Zernike3Deep, train_step_zernike3deep
+from .hetsiren import HetSIREN, train_step_hetsiren
+from .flexconsensus import FlexConsensus, train_step_flexconsensus
+from .reconsiren import ReconSIREN, train_step_reconsiren, predict_angular_assignment_step_reconsiren

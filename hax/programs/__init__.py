@@ -1,2 +1,2 @@
-from hax.programs.estimate_latent_covariances import estimate_latent_covariances
-from hax.programs.modart import single_step_modart, MoDART
+from .estimate_latent_covariances import estimate_latent_covariances
+from .modart import single_step_modart, MoDART

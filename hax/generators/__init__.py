@@ -1,2 +1,2 @@
-from hax.generators.generator_metadata import MetaDataGenerator, extract_columns
-from hax.generators.generator_numpy import NumpyGenerator, ArrayListGenerator
+from .generator_metadata import MetaDataGenerator, extract_columns
+from .generator_numpy import NumpyGenerator, ArrayListGenerator

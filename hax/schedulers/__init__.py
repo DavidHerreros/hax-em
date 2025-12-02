@@ -1,1 +1,1 @@
-from hax.schedulers.cosine_annealing import CosineAnnealingScheduler
+from .cosine_annealing import CosineAnnealingScheduler
