@@ -2,6 +2,7 @@
 
 
 from functools import partial
+import numpy as np
 
 import jax
 from jax import random as jnr, numpy as jnp
@@ -437,6 +438,7 @@ class HetSIREN(nnx.Module):
         self.inds = jnp.asarray(jnp.where(reconstruction_mask > 0.0)).T
         self.lat_dim = lat_dim
         reference_values = reference_volume[self.inds[..., 0], self.inds[..., 1], self.inds[..., 2]][None, ...]
+        self.has_reference_volume = not bool(np.all(reference_volume == 0.0))
         self.encoder = MultiEncoder(self.xsize, lat_dim, n_layers=3, isVae=isVae, architecture=architecture, isTomoSIREN=isTomoSIREN, rngs=rngs) \
             if decoupling or isTomoSIREN else Encoder(self.xsize, lat_dim, isVae=isVae, architecture=architecture, rngs=rngs)
         self.delta_volume_decoder = DeltaVolumeDecoder(self.inds.shape[0], lat_dim, self.xsize, self.inds, reference_values, transport_mass=transport_mass, rngs=rngs)
@@ -650,8 +652,12 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True):
         coords_reference, values_reference = model.delta_volume_decoder_rigid(input_rigid)
 
         # Generate projections
-        images_corrected = phys_decoder(x, values, jax.lax.stop_gradient(coords), model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
-        images_corrected_field = phys_decoder(x, model.delta_volume_decoder.reference_values, coords, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
+        if model.has_reference_volume:
+            images_corrected = phys_decoder(x, values, jax.lax.stop_gradient(coords), model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
+            images_corrected_field = phys_decoder(x, model.delta_volume_decoder.reference_values, coords, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
+        else:
+            images_corrected = phys_decoder(x, values, coords, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
+            images_corrected_field = images_corrected
         images_rigid = phys_decoder(x, values_reference, coords_reference, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type)
 
         # Project "mask"
@@ -1212,7 +1218,7 @@ def main():
         lr_schedule = CosineAnnealingScheduler.getScheduler(peak_value=args.learning_rate, total_steps=total_steps, warmup_frac=0.1, end_value=0.0, init_value=1e-5)
 
         # Optimizers (HetSIREN)
-        optimizer = nnx.Optimizer(hetsiren, optax.adam(lr_schedule))
+        optimizer = nnx.Optimizer(hetsiren, optax.adam(1e-4))
         graphdef, state = nnx.split((hetsiren, optimizer))
 
         # Resume if checkpoint exists
