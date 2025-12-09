@@ -1096,7 +1096,7 @@ def main():
 
     # Prepare network (ReconSIREN)
     reconsiren = ReconSIREN(vol, mask, xsize, args.sr, ctf_type=args.ctf_type, symmetry_group=args.symmetry_group,
-                            transport_mass=True, refine_current_assignment=args.refine_current_assignment,
+                            transport_mass=True, refine_current_assignment=args.refine_current_assignment, lat_dim=8,
                             bank_size=len(generator.md), learn_delta_volume=not args.do_not_learn_volume, rngs=nnx.Rngs(model_key))
 
     # Reload network
