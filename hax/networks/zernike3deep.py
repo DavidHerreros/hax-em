@@ -499,8 +499,6 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
     model, optimizer, optimizer_grays = nnx.merge(graphdef, state)
     distributions_key, key = jax.random.split(key)
 
-    sw_sorted_differentiable_batch = jax.vmap(sw_sorted_differentiable_images, in_axes=(0, 0, None, None, None))
-
     def loss_fn(model, x):
         # Check if Tomo mode
         if model.isTomo:
