@@ -1,8 +1,6 @@
 #!/usr/bin/env python
 
 
-import random
-
 import jax
 from jax import random as jnr, numpy as jnp
 from flax import nnx
@@ -10,12 +8,14 @@ import dm_pix
 
 from einops import rearrange
 
+from sklearn.cluster import KMeans
+
 from hax.utils import *
 from hax.layers import *
 
 
 class Encoder(nnx.Module):
-    def __init__(self, input_dim, pyramid_levels=4, num_components=4, refine_current_assignment=False, *, rngs: nnx.Rngs):
+    def __init__(self, input_dim, pyramid_levels=4, num_components=4, lat_dim=8, refine_current_assignment=False, *, rngs: nnx.Rngs):
         self.input_dim = input_dim
         self.input_conv_dim = 64  # Original was 64
         self.out_conv_dim = int(self.input_conv_dim / (2 ** 3))
@@ -64,6 +64,19 @@ class Encoder(nnx.Module):
         else:
             self.hidden_shifts.append(nnx.Linear(1024, 2, rngs=rngs, kernel_init=normal_initializer_mean(mean=0.0, stddev=1e-4)))
 
+        # Layers to latent
+        self.hidden_latent = [nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        self.hidden_latent.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_latent.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_latent.append(nnx.Linear(1024, 2, rngs=rngs))
+
+        self.rngs = rngs
+        self.mean_x = Linear(1024, lat_dim, rngs=rngs)
+        self.logstd_x = Linear(1024, lat_dim, rngs=rngs)
+
+    def sample_gaussian(self, mean, logstd):
+        return logstd * jnr.normal(self.rngs.distributions(), shape=mean.shape) + mean
+
     def __call__(self, x, return_diversity_loss=False):
         # Resize images
         x = jax.image.resize(x, (x.shape[0], self.input_conv_dim, self.input_conv_dim, 1), method="bilinear")
@@ -99,11 +112,11 @@ class Encoder(nnx.Module):
         x = self.hidden_layers_linear[-1](x)
 
         # First output: rotation matrices
-        # rotation_9d = nnx.relu(self.hidden_9d_rotation[0](x))
-        # for layer in self.hidden_9d_rotation[1:-1]:
-        #     rotation_9d = nnx.relu(layer(rotation_9d))
-        # rotation_9d = self.hidden_9d_rotation[-1](rotation_9d)  # TODO: THIS WAS WORKING WITH JUST ONE LAYER!! CHECK IN THE FUTURE IN CASE IT IS USEFUL
-        rotation_9d = self.hidden_9d_rotation[-1](x)  # TODO: THIS WAS WORKING WITH JUST ONE LAYER!! CHECK IN THE FUTURE IN CASE IT IS USEFUL
+        rotation_9d = nnx.relu(self.hidden_9d_rotation[0](x))
+        for layer in self.hidden_9d_rotation[1:-1]:
+            rotation_9d = nnx.relu(rotation_9d + layer(rotation_9d))
+        rotation_9d = self.hidden_9d_rotation[-1](rotation_9d)  # TODO: THIS WAS WORKING WITH JUST ONE LAYER!! CHECK IN THE FUTURE IN CASE IT IS USEFUL
+        # rotation_9d = self.hidden_9d_rotation[-1](x)  # TODO: THIS WAS WORKING WITH JUST ONE LAYER!! CHECK IN THE FUTURE IN CASE IT IS USEFUL
 
         if self.refine_current_assignment:
             rotations_6d = rotation_9d.reshape(x.shape[0] * self.num_components, 6)
@@ -130,7 +143,7 @@ class Encoder(nnx.Module):
         # Third output: in plane shifts
         in_plane_shifts = nnx.relu(self.hidden_shifts[0](x))
         for layer in self.hidden_shifts[1:-1]:
-            in_plane_shifts = nnx.relu(layer(in_plane_shifts))
+            in_plane_shifts = nnx.relu(in_plane_shifts + layer(in_plane_shifts))
         # in_plane_shifts = 0.5 * self.input_dim * self.hidden_shifts[-1](in_plane_shifts)
         in_plane_shifts = self.hidden_shifts[-1](in_plane_shifts)
         if self.refine_current_assignment:
@@ -139,14 +152,22 @@ class Encoder(nnx.Module):
         # Broadcast shifts to euler angles shape
         in_plane_shifts = jnp.broadcast_to(in_plane_shifts[:, None, :], (in_plane_shifts.shape[0], self.num_components, 2))
 
+        # Latent space (heterogeneity)
+        latent = nnx.relu(self.hidden_latent[0](x))
+        for layer in self.hidden_latent[1:-1]:
+            latent = nnx.relu(latent + layer(latent))
+        mean = self.mean_x(latent)
+        logstd = self.logstd_x(latent)
+        sample = self.sample_gaussian(mean, logstd)
+
         if return_diversity_loss:
             directions = rotations @ jnp.array([0, 0, 1])
             pairwise_dots = directions @ directions.transpose(0, 2, 1)
             off_diagonal_dots = pairwise_dots * (1.0 - jnp.eye(rotations.shape[1], dtype=pairwise_dots.dtype))
             diversity_loss = jnp.mean(jnp.sum(jnp.square(off_diagonal_dots), axis=(-2, -1)))
-            return rotations, in_plane_shifts, diversity_loss
+            return rotations, in_plane_shifts, diversity_loss, (sample, mean, logstd)
         else:
-            return rotations, in_plane_shifts
+            return rotations, in_plane_shifts, (sample, mean, logstd)
 
 
 class DeltaVolumeDecoder(nnx.Module):
@@ -162,12 +183,6 @@ class DeltaVolumeDecoder(nnx.Module):
         self.factor = 0.5 * volume_size
         coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)[None, ...]
         self.coords = (coords - self.factor) / self.factor
-
-        # Delta volume decoder (TODO: Check and fix hypernetwork - compare with TF implementation)
-        # self.hidden_linear = [HyperLinear(in_features=lat_dim, out_features=8, in_hyper_features=lat_dim, hidden_hyper_features=8, rngs=rngs, dtype=jnp.bfloat16)]
-        # for _ in range(3):
-        #     self.hidden_linear.append(HyperLinear(in_features=8, out_features=8, in_hyper_features=8, hidden_hyper_features=8, rngs=rngs, dtype=jnp.bfloat16))
-        # self.hidden_linear.append(HyperLinear(in_features=8, out_features=8, in_hyper_features=8, hidden_hyper_features=8, rngs=rngs, dtype=jnp.bfloat16))
 
         if transport_mass or learn_delta_volume:
             self.hidden_linear = [Linear(in_features=total_voxels * 3, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init_first(c=1.))]
@@ -191,8 +206,7 @@ class DeltaVolumeDecoder(nnx.Module):
         # Decode voxel values
         x = jnp.sin(1.0 * self.hidden_linear[0](coords))
         for layer in self.hidden_linear[1:-1]:
-            # x = jnp.sin(1.0 * (x + layer(x, x)))
-            x = x + jnp.sin(1.0 * layer(x))
+            x = jnp.sin(x + 1.0 * layer(x))
         x = self.hidden_linear[-1](x)
 
         if self.transport_mass:
@@ -270,6 +284,90 @@ class DeltaVolumeDecoder(nnx.Module):
 
         return grids
 
+class HetVolumeDecoder(nnx.Module):
+    def __init__(self, total_voxels, lat_dim, volume_size, *, rngs: nnx.Rngs):
+        self.volume_size = volume_size
+        self.total_voxels = total_voxels
+
+        # Indices to (normalized) coords
+        self.factor = 0.5 * volume_size
+
+        self.hidden_coords = [Linear(in_features=lat_dim // 2, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init_first(c=1.))]
+        for _ in range(4):
+            self.hidden_coords.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=6.)))
+        self.hidden_coords.append(Linear(in_features=8, out_features=3 * total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform()))
+
+        self.hidden_values = [Linear(in_features=lat_dim // 2, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init_first(c=1.))]
+        for _ in range(4):
+            self.hidden_values.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=6.)))
+        self.hidden_values.append(Linear(in_features=8, out_features=total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform()))
+
+    def __call__(self, x):
+        x_coords, x_map = jnp.split(x, indices_or_sections=2, axis=1)
+
+        # Decode values
+        x_map = jnp.sin(30.0 * self.hidden_values[0](x_map))
+        for layer in self.hidden_values[1:-1]:
+            x_map = jnp.sin(x_map + 1.0 * layer(x_map))
+        x_map = self.hidden_values[-1](x_map)
+
+        # Decode coords
+        x_coords = jnp.sin(30.0 * self.hidden_coords[0](x_coords))
+        for layer in self.hidden_coords[1:-1]:
+            x_coords = jnp.sin(x_coords + 1.0 * layer(x_coords))
+        x_coords = self.hidden_coords[-1](x_coords)
+
+        # Extract delta_coords and values
+        x_coords = jnp.reshape(x_coords, (x.shape[0], self.total_voxels, 3))
+        delta_coords, delta_values = x_coords, x_map
+
+        # Recover coords (non-normalized)
+        delta_coords = self.factor * delta_coords
+
+        return delta_coords, delta_values
+
+    def decode_volume(self, x, coords, values, filter=True):
+        # Decode volume values
+        delta_coords, delta_values = self.__call__(x)
+
+        # Displace coordinates
+        coords = coords + delta_coords + self.factor
+
+        # Get updated values
+        values = nnx.relu(values + delta_values)
+
+        # Place values on grid
+        grids = jnp.zeros((x.shape[0], self.volume_size, self.volume_size, self.volume_size))
+
+        # Scatter volume
+        bposf = jnp.floor(coords)
+        bposi = bposf.astype(jnp.int32)
+        bposf = coords - bposf
+
+        bamp0 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+        bamp1 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+        bamp2 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+        bamp3 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
+        bamp4 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
+        bamp5 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
+        bamp6 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+        bamp7 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
+
+        bamp = jnp.concat([bamp0, bamp1, bamp2, bamp3, bamp4, bamp5, bamp6, bamp7], axis=1)
+        bposi = jnp.concat([bposi, bposi + jnp.array((1, 0, 0)), bposi + jnp.array((0, 1, 0)), bposi + jnp.array((0, 0, 1)),
+                           bposi + jnp.array((0, 1, 1)), bposi + jnp.array((1, 0, 1)), bposi + jnp.array((1, 1, 0)), bposi + jnp.array((1, 1, 1))], axis=1)
+
+        def scatter_volume(vol, bpos_i, bamp_i):
+            return vol.at[bpos_i[..., 2], bpos_i[..., 1], bpos_i[..., 0]].add(bamp_i)
+
+        grids = jax.vmap(scatter_volume, in_axes=(0, 0, 0))(grids, bposi, bamp)
+
+        # Filter volume
+        if filter:
+            grids = jax.vmap(low_pass_3d)(grids)
+
+        return grids
+
 class PhysDecoder:
     def __init__(self, xsize, transport_mass):
         self.xsize = xsize
@@ -333,8 +431,9 @@ class PhysDecoder:
         return images
 
 class ReconSIREN(nnx.Module):
-    def __init__(self, reference_volume, reconstruction_mask, xsize, sr, bank_size=10000, ctf_type="apply", transport_mass=False,
-                 symmetry_group="c1", refine_current_assignment=False, learn_delta_volume=True, *, rngs: nnx.Rngs):
+    def __init__(self, reference_volume, reconstruction_mask, xsize, sr, bank_size=10000, ctf_type="apply", lat_dim=8,
+                 transport_mass=False, symmetry_group="c1", refine_current_assignment=False,
+                 learn_delta_volume=True, *, rngs: nnx.Rngs):
         super(ReconSIREN, self).__init__()
         self.xsize = xsize
         self.ctf_type = ctf_type
@@ -346,9 +445,10 @@ class ReconSIREN(nnx.Module):
         self.refine_current_assignment = refine_current_assignment
         self.learn_delta_volume = learn_delta_volume
         reference_values = reference_volume[self.inds[..., 0], self.inds[..., 1], self.inds[..., 2]][None, ...]
-        self.encoder = Encoder(self.xsize, refine_current_assignment=refine_current_assignment, rngs=rngs)
+        self.encoder = Encoder(self.xsize, refine_current_assignment=refine_current_assignment, lat_dim=lat_dim, rngs=rngs)
         self.delta_volume_decoder = DeltaVolumeDecoder(self.inds.shape[0], self.xsize, self.inds, reference_values,
                                                        transport_mass=transport_mass, learn_delta_volume=learn_delta_volume, rngs=rngs)
+        self.delta_het_decoder = HetVolumeDecoder(self.inds.shape[0], lat_dim=lat_dim, volume_size=self.xsize, rngs=rngs)
         self.phys_decoder = PhysDecoder(self.xsize, transport_mass=transport_mass)
 
         # Hyperparameter tuning
@@ -422,10 +522,22 @@ class ReconSIREN(nnx.Module):
 
         return images_corrected
 
+    def decode_het_volume(self, x, filter=True):
+        if x.ndim == 4:
+            _, _, (_, x, _) = self.encoder(x, return_diversity_loss=False)
+
+        # Get consensus volume
+        coords, values = self.delta_volume_decoder()
+
+        # Decode het volume
+        vol = self.delta_het_decoder.decode_volume(x, coords, values, filter=filter)
+
+        return vol
+
 
 @jax.jit
 def train_step_reconsiren(graphdef, state, x, labels, md, key):
-    model, optimizer_pose, optimizer_volume = nnx.merge(graphdef, state)
+    model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
 
     # Random keys
     key, swd_key, uniform_key, choice_key = jax.random.split(key, 4)
@@ -438,12 +550,21 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
             x_ctf_corrected = x
 
         # Get euler angles and shifts
-        rotations, shifts, diversity_loss = model.encoder(x_ctf_corrected, return_diversity_loss=True)
+        rotations, shifts, diversity_loss, (sample, latent, logstd) = model.encoder(x_ctf_corrected, return_diversity_loss=True)
 
         # Decode volume
         coords, values = model.delta_volume_decoder()
         # volumes = model.delta_volume_decoder.decode_volume(coords_values=[coords, values])
         # chimeric_volumes =  volumes + ((1. - model.reconstruction_mask) * model.reference_volume)[None, ...]
+
+        # Decode het volume
+        delta_coords_het, delta_values_het = model.delta_het_decoder(sample)
+        coords_het = jax.lax.stop_gradient(coords) + delta_coords_het
+        values_het = nnx.relu(jax.lax.stop_gradient(values) + delta_values_het)
+        # coords_het_flat = jnp.tile(coords_het[:, None, ...], (1, rotations.shape[1], 1, 1))
+        # values_het_flat = jnp.tile(values_het[:, None, ...], (1, rotations.shape[1], 1))
+        # coords_het_flat = rearrange(coords_het_flat, "b n c d -> (b n) c d")
+        # values_het_flat = rearrange(values_het_flat, "b n v -> (b n) v")
 
         # Refine current assignment (if provided)
         # rotations = jnp.matmul(rotations, current_rotations[:, None, :, :])
@@ -459,14 +580,14 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
 
         # Losses
         images_corrected_loss = images_corrected[..., 0] if images_corrected.shape[-1] == 1 else images_corrected
-        x_loss = x[..., 0] if x.shape[-1] == 1 else x
+        x_loss_nb = x[..., 0] if x.shape[-1] == 1 else x
 
         # Consider CTF if Wiener/Squared mode (only for loss)
         if model.ctf_type == "wiener":
             ctf_broadcasted = jnp.broadcast_to(ctf[:, None, :], (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
             ctf_broadcasted = rearrange(ctf_broadcasted, "b n w h -> (b n) w h")
 
-            x_loss = wiener2DFilter(x_loss, ctf, pad_factor=2)
+            x_loss_nb = wiener2DFilter(x_loss_nb, ctf, pad_factor=2)
 
             images_corrected_loss = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
             images_corrected_loss = wiener2DFilter(images_corrected_loss, ctf_broadcasted, pad_factor=2)
@@ -475,14 +596,14 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
             ctf_broadcasted = jnp.broadcast_to(ctf[:, None, :], (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
             ctf_broadcasted = rearrange(ctf_broadcasted, "b n w h -> (b n) w h")
 
-            x_loss = ctfFilter(x_loss, ctf, pad_factor=2)
+            x_loss_nb = ctfFilter(x_loss_nb, ctf, pad_factor=2)
 
             images_corrected_loss = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
             images_corrected_loss = ctfFilter(images_corrected_loss, ctf_broadcasted, pad_factor=2)
             images_corrected_loss = rearrange(images_corrected_loss, "(b n) w h -> b n w h")
 
         # Broadcast input images to right size
-        x_loss = jnp.broadcast_to(x_loss[:, None, ...], (x_loss.shape[0], images_corrected.shape[1], x_loss.shape[1], x_loss.shape[2]))
+        x_loss = jnp.broadcast_to(x_loss_nb[:, None, ...], (x_loss_nb.shape[0], images_corrected.shape[1], x_loss_nb.shape[1], x_loss_nb.shape[2]))
 
         # Project "mask"
         if not model.delta_volume_decoder.transport_mass:
@@ -504,8 +625,22 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
         # Get minimum indices
         min_indices = jnp.argmin(recon_loss, axis=1)
 
+        # Heterogeneity
+        rotations_het = rotations[jnp.arange(images_corrected.shape[0]), min_indices, :][:, None, ...]
+        shifts_het = shifts[jnp.arange(images_corrected.shape[0]), min_indices, :][:, None, ...]
+        # TODO: Test stop gradient in rotations_het and shifts_het
+        images_het = model.phys_decoder(x, values_het, coords_het, model.xsize, jax.lax.stop_gradient(rotations_het),
+                                        jax.lax.stop_gradient(shifts_het), ctf, model.ctf_type)[:, 0, ...]
+        images_het_loss = images_het[..., 0] if images_het.shape[-1] == 1 else images_het
+        if model.ctf_type == "wiener":
+            images_het_loss = wiener2DFilter(images_het_loss, ctf, pad_factor=2)
+        elif model.ctf_type == "squared":
+            images_het_loss = ctfFilter(images_het_loss, ctf, pad_factor=2)
+        recon_het_loss = dm_pix.mse(images_het_loss[..., None], x_loss_nb[..., None]).mean()
+
         # Index losses and rotations based on extracted indices
         recon_loss = recon_loss[jnp.arange(images_corrected.shape[0]), min_indices].mean()
+        recon_loss_all = 0.5 * (recon_loss + recon_het_loss)
         rotations = rotations[jnp.arange(images_corrected.shape[0]), min_indices, :]
 
         # Rotations to Euler angles (ZYZ)
@@ -513,7 +648,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
 
         # L1 based denoising
         if not model.delta_volume_decoder.transport_mass:
-            l1_loss = jnp.mean(jnp.abs(values))
+            l1_loss = jnp.mean(jnp.abs(values)) + jnp.mean(jnp.abs(values_het))
         else:
             l1_loss = 0.0
 
@@ -521,6 +656,9 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
         diff_x, diff_y, diff_z = sparse_finite_3D_differences(values, model.inds, model.xsize)
         l1_grad_loss = jnp.abs(diff_x).mean() + jnp.abs(diff_z).mean() + jnp.abs(diff_y).mean()
         l2_grad_loss = jnp.square(diff_x).mean() + jnp.square(diff_z).mean() + jnp.square(diff_y).mean()
+
+        # KL loss VAE
+        kl_loss = -0.5 * jnp.sum(1. + 2. * logstd - jnp.square(jnp.exp(logstd)) - jnp.square(latent))
 
         # Decoupling (TODO: In the future this will be for missing angles like TF implementation)
 
@@ -534,13 +672,16 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
         uniform_angular_distribution_loss = sliced_wasserstein_loss(memory_bank_subset, uniform_distributed_samples, key)
 
         # loss = recon_loss + l1_loss  + 0.001 * (l1_grad_loss + l2_grad_loss) # + 0.001 * uniform_angular_distribution_loss
-        loss = recon_loss + 0.001 * l1_loss + 0.001 * (l1_grad_loss + l2_grad_loss) + nnx.relu(model.alpha_uniform.value) * uniform_angular_distribution_loss + nnx.relu(model.alpha_uniform.value) * diversity_loss
+        loss = (recon_loss_all + 0.001 * l1_loss + 0.001 * (l1_grad_loss + l2_grad_loss) + 0.0001 * kl_loss +
+                nnx.relu(model.alpha_uniform.value) * uniform_angular_distribution_loss +
+                nnx.relu(model.alpha_uniform.value) * diversity_loss)
         return loss, (recon_loss, euler_angles)
 
 
     # Optimizer parameters
     params_pose = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('alpha_uniform')))
     params_volume = nnx.All(nnx.Param, nnx.PathContains('delta_volume_decoder'))
+    params_het = nnx.All(nnx.Param, nnx.PathContains('delta_het_decoder'))
 
     if model.refine_current_assignment:
         # Precompute batch aligments
@@ -570,13 +711,14 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
         # Wiener filter
         x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
-    grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, (params_pose, params_volume)), has_aux=True)
+    grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, (params_pose, params_volume, params_het)), has_aux=True)
     (loss, (recon_loss, euler_angles)), grads_combined = grad_fn(model, x)
 
-    grads_pose, grads_volume = grads_combined.split(params_pose, params_volume)
+    grads_pose, grads_volume, grads_het = grads_combined.split(params_pose, params_volume, params_het)
 
     optimizer_pose.update(grads_pose)
     optimizer_volume.update(grads_volume)
+    optimizer_het.update(grads_het)
 
     # grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
     # (loss, (recon_loss, euler_angles)), grads = grad_fn(model, x)
@@ -586,14 +728,14 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
     # Update memory bank
     model.enqueue(euler_angles)
 
-    state = nnx.state((model, optimizer_pose, optimizer_volume))
+    state = nnx.state((model, optimizer_pose, optimizer_volume, optimizer_het))
 
     return loss, recon_loss, state, key
 
 
 @jax.jit
 def validation_step_reconsiren(graphdef, state, x, labels, md, key):
-    model, optimizer_pose, optimizer_volume = nnx.merge(graphdef, state)
+    model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
 
     # Random keys
     key, choice_key = jax.random.split(key, 2)
@@ -606,7 +748,7 @@ def validation_step_reconsiren(graphdef, state, x, labels, md, key):
             x_ctf_corrected = x
 
         # Get euler angles and shifts
-        rotations, shifts, _ = model.encoder(x_ctf_corrected, return_diversity_loss=True)
+        rotations, shifts, _, _ = model.encoder(x_ctf_corrected, return_diversity_loss=True)
 
         # Decode volume
         coords, values = model.delta_volume_decoder()
@@ -748,7 +890,7 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md):
         x_ctf_corrected = x
 
     # Get euler angles and shifts
-    rotations, shifts, diversity_loss = model.encoder(x_ctf_corrected, return_diversity_loss=True)
+    rotations, shifts, diversity_loss, (_, latent, _) = model.encoder(x_ctf_corrected, return_diversity_loss=True)
 
     # Decode volume
     coords, values = model.delta_volume_decoder()
@@ -814,7 +956,7 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md):
     rotations = rotations[jnp.arange(images_corrected.shape[0]), min_indices, :]
     shifts = shifts[jnp.arange(images_corrected.shape[0]), min_indices, :]
 
-    return rotations, shifts
+    return rotations, shifts, latent
 
 euler_from_matrix_batch = jax.vmap(jax.jit(euler_from_matrix))
 
@@ -988,8 +1130,13 @@ def main():
         # Jitted functions for volume prediction
         @jax.jit
         def decode_volume(graphdef, state):
-            model, _, _ = nnx.merge(graphdef, state)
+            model, _, _, _ = nnx.merge(graphdef, state)
             return model.delta_volume_decoder.decode_volume()
+
+        @jax.jit
+        def decode_het_volume(graphdef, state, x):
+            model, _, _, _ = nnx.merge(graphdef, state)
+            return model.decode_het_volume(x)
 
         # Prepare data loader
         data_loader_full, data_loader, data_loader_validation = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
@@ -1052,16 +1199,19 @@ def main():
                 NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "volumeAdjustment"), mode="pickle")
 
         # Learning rate scheduler
-        total_steps = args.epochs * len(data_loader)
-        lr_schedule_pose = CosineAnnealingScheduler.getScheduler(peak_value=4. * args.learning_rate, total_steps=total_steps, warmup_frac=0.1, init_value=args.learning_rate, end_value=0.0)
-        lr_schedule_volume = CosineAnnealingScheduler.getScheduler(peak_value=4. * 1e-3, total_steps=total_steps, warmup_frac=0.1, init_value=1e-3, end_value=0.0)
+        # total_steps = args.epochs * len(data_loader)
+        # lr_schedule_pose = CosineAnnealingScheduler.getScheduler(peak_value=4. * args.learning_rate, total_steps=total_steps, warmup_frac=0.1, init_value=args.learning_rate, end_value=0.0)
+        # lr_schedule_volume = CosineAnnealingScheduler.getScheduler(peak_value=4. * 1e-3, total_steps=total_steps, warmup_frac=0.1, init_value=1e-3, end_value=0.0)
+        # lr_schedule_het = CosineAnnealingScheduler.getScheduler(peak_value=4. * 1e-3, total_steps=total_steps, warmup_frac=0.1, init_value=1e-3, end_value=0.0)
 
         # Optimizers (ReconSIREN)
         params_pose = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('alpha_uniform')))
         params_volume = nnx.All(nnx.Param, nnx.PathContains('delta_volume_decoder'))
-        optimizer_pose = nnx.Optimizer(reconsiren, optax.adam(lr_schedule_pose), wrt=params_pose)
-        optimizer_volume = nnx.Optimizer(reconsiren, optax.adam(lr_schedule_volume), wrt=params_volume)
-        graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_volume))
+        params_het = nnx.All(nnx.Param, nnx.PathContains('delta_het_decoder'))
+        optimizer_pose = nnx.Optimizer(reconsiren, optax.adamw(args.learning_rate), wrt=params_pose)
+        optimizer_volume = nnx.Optimizer(reconsiren, optax.adamw(1e-3), wrt=params_volume)
+        optimizer_het = nnx.Optimizer(reconsiren, optax.adamw(1e-3), wrt=params_het)
+        graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_volume, optimizer_het))
 
         # Resume if checkpoint exists
         if os.path.isdir(os.path.join(args.output_path, "ReconSIREN_CHECKPOINT")):
@@ -1132,15 +1282,31 @@ def main():
                 writer.add_images("Predicted volume (slices)", slices, dataformats="NHWC", global_step=i)
 
                 # Plot angular distribution
-                reconsiren_intermediate, _, _ = nnx.merge(graphdef, state)
+                reconsiren_intermediate, _, _, _ = nnx.merge(graphdef, state)
                 euler_angles = np.array(reconsiren_intermediate.memory_bank.value)
                 fig, _ = plot_angular_distribution(euler_angles)
                 writer.add_figure("Angular distribution density", fig, global_step=i)
 
+                # Predict some heterogeneous volumes
+                pbar_pred = tqdm(data_loader_full, desc=f"Latents prediction", file=sys.stdout, ascii=" >=", colour="green")
+                latents = []
+                graphdef_aux, state_aux = nnx.split(reconsiren_intermediate)
+                for (x, labels) in pbar_pred:
+                    _, _, latent = predict_angular_assignment_step_reconsiren(graphdef_aux, state_aux, x, labels, md_columns)
+                    latents.append(np.array(latent))
+                latents = np.concatenate(latents, axis=0)
+                kmeans = KMeans(n_clusters=10).fit(latents)
+                centers = kmeans.cluster_centers_
+                idx = 1
+                for center in centers:
+                    decoded = decode_het_volume(graphdef, state, center[None, ...])
+                    ImageHandler().write(np.array(decoded), os.path.join(args.output_path, f"reconsiren_hetmap_{idx:02d}.mrc"), overwrite=True)
+                    idx += 1
+
                 # Save checkpoint model
                 NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "ReconSIREN_CHECKPOINT"), epoch=i)
 
-        reconsiren, optimizer_pose, optimizer_volume = nnx.merge(graphdef, state)
+        reconsiren, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
 
         # Save model
         NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "ReconSIREN"), mode="pickle")
@@ -1158,6 +1324,7 @@ def main():
 
         # Jitted functions for volume prediction
         decode_volume = jax.jit(reconsiren.delta_volume_decoder.decode_volume)
+        decode_het_volume = jax.jit(reconsiren.decode_het_volume)
 
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting angular assignment / shifts... ######")
@@ -1168,8 +1335,9 @@ def main():
 
         graphdef, state = nnx.split(reconsiren)
         md_pred = generator.md
+        latents = []
         for (x, labels) in pbar:
-            rotations, shifts = predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md_columns)
+            rotations, shifts, latent = predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md_columns)
 
             # Convert rotation to Euler angles in Xmipp format
             euler_angles = xmippEulerFromMatrix(rotations)
@@ -1184,6 +1352,13 @@ def main():
             md_pred[labels, 'shiftX'] = shifts[:, 0]
             md_pred[labels, 'shiftY'] = shifts[:, 1]
 
+            # Save latents to list
+            latents.append(latent)
+
+        # Save latents to metadata
+        latents = np.concatenate(latents, axis=0)
+        md_pred[:, 'latent_space'] = np.asarray([",".join(np.char.mod('%f', item)) for item in latents])
+
         md_pred.write(os.path.join(args.output_path, "predicted_pose_shifts" + os.path.splitext(args.md)[1]))
 
         # Predict volume
@@ -1191,6 +1366,15 @@ def main():
 
         decoded_volume = decode_volume()
         ImageHandler().write(np.array(decoded_volume), os.path.join(args.output_path, "reconsiren_map.mrc"), overwrite=True)
+
+        # Predict heterogeneous states
+        kmeans = KMeans(n_clusters=20).fit(latents)
+        centers = kmeans.cluster_centers_
+        idx = 1
+        for center in centers:
+            decoded = decode_het_volume(center[None, ...])
+            ImageHandler().write(np.array(decoded), os.path.join(args.output_path, f"reconsiren_hetmap_{idx:02d}.mrc"), overwrite=True)
+            idx += 1
 
 if __name__ == "__main__":
     main()
