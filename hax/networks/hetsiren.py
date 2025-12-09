@@ -252,6 +252,10 @@ class DeltaVolumeDecoder(nnx.Module):
         coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)[None, ...]
         self.coords = (coords - self.factor) / self.factor
 
+        # Graph from coordinates
+        if not jnp.all(reference_values == 0):
+            self.edge_index, _ = build_graph_from_coordinates(self.coords[0], k=2, radius_factor=1.5)
+
         # Delta volume decoder (TODO: Check and fix hypernetwork - compare with TF implementation)
         # self.hidden_linear = [HyperLinear(in_features=lat_dim, out_features=8, in_hyper_features=lat_dim, hidden_hyper_features=8, rngs=rngs, dtype=jnp.bfloat16)]
         # for _ in range(3):
@@ -592,7 +596,8 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True):
         wiener2DFilter_vmap = wiener2DFilter
         ctfFilter_vmap = ctfFilter
 
-    sparse_finite_3D_differences_field = jax.vmap(sparse_finite_3D_differences, in_axes=(-1, None, None), out_axes=-1)
+    # sparse_finite_3D_differences_field = jax.vmap(sparse_finite_3D_differences, in_axes=(-1, None, None), out_axes=-1)
+    distance_regularizer_from_graph_batch = jax.vmap(distance_regularizer_from_graph, in_axes=(None, 0, None))
 
     def loss_fn(model, x):
         # Check if Tomo mode
@@ -716,7 +721,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True):
         # L1 based denoising
         l1_loss = jnp.mean(jnp.abs(values))
 
-        # L1 and L2 total variation
+        # L1 and L2 total variation (old version - no sparse)
         # diff_x = volumes[:, 1:, :, :] - volumes[:, :-1, :, :]
         # diff_y = volumes[:, :, 1:, :] - volumes[:, :, :-1, :]
         # diff_z = volumes[:, :, :, 1:] - volumes[:, :, :, :-1]
@@ -724,14 +729,18 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True):
         # l2_grad_loss = jnp.square(diff_x).mean() + jnp.square(diff_z).mean() + jnp.square(diff_y).mean()
 
         # Values
-        diff_x, diff_y, diff_z = sparse_finite_3D_differences(values, model.inds, model.xsize)
-        l1_grad_loss = jnp.abs(diff_x).mean() + jnp.abs(diff_z).mean() + jnp.abs(diff_y).mean()
-        l2_grad_loss = jnp.square(diff_x).mean() + jnp.square(diff_z).mean() + jnp.square(diff_y).mean()
+        # diff_x, diff_y, diff_z = sparse_finite_3D_differences(values, model.inds, model.xsize)
+        # l1_grad_loss = jnp.abs(diff_x).mean() + jnp.abs(diff_z).mean() + jnp.abs(diff_y).mean()
+        # l2_grad_loss = jnp.square(diff_x).mean() + jnp.square(diff_z).mean() + jnp.square(diff_y).mean()
 
         # Field
-        diff_field_x, diff_field_y, diff_field_z = sparse_finite_3D_differences_field(field, model.inds, model.xsize)
-        l1_grad_field_loss = jnp.abs(diff_field_x).mean() + jnp.abs(diff_field_z).mean() + jnp.abs(diff_field_y).mean()
-        l2_grad_field_loss = jnp.square(diff_field_x).mean() + jnp.square(diff_field_z).mean() + jnp.square(diff_field_y).mean()
+        # if model.has_reference_volume and model.delta_volume_decoder.transport_mass:
+        #     diff_field_x, diff_field_y, diff_field_z = sparse_finite_3D_differences_field(field, model.inds, model.xsize)
+        #     l1_grad_field_loss = jnp.abs(diff_field_x).mean() + jnp.abs(diff_field_z).mean() + jnp.abs(diff_field_y).mean()
+        #     l2_grad_field_loss = jnp.square(diff_field_x).mean() + jnp.square(diff_field_z).mean() + jnp.square(diff_field_y).mean()
+        # else:
+        #     l1_grad_field_loss = 0.0
+        #     l2_grad_field_loss = 0.0
 
         # Chimeric volume losses
         if model.local_reconstruction:
@@ -758,6 +767,13 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True):
         else:
             nll = recons_loss_all.mean()
             kl_pose = 0.0
+
+        # Graph based loss
+        if model.has_reference_volume and model.delta_volume_decoder.transport_mass:
+            loss_graph = distance_regularizer_from_graph_batch(model.delta_volume_decoder.coords[0],  coords / model.delta_volume_decoder.factor,
+                                                               model.delta_volume_decoder.edge_index).mean()
+        else:
+            loss_graph = 0.0
 
         # Decoupling
         if model.decoupling or model.isTomoSIREN:
@@ -1214,11 +1230,11 @@ def main():
                 NeuralNetworkCheckpointer.save(volumeAdjustment, os.path.join(args.output_path, "volumeAdjustment"), mode="pickle")
 
         # Learning rate scheduler
-        total_steps = args.epochs * len(data_loader)
-        lr_schedule = CosineAnnealingScheduler.getScheduler(peak_value=args.learning_rate, total_steps=total_steps, warmup_frac=0.1, end_value=0.0, init_value=1e-5)
+        # total_steps = args.epochs * len(data_loader)
+        # lr_schedule = CosineAnnealingScheduler.getScheduler(peak_value=args.learning_rate, total_steps=total_steps, warmup_frac=0.1, end_value=0.0, init_value=1e-5)
 
         # Optimizers (HetSIREN)
-        optimizer = nnx.Optimizer(hetsiren, optax.adam(1e-4))
+        optimizer = nnx.Optimizer(hetsiren, optax.adamw(1e-4))
         graphdef, state = nnx.split((hetsiren, optimizer))
 
         # Resume if checkpoint exists

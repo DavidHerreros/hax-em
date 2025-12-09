@@ -9,6 +9,9 @@ import jax.numpy as jnp
 
 from functools import partial
 
+import numpy as np
+from sklearn.neighbors import KDTree
+
 from hax.generators import NumpyGenerator
 from hax.utils.loggers import bcolors
 
@@ -410,3 +413,90 @@ def sparse_finite_3D_differences(values, inds, vol_dim):
         return diff_x, diff_y, diff_z
 
     return _single_batch_diff(values, inds)
+
+
+def build_graph_from_coordinates(
+    centers,
+    k: int = 2,
+    radius_factor: float = 1.5,
+    undirected: bool = False,
+):
+    """
+    Memory-efficient model-free graph construction using sklearn KDTree.
+
+    Parameters
+    ----------
+    centers : jnp.ndarray or np.ndarray, shape (N, 3)
+        Pseudo-atom centers.
+    k : int, default=2
+        Number of nearest neighbours to estimate local spacing (2 in DynaMight).
+        We will query k+1 neighbors because the first one is the point itself.
+    radius_factor : float, default=1.5
+        Multiplier for the mean k-NN distance to set the radius.
+    leaf_size : int, default=40
+        KDTree leaf_size parameter (controls speed/memory trade-off).
+    metric : str, default="euclidean"
+        Distance metric for KDTree.
+    undirected : bool, default=False
+        If True, keep only one edge per undirected pair (i < j).
+        If False, keep both directions (i->j and j->i).
+
+    Returns
+    -------
+    edge_index : jnp.ndarray, shape (2, E), dtype=int32
+        Edge list [i, j] for the graph.
+    cutoff : jnp.ndarray, scalar
+        Radius used to connect nodes.
+    """
+    # Convert to numpy for sklearn
+    if isinstance(centers, jnp.ndarray):
+        centers_np = np.asarray(centers)
+    else:
+        centers_np = np.asarray(centers, dtype=np.float32)
+
+    # Build KDTree on CPU
+    tree = KDTree(centers_np)
+
+    # Estimate mean k-NN distance (excluding self)
+    dists, idxs = tree.query(centers_np, k=k + 1)
+    knn_dists = dists[:, 1 : k + 1]  # (N, k)
+    mean_k = knn_dists.mean()        # scalar float
+    cutoff = radius_factor * mean_k
+
+    # Radius neighbors graph
+    ind_array = tree.query_radius(centers_np, r=cutoff, return_distance=False)
+
+    edges_i = []
+    edges_j = []
+
+    if undirected:
+        # Only keep edges with j > i to avoid duplicates
+        for i, neigh in enumerate(ind_array):
+            for j in neigh:
+                if j == i:
+                    continue
+                if j > i:
+                    edges_i.append(i)
+                    edges_j.append(j)
+    else:
+        # Keep directed edges (i -> j), excluding self
+        for i, neigh in enumerate(ind_array):
+            for j in neigh:
+                if j == i:
+                    continue
+                edges_i.append(i)
+                edges_j.append(j)
+
+    edges_i = np.asarray(edges_i, dtype=np.int32)
+    edges_j = np.asarray(edges_j, dtype=np.int32)
+
+    if edges_i.size == 0:
+        edge_index_np = np.zeros((2, 0), dtype=np.int32)
+    else:
+        edge_index_np = np.stack([edges_i, edges_j], axis=0)  # (2, E)
+
+    # Convert back to JAX
+    edge_index = jnp.asarray(edge_index_np)
+    cutoff_jnp = jnp.asarray(cutoff, dtype=centers.dtype if isinstance(centers, jnp.ndarray) else jnp.float32)
+
+    return edge_index, cutoff_jnp
