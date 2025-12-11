@@ -578,8 +578,8 @@ class HetSIREN(nnx.Module):
                 values - self.delta_volume_decoder.reference_values)
 
 
-@partial(jax.jit, static_argnames=("do_update", ))
-def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True):
+@partial(jax.jit, static_argnames=("do_update", "l1_lambda"))
+def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_lambda=1e-4):
     model, optimizer = nnx.merge(graphdef, state)
     distributions_key, rot_sample_key, key = jnr.split(key, 3)
 
@@ -813,7 +813,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True):
             decoupling_loss = 0.0
 
         loss = (nll + 0.0001 * kl_loss + 0.001 * kl_pose + 0.001 * decoupling_loss
-                + 0.0001 * l1_loss + loss_graph + 100. * hist_loss)
+                + l1_lambda * l1_loss + loss_graph + 100. * hist_loss)
         return loss, (recon_loss.mean(), latent)
 
     # Check if Tomo mode
@@ -1065,6 +1065,9 @@ def main():
                         help=f"Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data - "
                              f"{bcolors.WARNING}NOTE{bcolors.ENDC}: If a reference volume was provided, HetSIREN also learns a gray level adjustment. In this case, "
                              f"reload must be the path to a folder containing two additional folders called: {bcolors.UNDERLINE}HetSIREN{bcolors.ENDC} and {bcolors.UNDERLINE}volumeAdjustment{bcolors.ENDC})")
+    parser.add_argument("--denoising_strength", required=False, type=float, default=1e-4,
+                        help=f"Determines how strongly HetSIREN will learn to remove noise from the resulting volumes. Increasing the value of this parameter will result in a stronger regularization of the noise, but it may affect the protein "
+                             f"signal as well. ({bcolors.WARNING}NOTE{bcolors.ENDC}: We recommend setting this parameter in the range 0.0001 to 0.1)")
     args = parser.parse_args()
 
     # Manually handed parameters
@@ -1271,7 +1274,7 @@ def main():
             pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{args.epochs}", file=sys.stdout, ascii=" >=", colour="green")
 
             for (x, labels) in pbar:
-                loss, recon_loss, state, rng = train_step_hetsiren(graphdef, state, x, labels, md_columns, rng)
+                loss, recon_loss, state, rng = train_step_hetsiren(graphdef, state, x, labels, md_columns, rng, l1_lambda=args.denoising_strength)
                 total_loss += loss
                 total_recon_loss += recon_loss
 
