@@ -249,7 +249,7 @@ class FlowDecoder(nnx.Module):
         self.zernike_coeffs = precomputePolynomialsZernike(L2, L1)
 
         # Graph from coordinates
-        self.edge_index, _ = build_graph_from_coordinates(self.coords[0], k=2, radius_factor=1.5)
+        self.edge_index, _ = build_graph_from_coordinates(self.coords, k=2, radius_factor=1.5)
 
         # Coefficients layers
         self.hidden_layers_coeff = [Linear(latent_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
@@ -289,7 +289,7 @@ class PhysDecoder(nnx.Module):
         self.xsize = xsize
 
         # Gray level adjustment
-        self.imageAdjustment = ImageAdjustment(lat_dim=lat_dim, xsize=xsize, predict_value=False, rngs=rngs)
+        self.imageAdjustment = ImageAdjustment(lat_dim=lat_dim, xsize=xsize, predict_value=True, rngs=rngs)
 
     def __call__(self, flow, x, inds, values, xsize, rotations, shifts, ctf, ctf_type):
         # Indices to coords
@@ -567,10 +567,9 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
             images_rigid_loss = images_rigid
 
         # Adjusted image
-        x_loss_adjusted = a * jax.lax.stop_gradient(x_loss) + b
+        images_corrected_loss = a * images_corrected_loss + b
 
-        recon_loss = 0.5 * (dm_pix.mse(images_corrected_loss[..., None], x_loss[..., None]).mean() +
-                            dm_pix.mse(images_corrected_loss[..., None], x_loss_adjusted[..., None]).mean())
+        recon_loss = mse(images_corrected_loss[..., None], x_loss[..., None]).mean()
         recon_loss_rigid = mse(images_rigid_loss[..., None], x_loss[..., None]).mean()
         recons_loss_all = 0.5 * (recon_loss + recon_loss_rigid)
 
