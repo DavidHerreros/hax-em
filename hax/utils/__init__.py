@@ -1,4 +1,4 @@
-from .losses import simae, correlation_coefficient_loss, ncc_loss, gradient_loss, diceLoss, contrastive_ce_loss, triplet_loss, sliced_wasserstein_loss, distance_regularizer_from_graph
+from .losses import simae, correlation_coefficient_loss, ncc_loss, gradient_loss, diceLoss, contrastive_ce_loss, triplet_loss, sliced_wasserstein_loss, distance_regularizer_from_graph, repulsion_from_graph
 from .ctf import computeCTF
 from .euler import euler_matrix_batch, euler_from_matrix
 from .grid_interpolation import interpolate

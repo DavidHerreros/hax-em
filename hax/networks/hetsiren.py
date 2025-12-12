@@ -598,6 +598,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
 
     # sparse_finite_3D_differences_field = jax.vmap(sparse_finite_3D_differences, in_axes=(-1, None, None), out_axes=-1)
     distance_regularizer_from_graph_batch = jax.vmap(distance_regularizer_from_graph, in_axes=(None, 0, None))
+    repulsion_from_graph_batch = jax.vmap(repulsion_from_graph, in_axes=(None, 0, None))
 
     def loss_fn(model, x):
         # Check if Tomo mode
@@ -772,6 +773,8 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         if model.has_reference_volume and model.delta_volume_decoder.transport_mass:
             loss_graph = distance_regularizer_from_graph_batch(model.delta_volume_decoder.coords[0],  coords / model.delta_volume_decoder.factor,
                                                                model.delta_volume_decoder.edge_index).mean()
+            loss_graph += repulsion_from_graph_batch(model.delta_volume_decoder.coords[0],  coords / model.delta_volume_decoder.factor,
+                                                     model.delta_volume_decoder.edge_index).mean()
         else:
             loss_graph = 0.0
 

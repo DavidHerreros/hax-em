@@ -439,3 +439,26 @@ def distance_regularizer_from_graph(c0: jnp.ndarray,
     loss_per_edge = diff ** 2  # (E,)
 
     return jnp.mean(loss_per_edge)
+
+
+def repulsion_from_graph(c0: jnp.ndarray,
+                         c: jnp.ndarray,
+                         edge_index: jnp.ndarray):
+    """
+    c0: (N, 3) reference centers (no grad needed).
+    c:  (N, 3) deformed centers (requires grad).
+    edge_index: (2, E) int array of edge indices [i, j].
+
+    Returns:
+        scalar loss (if mean/sum) or (E,) per-edge loss (if "none").
+    """
+
+    i, j = edge_index  # (E,), (E,)
+
+    d  = jnp.linalg.norm(c[i]  - c[j],  axis=-1)  # (E,)
+
+    tau = jnp.linalg.norm(c0[i] - c0[j], axis=-1).mean()
+
+    x = jnp.where(d < tau, 1.0, tau)
+
+    return jnp.mean(x * (d - tau) ** 2.).mean()
