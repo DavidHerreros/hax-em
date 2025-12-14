@@ -24,53 +24,51 @@ class Encoder(nnx.Module):
         self.refine_current_assignment = refine_current_assignment
 
         # Hidden layers
-        self.hidden_layers_conv = [nnx.Conv(self.pyramid_levels, 64, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16)]
-        self.hidden_layers_conv.append(nnx.Conv(64, 64, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_conv = [Conv(self.pyramid_levels, 64, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16)]
+        self.hidden_layers_conv.append(Conv(64, 64, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
 
-        self.hidden_layers_conv.append(nnx.Conv(64, 128, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_layers_conv.append(nnx.Conv(128, 128, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_conv.append(Conv(64, 128, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_conv.append(Conv(128, 128, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
 
-        self.hidden_layers_conv.append(nnx.Conv(128, 256, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_layers_conv.append(nnx.Conv(256, 256, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_layers_conv.append(nnx.Conv(256, 256, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_conv.append(Conv(128, 256, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_conv.append(Conv(256, 256, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_conv.append(Conv(256, 256, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
 
-        self.hidden_layers_conv.append(nnx.Conv(256, 512, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_layers_conv.append(nnx.Conv(512, 512, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_layers_conv.append(nnx.Conv(512, 512, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_conv.append(Conv(256, 512, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_conv.append(Conv(512, 512, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_conv.append(Conv(512, 512, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
 
-        self.hidden_layers_linear = [nnx.Linear(self.out_conv_dim * self.out_conv_dim * 512, 1024, rngs=rngs, dtype=jnp.bfloat16)]
-        self.hidden_layers_linear.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_layers_linear.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_linear = [Linear(self.out_conv_dim * self.out_conv_dim * 512, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        self.hidden_layers_linear.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers_linear.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         # self.hidden_layers_linear.append(Linear(1024, 8, rngs=rngs))
 
         # Layers to 9D rotation
-        self.hidden_9d_rotation = [nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
-        self.hidden_9d_rotation.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_9d_rotation.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        # self.hidden_9d_rotation.append(nnx.Linear(1024, 3, rngs=rngs))
+        self.hidden_9d_rotation = [Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        self.hidden_9d_rotation.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_9d_rotation.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        # self.hidden_9d_rotation.append(Linear(1024, 3, rngs=rngs))
         if refine_current_assignment:
-            self.hidden_9d_rotation.append(nnx.Linear(1024, self.num_components * 6, rngs=rngs))
+            self.hidden_9d_rotation.append(Linear(1024, self.num_components * 6, rngs=rngs))
             self.alpha_rotations = nnx.Param(jnp.array(1e-4))
         else:
-            self.hidden_9d_rotation.append(nnx.Linear(1024, self.num_components * 9, rngs=rngs))
+            self.hidden_9d_rotation.append(Linear(1024, self.num_components * 9, rngs=rngs))
 
         # Layers to shifts
-        self.hidden_shifts = [nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
-        self.hidden_shifts.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_shifts.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_shifts = [Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        self.hidden_shifts.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_shifts.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         if refine_current_assignment:
-            self.hidden_shifts.append(nnx.Linear(1024, 2, rngs=rngs, kernel_init=normal_initializer_mean(mean=0.0, stddev=1e-4)))
+            self.hidden_shifts.append(Linear(1024, 2, rngs=rngs, kernel_init=normal_initializer_mean(mean=0.0, stddev=1e-4)))
             self.alpha_shifts = nnx.Param(jnp.array(1e-4))
         else:
-            self.hidden_shifts.append(nnx.Linear(1024, 2, rngs=rngs, kernel_init=normal_initializer_mean(mean=0.0, stddev=1e-4)))
+            self.hidden_shifts.append(Linear(1024, 2, rngs=rngs, kernel_init=normal_initializer_mean(mean=0.0, stddev=1e-4)))
 
         # Layers to latent
-        self.hidden_latent = [nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
-        self.hidden_latent.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_latent.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_latent.append(nnx.Linear(1024, 2, rngs=rngs))
-
         self.rngs = rngs
+        self.hidden_latent = [Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        self.hidden_latent.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_latent.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         self.mean_x = Linear(1024, lat_dim, rngs=rngs)
         self.logstd_x = Linear(1024, lat_dim, rngs=rngs)
 
@@ -154,7 +152,7 @@ class Encoder(nnx.Module):
 
         # Latent space (heterogeneity)
         latent = nnx.gelu(self.hidden_latent[0](x))  # or nnx.Relu (TODO: Try leaky relu)
-        for layer in self.hidden_latent[1:-1]:
+        for layer in self.hidden_latent[1:]:
             latent = nnx.gelu(latent + layer(latent))  # or nnx.Relu (TODO: Try leaky relu)
         mean = self.mean_x(latent)
         logstd = self.logstd_x(latent)
@@ -1221,7 +1219,7 @@ def main():
 
         # Training loop (ReconSIREN)
         training_volume_log = " / volume" if not args.do_not_learn_volume else ""
-        print(f"{bcolors.OKCYAN}\n###### Training angular assignment / shifts{training_volume_log}... ######")
+        print(f"{bcolors.OKCYAN}\n###### Training angular assignment / shifts{training_volume_log} / heterogeneity... ######")
         for i in range(resume_epoch, args.epochs):
             total_loss = 0
             total_recon_loss = 0
