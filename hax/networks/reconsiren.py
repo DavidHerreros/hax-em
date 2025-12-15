@@ -44,15 +44,18 @@ class Encoder(nnx.Module):
         # self.hidden_layers_linear.append(Linear(1024, 8, rngs=rngs))
 
         # Layers to 9D rotation
-        self.hidden_9d_rotation = [Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
-        self.hidden_9d_rotation.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        self.hidden_9d_rotation.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        # self.hidden_9d_rotation.append(Linear(1024, 3, rngs=rngs))
+        self.hidden_6d_rotation = [Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        self.hidden_6d_rotation.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_6d_rotation.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         if refine_current_assignment:
-            self.hidden_9d_rotation.append(Linear(1024, self.num_components * 6, rngs=rngs))
+            self.hidden_6d_rotation.append(Linear(1024, self.num_components * 6, rngs=rngs))
             self.alpha_rotations = nnx.Param(jnp.array(1e-4))
         else:
-            self.hidden_9d_rotation.append(Linear(1024, self.num_components * 9, rngs=rngs))
+            identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...]
+            identity_6d = jnp.tile(identity_6d, (1, self.num_components))
+            kernel_init = jax.nn.initializers.normal(stddev=1e-2)
+            bias_init = lambda key, shape, dtype: identity_6d
+            self.hidden_6d_rotation.append(Linear(1024, self.num_components * 6, kernel_init=kernel_init, bias_init=bias_init, rngs=rngs))
 
         # Layers to shifts
         self.hidden_shifts = [Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
@@ -110,33 +113,23 @@ class Encoder(nnx.Module):
         x = self.hidden_layers_linear[-1](x)
 
         # First output: rotation matrices
-        rotation_9d = nnx.gelu(self.hidden_9d_rotation[0](x))  # or nnx.Relu (TODO: Try leaky relu)
-        for layer in self.hidden_9d_rotation[1:-1]:
-            rotation_9d = nnx.gelu(rotation_9d + layer(rotation_9d))  # or nnx.Relu (TODO: Try leaky relu)
-        rotation_9d = self.hidden_9d_rotation[-1](rotation_9d)
-        # rotation_9d = self.hidden_9d_rotation[-1](x)  # Keep for reference: before only one layer needed
+        rotations_6d = nnx.gelu(self.hidden_6d_rotation[0](x))  # or nnx.Relu (TODO: Try leaky relu)
+        for layer in self.hidden_6d_rotation[1:-1]:
+            rotations_6d = nnx.gelu(rotations_6d + layer(rotations_6d))  # or nnx.Relu (TODO: Try leaky relu)
+        rotations_6d = self.hidden_6d_rotation[-1](rotations_6d)
+        # rotation_9d = self.hidden_6d_rotation[-1](x)  # Keep for reference: before only one layer needed
 
+        rotations_6d = rotations_6d.reshape(x.shape[0] * self.num_components, 6)
         if self.refine_current_assignment:
-            rotations_6d = rotation_9d.reshape(x.shape[0] * self.num_components, 6)
             identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...].repeat(rotations_6d.shape[0], axis=0)
-            rotation_6d = identity_6d + self.alpha_rotations * rotations_6d
-            a1, a2 = jnp.split(rotation_6d, 2, axis=-1)
-            b1 = a1 / jnp.clip(jnp.linalg.norm(a1, axis=-1, keepdims=True), a_min=1e-6)
-            a2_ortho = a2 - jnp.sum(a2 * b1, axis=-1, keepdims=True) * b1
-            b2 = a2_ortho / jnp.clip(jnp.linalg.norm(a2_ortho, axis=-1, keepdims=True), a_min=1e-6)
-            b3 = jnp.cross(b1, b2, axis=-1)
-            rotations = jnp.stack([b1, b2, b3], axis=-1)
-            rotations = rotations.reshape(x.shape[0], self.num_components, 3, 3)
-        else:
-            M = rotation_9d.reshape(x.shape[0] * self.num_components, 9).reshape(-1, 3, 3)
-            U, _, V = jnp.linalg.svd(M, full_matrices=False)
-            det = jnp.linalg.det(jnp.matmul(U, V))
-            correction_diag = jnp.eye(3).reshape((1,) * (det.ndim) + (3, 3))
-            correction_diag = jnp.broadcast_to(correction_diag, (M.shape[0], 3, 3))
-            correction_diag = correction_diag.at[..., 2, 2].set(det)
-            U_corrected = jnp.matmul(U, correction_diag)
-            rotations = jnp.matmul(U_corrected, V)
-            rotations = rotations.reshape(x.shape[0], self.num_components, 3, 3)
+            rotations_6d = identity_6d + self.alpha_rotations * rotations_6d
+        a1, a2 = jnp.split(rotations_6d, 2, axis=-1)
+        b1 = a1 / jnp.clip(jnp.linalg.norm(a1, axis=-1, keepdims=True), a_min=1e-6)
+        a2_ortho = a2 - jnp.sum(a2 * b1, axis=-1, keepdims=True) * b1
+        b2 = a2_ortho / jnp.clip(jnp.linalg.norm(a2_ortho, axis=-1, keepdims=True), a_min=1e-6)
+        b3 = jnp.cross(b1, b2, axis=-1)
+        rotations = jnp.stack([b1, b2, b3], axis=-1)
+        rotations = rotations.reshape(x.shape[0], self.num_components, 3, 3)
 
         # Third output: in plane shifts
         in_plane_shifts = nnx.gelu(self.hidden_shifts[0](x))  # or nnx.Relu (TODO: Try leaky relu)
@@ -1074,7 +1067,7 @@ def main():
     if args.mask is not None:
         mask = ImageHandler(args.mask).getData()
     else:
-        mask = ImageHandler().createCircularMask(boxSize=xsize, radius=int(0.125 * xsize), is3D=True)
+        mask = ImageHandler().createCircularMask(boxSize=xsize, radius=int(0.25 * xsize), is3D=True)
 
     # Data loading approach
     if args.load_images_to_ram:
