@@ -1877,7 +1877,7 @@ def main():
             volumeAdjustment, os.path.join(args.output_path, "volumeAdjustment")
         )
         NeuralNetworkCheckpointer.save(
-            zernike3deep, os.path.join(args.output_path, "Zernike3Deep")
+            zernike3deep, os.path.join(args.output_path, "Zernike3Deep"), mode="pickle",
         )
 
         # Remove checkpoint
