@@ -1,14 +1,95 @@
 import os
 import sys
+import struct
+from glob import glob
 
 import numpy as np
 import random
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
 from tqdm import tqdm
 from jax import numpy as jnp
 from jax.tree_util import tree_map
 from xmipp_metadata.metadata import XmippMetaData
 from hax.utils.loggers import bcolors
+
+
+def _write_one_shard_array_record(path, image_indices, getImage_fn, dtype=np.float16):
+    """
+    Worker: loads images for a shard and writes a single ArrayRecord file.
+    """
+    from array_record.python.array_record_module import ArrayRecordWriter
+
+    # Load images for this shard
+    imgs = getImage_fn(image_indices)
+    imgs = np.ascontiguousarray(imgs.astype(dtype, copy=False))
+
+    # Precompute dtype bytes once per shard
+    dtype_str = imgs.dtype.str.encode("utf-8")
+    label_struct = struct.Struct("<I")  # unsigned int label prefix
+
+    # If all images share shape (typical), precompute header too
+    first_shape = imgs[0].shape
+    same_shape = True
+    for k in range(1, len(imgs)):
+        if imgs[k].shape != first_shape:
+            same_shape = False
+            break
+
+    if same_shape:
+        shape = first_shape
+        header = struct.pack(
+            f"<I{len(dtype_str)}sI{len(shape)}I",
+            len(dtype_str), dtype_str, len(shape), *shape
+        )
+
+    writer = ArrayRecordWriter(path, "group_size:1,uncompressed")
+    try:
+        for img, label in zip(imgs, image_indices):
+            raw = img.tobytes()
+
+            if not same_shape:
+                shape = img.shape
+                header = struct.pack(
+                    f"<I{len(dtype_str)}sI{len(shape)}I",
+                    len(dtype_str), dtype_str, len(shape), *shape
+                )
+
+            record_bytes = label_struct.pack(int(label)) + header + raw
+            writer.write(record_bytes)
+    finally:
+        writer.close()
+
+def parse_and_decompress(record_bytes):
+    label = struct.unpack('<I', record_bytes[:4])[0]
+    cursor = 4
+    dtype_len = struct.unpack('<I', record_bytes[cursor:cursor + 4])[0]
+    cursor += 4
+    dtype_str = record_bytes[cursor:cursor + dtype_len]
+    cursor += dtype_len
+    ndim = struct.unpack('<I', record_bytes[cursor:cursor + 4])[0]
+    cursor += 4
+    shape_format = f'<{ndim}I'
+    shape_size = struct.calcsize(shape_format)
+    shape = struct.unpack(shape_format, record_bytes[cursor:cursor + shape_size])
+    cursor += shape_size
+    data_bytes = record_bytes[cursor:]
+    image = np.frombuffer(data_bytes, dtype=np.dtype(dtype_str)).reshape(shape)
+    return image.astype(np.float32, copy=False)[..., None], label
+
+
+def _write_one_shard_mmap(path, image_indices, getImage_fn, dtype=np.float16):
+    from mmap_ninja import numpy as np_ninja
+
+    def getImage_dtype():
+        for idx in image_indices:
+            yield getImage_fn(idx).astype(dtype)
+
+    np_ninja.from_generator(
+        out_dir=path,
+        sample_generator=getImage_dtype(),
+        batch_size=2048,
+        verbose=False
+    )
 
 
 class MetaDataGenerator:
@@ -61,26 +142,125 @@ class MetaDataGenerator:
         images = build_ram_slab(len(self.md), H, W, batch_size=4096, threads=8)[..., None]
         return images[images_order]
 
-    def load_images_to_mmap(self, mmap_output_dir=None, images_order=None):
-        from mmap_ninja import numpy as np_ninja
-
-        if mmap_output_dir is None:
-            mmap_output_dir = os.path.join(os.path.dirname(self.file), "images_mmap")
-        else:
-            mmap_output_dir = os.path.join(mmap_output_dir, "images_mmap")
-
+    def load_images_to_array_record(self, mmap_output_dir=None, images_order=None, multiple_files=True, shard_size=10000,
+                                    num_workers=None, precision=np.float16, group_size=1, batch_reading_size=20000):
         if images_order is None:
             images_order = np.arange(len(self.md))
 
-        if not os.path.isdir(mmap_output_dir):
-            print(f"{bcolors.OKCYAN}\n###### Creating MMAP from images... ######")
-            np_ninja.from_generator(
-                out_dir=mmap_output_dir,
-                sample_generator=map(self.md.getMetaDataImage, images_order),
-                batch_size=4096,
-                verbose=True
-            )
-        return np_ninja.open_existing(mmap_output_dir)
+        # If we already have shards, just return the datasource
+        existing = glob(os.path.join(mmap_output_dir, "dataset-*.arrayrecord"))
+        if not existing:
+            print(f"{bcolors.OKCYAN}\n###### Creating Array Record from images... ######")
+
+            if not multiple_files:
+                # Single file.
+                shard_name = "dataset-00000.arrayrecord"
+                path = os.path.join(mmap_output_dir, shard_name)
+                from array_record.python.array_record_module import ArrayRecordWriter
+                import struct
+
+                writer = ArrayRecordWriter(path, f"group_size:{group_size},uncompressed")
+                try:
+                    label_struct = struct.Struct("<I")
+                    with tqdm(total=len(images_order), file=sys.stdout, ascii=" >=", colour="green") as pbar:
+                        for i in range(0, len(images_order), batch_reading_size):
+                            idxs = images_order[i:i + batch_reading_size]
+                            imgs = self.md.getMetaDataImage(idxs)
+                            imgs = np.ascontiguousarray(imgs.astype(precision, copy=False))
+
+                            dtype_str = imgs.dtype.str.encode("utf-8")
+                            # assume same shape in batch; recompute header per batch
+                            shape = imgs[0].shape
+                            header = struct.pack(
+                                f"<I{len(dtype_str)}sI{len(shape)}I",
+                                len(dtype_str), dtype_str, len(shape), *shape
+                            )
+
+                            for img, label in zip(imgs, idxs):
+                                record_bytes = label_struct.pack(int(label)) + header + img.tobytes()
+                                writer.write(record_bytes)
+                                pbar.update(1)
+                finally:
+                    writer.close()
+
+            else:
+                # Multiple files: write shards in parallel
+                if num_workers is None:
+                    num_workers = os.cpu_count() or 4
+
+                # Build shard jobs
+                shards = []
+                n = len(images_order)
+                shard_idx = 0
+                for start in range(0, n, shard_size):
+                    end = min(start + shard_size, n)
+                    idxs = np.asarray(images_order[start:end])
+                    shard_name = f"dataset-{shard_idx:05d}.arrayrecord"
+                    path = os.path.join(mmap_output_dir, shard_name)
+                    shards.append((path, idxs))
+                    shard_idx += 1
+
+                # Submit processes
+                with tqdm(total=n, file=sys.stdout, ascii=" >=", colour="green") as pbar:
+                    with ProcessPoolExecutor(max_workers=num_workers) as ex:
+                        futures = [
+                            ex.submit(_write_one_shard_array_record, path, idxs, self.md.getMetaDataImage)
+                            for (path, idxs) in shards
+                        ]
+
+                        # Update progress by shard completion (exact per-record progress would require IPC)
+                        for fut, (_, idxs) in zip(as_completed(futures), shards):
+                            fut.result()  # raise if any error
+                            pbar.update(len(idxs))
+
+    def load_images_to_mmap(self, mmap_output_dir=None, images_order=None, shard_size=10000, num_workers=None,
+                            precision=np.float16, multiple_files=True):
+        if multiple_files:
+
+            # If we already have shards, just return the datasource
+            existing = glob(os.path.join(mmap_output_dir, "dataset-*"))
+
+            if not existing:
+                print(f"{bcolors.OKCYAN}\n###### Creating MMAP from images... ######")
+
+                # Multiple files: write shards in parallel
+                if num_workers is None:
+                    num_workers = os.cpu_count() or 4
+
+                # Build shard jobs
+                shards = []
+                n = len(images_order)
+                shard_idx = 0
+                for start in range(0, n, shard_size):
+                    end = min(start + shard_size, n)
+                    idxs = np.asarray(images_order[start:end])
+                    shard_name = f"dataset-{shard_idx:05d}"
+                    path = os.path.join(mmap_output_dir, shard_name)
+                    shards.append((path, idxs))
+                    shard_idx += 1
+
+                # Submit processes
+                with tqdm(total=n, file=sys.stdout, ascii=" >=", colour="green") as pbar:
+                    with ProcessPoolExecutor(max_workers=num_workers) as ex:
+                        futures = [
+                            ex.submit(_write_one_shard_mmap, path, idxs, self.md.getMetaDataImage, precision)
+                            for (path, idxs) in shards
+                        ]
+
+                        # Update progress by shard completion (exact per-record progress would require IPC)
+                        for fut, (_, idxs) in zip(as_completed(futures), shards):
+                            fut.result()  # raise if any error
+                            pbar.update(len(idxs))
+
+            else:
+                if not os.path.isdir(mmap_output_dir):
+                    from mmap_ninja import numpy as np_ninja
+                    np_ninja.from_generator(
+                        out_dir=mmap_output_dir,
+                        sample_generator=map(self.md.getMetaDataImage, images_order),
+                        batch_size=4096,
+                        verbose=True
+                    )
 
     def return_tf_dataset(self, preShuffle=False, shuffle=True, prefetch=-1, batch_size=8, mmap=True, mmap_output_dir=None, split_fraction=None):
         import tensorflow_datasets as tfds
@@ -94,7 +274,10 @@ class MetaDataGenerator:
                 np.random.shuffle(file_idx)
 
             if mmap:
-                images = self.load_images_to_mmap(mmap_output_dir=mmap_output_dir, images_order=None)
+                from mmap_ninja import numpy as np_ninja
+
+                self.load_images_to_mmap(mmap_output_dir=mmap_output_dir, images_order=None)
+                images = np_ninja.open_existing(mmap_output_dir)
 
                 def _load_image(idx):
                     idx = idx.astype(np.int64)
@@ -185,45 +368,196 @@ class MetaDataGenerator:
         def numpy_collate(batch):
             return tree_map(np.asarray, default_collate(batch))
 
-        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=0, collate_fn=numpy_collate)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=16, collate_fn=numpy_collate, persistent_workers=True,
+                          pin_memory=True)
 
-    def return_grain_dataset(self, preShuffle=False, shuffle=True, batch_size=8, mmap=True, mmap_output_dir=None):
-        import grain
+    def prepare_grain_array_record(self, mmap_output_dir=None, preShuffle=False, num_workers=16, precision=np.float16, group_size=1,
+                                   shard_size=10000):
+        self.grain_dataset_type = "ArrayRecord"
 
-        class CustomSource(grain.sources.RandomAccessDataSource):
-            def __init__(self, data, labels, subtomo_labels=None):
-                self.data = data
-                self.labels = labels
-                self.subtomo_labels = subtomo_labels
+        # Prepare folder to save data
+        if mmap_output_dir is None:
+            self.mmap_output_dir = os.path.join(os.path.dirname(self.file), "images_mmap_grain")
+        else:
+            self.mmap_output_dir = os.path.join(mmap_output_dir, "images_mmap_grain")
+        os.makedirs(self.mmap_output_dir, exist_ok=True)
 
-            def __getitem__(self, idx):
-                if self.subtomo_labels is None:
-                    return self.data[idx], self.labels[idx]
-                else:
-                    return (self.data[idx], self.subtomo_labels[idx]), self.labels[idx]
-
-            def __len__(self):
-                return len(self.data)
-
+        # Pre shuffle data before writing
         file_idx = np.arange(len(self.md))
         if preShuffle:
             np.random.shuffle(file_idx)
 
-        if mmap:
-            images = self.load_images_to_mmap(mmap_output_dir=mmap_output_dir, images_order=file_idx)
-        else:
-            images = self.load_images_to_ram(images_order=file_idx)
+        self.load_images_to_array_record(mmap_output_dir=self.mmap_output_dir, images_order=file_idx, num_workers=num_workers,
+                                         precision=precision, group_size=group_size, shard_size=shard_size)
 
-        if self.mode == "tomo":
-            subtomo_labels = self.sinusoid_table[self.md[file_idx, "subtomo_labels"].astype(int) - 1]
-            dataset = grain.MapDataset.source(CustomSource(images, file_idx, subtomo_labels))
-        else:
-            dataset = grain.MapDataset.source(CustomSource(images, file_idx))
+    def prepare_grain_mmap(self, mmap_output_dir=None, preShuffle=False, num_workers=16, shard_size=10000, precision=np.float16,
+                           multiple_files=True):
+        self.grain_dataset_type = "MMAP"
 
-        if shuffle:
+        # Prepare folder to save data
+        if mmap_output_dir is None:
+            self.mmap_output_dir = os.path.join(os.path.dirname(self.file), "images_mmap")
+        else:
+            self.mmap_output_dir = os.path.join(mmap_output_dir, "images_mmap")
+        os.makedirs(self.mmap_output_dir, exist_ok=True)
+
+        # Pre shuffle data before writing
+        images_order = np.arange(len(self.md))
+        if preShuffle:
+            np.random.shuffle(images_order)
+
+        self.load_images_to_mmap(mmap_output_dir=self.mmap_output_dir, images_order=images_order, num_workers=num_workers,
+                                 shard_size=shard_size, precision=precision, multiple_files=multiple_files)
+
+    def return_grain_dataset(self, shuffle="global", batch_size=8, num_epochs=1, num_threads=1, num_workers=16,
+                             split_fraction=None):
+        import grain
+        from array_record.python.array_record_data_source import ArrayRecordDataSource
+
+        # Get sources
+        if self.grain_dataset_type == "ArrayRecord":
+            shard_files = glob(os.path.join(self.mmap_output_dir, "dataset-*.arrayrecord"))
+            shard_files.sort()
+            sources = ArrayRecordDataSource(shard_files, reader_options={"index_storage_option": "in_memory"})
+            dataset = grain.MapDataset.source(sources)
+
+        elif self.grain_dataset_type == "MMAP":
+            from mmap_ninja import numpy as np_ninja
+
+            # Class to handle mmap_ninja shards
+            class LazyNinjaGrainSource:
+                def __init__(self, shard_paths):
+                    self.shard_paths = shard_paths
+
+                    self.shard_lengths = []
+                    for p in shard_paths:
+                        mmap = np_ninja.open_existing(p, mode="r")
+                        self.shard_lengths.append(len(mmap))
+
+                    self.total_len = sum(self.shard_lengths)
+                    self.cumulative_indices = np.cumsum(self.shard_lengths)
+
+                def _get_shard(self, shard_idx):
+                    return np_ninja.open_existing(self.shard_paths[shard_idx], mode="r")
+
+                def __len__(self):
+                    return self.total_len
+
+                def __getitem__(self, idx):
+                    if idx < 0 or idx >= self.total_len:
+                        raise IndexError
+
+                    # Find the shard index
+                    shard_idx = np.searchsorted(self.cumulative_indices, idx, side='right')
+
+                    # Calculate local index
+                    if shard_idx == 0:
+                        local_idx = idx
+                    else:
+                        local_idx = idx - self.cumulative_indices[shard_idx - 1]
+
+                    # Get the shard lazily (using the LRU cache)
+                    shard = self._get_shard(shard_idx)
+
+                    # Access data (returns a numpy array)
+                    return shard[local_idx][..., None].astype(np.float32), idx
+
+            shard_paths = glob(os.path.join(self.mmap_output_dir, "dataset-*"))
+            shard_paths.sort()
+            source = LazyNinjaGrainSource(shard_paths)
+            dataset = grain.MapDataset.source(source)
+
+        else:
+            raise ValueError("Unknown grain dataset type")
+
+        if split_fraction:
+            len_dataset = int(np.ceil(len(self.md) / batch_size))
+            split_point = int(split_fraction[0] * len_dataset)
+            datasets = [dataset.slice(slice(0, split_point)), dataset.slice(slice(split_point, len_dataset))]
+        else:
+            datasets = [dataset, ]
+
+        # Shuffling type
+        if shuffle == "global":
             seed = random.randint(0, 2 ** 32 - 1)
-            dataset = dataset.shuffle(seed=seed)
-        return dataset.to_iter_dataset().batch(batch_size)
+            datasets = [dataset.shuffle(seed=seed) for dataset in datasets]
+
+            if self.grain_dataset_type == "ArrayRecord":
+                datasets = [dataset.map(parse_and_decompress) for dataset in datasets]
+
+            datasets = [dataset.repeat(num_epochs) for dataset in datasets]
+
+            if num_threads > 1:
+                read_options = grain.ReadOptions(num_threads=num_threads, prefetch_buffer_size=1)
+            else:
+                read_options = None
+
+
+            datasets = [dataset.to_iter_dataset(read_options=read_options).batch(batch_size) for dataset in datasets]
+
+            if num_workers == -1:
+                performance_configs = [grain.experimental.pick_performance_config(
+                    ds=dataset,
+                    ram_budget_mb=1024,
+                    max_workers=None,
+                    max_buffer_size=None
+                ) for dataset in datasets]
+                mp_options = [performance_config.multiprocessing_options for performance_config in performance_configs]
+            else:
+                mp_options = [grain.multiprocessing.MultiprocessingOptions(num_workers=num_workers,
+                                                                           per_worker_buffer_size=2) for _ in datasets]
+            datasets = [dataset.mp_prefetch(options=mp_options_dataset) for dataset, mp_options_dataset in zip(datasets, mp_options)]
+
+        elif shuffle == "hierarchical":
+            seed = random.randint(0, 2 ** 32 - 1)
+
+            datasets = [grain.experimental.WindowShuffleMapDataset(dataset, window_size=2048, seed=seed) for dataset in datasets]
+
+            if self.grain_dataset_type == "ArrayRecord":
+                datasets = [dataset.map(parse_and_decompress) for dataset in datasets]
+
+            datasets = [dataset.repeat(num_epochs) for dataset in datasets]
+
+            # dataset = dataset.to_iter_dataset()
+
+            datasets = [grain.experimental.InterleaveIterDataset(dataset, cycle_length=10) for dataset in datasets]
+
+            datasets = [dataset.batch(batch_size) for dataset in datasets]
+
+            mp_options = grain.multiprocessing.MultiprocessingOptions(num_workers=16, per_worker_buffer_size=2)
+            datasets = [dataset.mp_prefetch(options=mp_options) for dataset in datasets]
+
+        else:
+            if self.grain_dataset_type == "ArrayRecord":
+                datasets = [dataset.map(parse_and_decompress) for dataset in datasets]
+
+            datasets = [dataset.repeat(num_epochs) for dataset in datasets]
+
+            if num_threads > 1:
+                read_options = grain.ReadOptions(num_threads=num_threads, prefetch_buffer_size=1)
+            else:
+                read_options = None
+
+            datasets = [dataset.to_iter_dataset(read_options=read_options).batch(batch_size) for dataset in datasets]
+
+            if num_workers == -1:
+                performance_configs = [grain.experimental.pick_performance_config(
+                    ds=dataset,
+                    ram_budget_mb=1024,
+                    max_workers=None,
+                    max_buffer_size=None
+                ) for dataset in datasets]
+                mp_options = [performance_config.multiprocessing_options for performance_config in performance_configs]
+            else:
+                mp_options = [grain.multiprocessing.MultiprocessingOptions(num_workers=num_workers,
+                                                                           per_worker_buffer_size=2) for _ in datasets]
+            datasets = [dataset.mp_prefetch(options=mp_options_dataset) for dataset, mp_options_dataset in zip(datasets, mp_options)]
+
+        if split_fraction is not None:
+            return datasets
+        else:
+            return datasets[0]
+
 
 def extract_columns(md, hasCTF=None, isTomo=None):
     hasCTF = md.isMetaDataLabel("ctfDefocusU") if hasCTF is None else hasCTF
