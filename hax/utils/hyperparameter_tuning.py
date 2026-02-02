@@ -32,8 +32,8 @@ def find_max_batch_size(graphdef, state, step, md, rng, input_shape_per_sample):
             # Double the batch size
             batch_size *= 2
 
-            # Optional: Break if batch size is unreasonably large
-            if batch_size > 65536:
+            # Optional: Break if batch size is unreasonably large (above 256 weird errors may appear)
+            if batch_size > 256:
                 break
 
         except (RuntimeError, jax.errors.JaxRuntimeError) as e:
