@@ -417,7 +417,8 @@ def sparse_finite_3D_differences(values, inds, vol_dim):
 
 def build_graph_from_coordinates(
     centers,
-    k: int = 2,
+    k_knn: int = 6,
+    k_spacing: int = 2,
     radius_factor: float = 1.5,
     undirected: bool = False,
 ):
@@ -428,8 +429,11 @@ def build_graph_from_coordinates(
     ----------
     centers : jnp.ndarray or np.ndarray, shape (N, 3)
         Pseudo-atom centers.
-    k : int, default=2
+    k_spacing : int, default=2
         Number of nearest neighbours to estimate local spacing (2 in DynaMight).
+        We will query k+1 neighbors because the first one is the point itself.
+    k_knn : int, default=6
+        Number of nearest neighbours to estimate connection graph (6 in DynaMight).
         We will query k+1 neighbors because the first one is the point itself.
     radius_factor : float, default=1.5
         Multiplier for the mean k-NN distance to set the radius.
@@ -458,8 +462,8 @@ def build_graph_from_coordinates(
     tree = KDTree(centers_np)
 
     # Estimate mean k-NN distance (excluding self)
-    dists, idxs = tree.query(centers_np, k=k + 1)
-    knn_dists = dists[:, 1 : k + 1]  # (N, k)
+    dists, idxs = tree.query(centers_np, k=k_spacing + 1)
+    knn_dists = dists[:, 1 : k_spacing + 1]  # (N, k)
     mean_k = knn_dists.mean()        # scalar float
     cutoff = radius_factor * mean_k
 
@@ -490,16 +494,42 @@ def build_graph_from_coordinates(
     edges_i = np.asarray(edges_i, dtype=np.int32)
     edges_j = np.asarray(edges_j, dtype=np.int32)
 
+    # Compute edge weights
     if edges_i.size == 0:
         edge_index_np = np.zeros((2, 0), dtype=np.int32)
+        edge_weights_np = np.zeros((0,), dtype=np.float32)
     else:
-        edge_index_np = np.stack([edges_i, edges_j], axis=0)  # (2, E)
+        edge_index_np = np.stack([edges_i, edges_j], axis=0)
+
+        # Get distances in consensus model
+        diffs = centers_np[edges_i] - centers_np[edges_j]
+        dists = np.linalg.norm(diffs, axis=-1)
+
+        # Gaussian weighting
+        sigma = mean_k
+        edge_weights_np = np.exp(-(dists ** 2.) / (2. * sigma ** 2.))
+
+        # Compute Degree Normalization (Optional but stabilizes training)
+        # Ensures total weight per node is roughly consistent
+        # unique, counts = np.unique(edges_i, return_counts=True)
+        # degree_map = dict(zip(unique, counts))
+        # node_degrees = np.array([degree_map.get(idx, 1) for idx in edges_i])
+        # edge_weights_np = edge_weights_np / node_degrees
+
+    # Build KNN graph (for Outlier Loss)
+    dists_knn, idxs_knn = tree.query(centers_np, k=k_knn + 1)
+    edges_i_knn = np.repeat(np.arange(centers_np.shape[0]), k_knn)
+    edges_j_knn = idxs_knn[:, 1:].flatten()
+    edge_index_knn_np = np.stack([edges_i_knn, edges_j_knn], axis=0)
 
     # Convert back to JAX
     edge_index = jnp.asarray(edge_index_np)
+    edge_weights = jnp.asarray(edge_weights_np, dtype=jnp.float32)
+    consensus_distances = jnp.asarray(dists, dtype=jnp.float32)
+    edge_index_knn = jnp.asarray(edge_index_knn_np)
     cutoff_jnp = jnp.asarray(cutoff, dtype=centers.dtype if isinstance(centers, jnp.ndarray) else jnp.float32)
 
-    return edge_index, cutoff_jnp
+    return edge_index, edge_weights, consensus_distances, consensus_distances.mean(), edge_index_knn, cutoff_jnp
 
 
 def sample_mask_points(mask, N):
@@ -534,3 +564,7 @@ def sample_mask_points(mask, N):
 
     # 5. Reshape back to the original (M, M, M) dimensions
     return out_flat.reshape(mask.shape)
+
+
+def safe_norm(x, axis=-1, eps=1e-8):
+    return jnp.sqrt(jnp.sum(jnp.square(x), axis=axis) + eps)

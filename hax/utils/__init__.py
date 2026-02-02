@@ -8,7 +8,8 @@ from .zernike3d import computeBasis, basisDegreeVectors, precomputePolynomialsZe
 from .segmentation import get_segmentation_centers, watershed_segmentation
 from .normalizers import min_max_scale, standard_normalization
 from .random_gen import random_rotation_matrices
-from .miscellaneous import estimate_noise_stddev, filter_latent_space, batched_knn, rigid_registration, estimate_envelopes, sparse_finite_3D_differences, build_graph_from_coordinates, sample_mask_points
+from .miscellaneous import (estimate_noise_stddev, filter_latent_space, batched_knn, rigid_registration, estimate_envelopes,
+                            sparse_finite_3D_differences, build_graph_from_coordinates, sample_mask_points, safe_norm)
 from .whiten_filter import estimate_noise_psd, create_whitening_fn
 from .loggers import bcolors
 from .symmetry_groups import symmetry_matrices
