@@ -28,12 +28,15 @@ class ImageAdjustment(nnx.Module):
             self.hidden_layers_us.append(nnx.Linear(32, 32, rngs=rngs, dtype=jnp.bfloat16))
         self.latent = nnx.Linear(32, lat_dim, rngs=rngs)
 
+        self.a_reg = nnx.Param(0.0)
+        self.b_reg = nnx.Param(0.0)
+
         if predict_value:
-            self.a = nnx.Linear(32, 1, rngs=rngs, kernel_init=jax.nn.initializers.zeros, bias_init=jax.nn.initializers.ones)
-            self.b = nnx.Linear(32, 1, rngs=rngs, kernel_init=jax.nn.initializers.zeros, bias_init=jax.nn.initializers.zeros)
+            self.a = nnx.Linear(32, 1, rngs=rngs)
+            self.b = nnx.Linear(32, 1, rngs=rngs)
         else:
-            self.a = nnx.Linear(32, xsize * xsize, rngs=rngs, kernel_init=jax.nn.initializers.zeros, bias_init=jax.nn.initializers.ones)
-            self.b = nnx.Linear(32, xsize * xsize, rngs=rngs, kernel_init=jax.nn.initializers.zeros, bias_init=jax.nn.initializers.zeros)
+            self.a = nnx.Linear(32, xsize * xsize, rngs=rngs)
+            self.b = nnx.Linear(32, xsize * xsize, rngs=rngs)
 
     def __call__(self, x):
         if x.ndim == 4:
@@ -51,8 +54,8 @@ class ImageAdjustment(nnx.Module):
         for layer in self.hidden_layers_us[1:]:
             partial_gray = nnx.relu(partial_gray + layer(partial_gray))
 
-        a = nnx.relu(self.a(partial_gray))
-        b = self.b(partial_gray)
+        a = nnx.relu(1.0 + jax.nn.softplus(self.a_reg.value) * self.a(partial_gray))
+        b = jax.nn.softplus(self.b_reg.value) * self.b(partial_gray)
 
         if not self.predict_value:
             a = rearrange(a, "b (w h) -> b w h", w=self.xsize, h=self.xsize)
@@ -127,7 +130,7 @@ def train_step_image_adjustment(graphdef, state, x, labels, md, sr, ctf_type, co
             images = ctfFilter(images, ctf * ctf, pad_factor=2)
 
         # Apply gray level correction
-        x = a * x + b
+        images = a * images + b
 
         # Loss
         loss = dm_pix.mse(images[..., None], x[..., None]).mean()
@@ -379,7 +382,7 @@ def main():
         writer = JaxSummaryWriter(os.path.join(args.output_path, "Image_adjustment_metrics"))
 
         # Prepare data loader
-        _, data_loader, data_loader_validation = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
+        _, data_loader, data_loader_validation = generator.return_tf_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=False,
                                                                              mmap=mmap, mmap_output_dir=mmap_output_dir, split_fraction=args.dataset_split_fraction)
 
         # Example of training data for Tensorboard
@@ -474,6 +477,8 @@ def main():
         adjustment_b = []
         for (x, labels) in pbar:
             a, b = predict_fn(x)
+            a = np.nan_to_num(1. / a, nan=0.0, posinf=0.0, neginf=0.0)
+            b = -b * a
 
             # Adjust shapes of a and b
             if imageAdjustment.predict_value:

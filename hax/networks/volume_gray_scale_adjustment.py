@@ -28,8 +28,10 @@ class VolumeAdjustment(nnx.Module):
         for _ in range(2):
             self.hidden_layers_us.append(nnx.Linear(32, 32, rngs=rngs, dtype=jnp.bfloat16))
         self.latent = nnx.Linear(32, lat_dim, rngs=rngs)
-        self.a = nnx.Linear(32, out_dim, rngs=rngs, kernel_init=jax.nn.initializers.zeros, bias_init=nnx.initializers.ones)
-        self.b = nnx.Linear(32, out_dim, rngs=rngs, kernel_init=jax.nn.initializers.zeros, bias_init=nnx.initializers.zeros)
+        self.a = nnx.Linear(32, out_dim, rngs=rngs)
+        self.b = nnx.Linear(32, out_dim, rngs=rngs)
+        self.a_reg = nnx.Param(0.0)
+        self.b_reg = nnx.Param(0.0)
 
     def __call__(self, return_ab=False):
         coords = rearrange(self.coords, "(b c) d -> b (c d)", b=1)
@@ -44,8 +46,8 @@ class VolumeAdjustment(nnx.Module):
         for layer in self.hidden_layers_us[1:]:
             partial_gray = nnx.relu(partial_gray + layer(partial_gray))
 
-        a = nnx.relu(self.a(partial_gray))
-        b = self.b(partial_gray)
+        a = nnx.relu(1.0 + jax.nn.softplus(self.a_reg.value) * self.a(partial_gray))
+        b = jax.nn.softplus(self.b_reg.value) * self.b(partial_gray)
         a, b = jnp.squeeze(a), jnp.squeeze(b)
 
         if return_ab:
@@ -59,6 +61,8 @@ class VolumeAdjustment(nnx.Module):
 @partial(jax.jit, static_argnames=["sr", "ctf_type", "xsize"])
 def train_step_volume_adjustment(graphdef, state, x, labels, md, sr, ctf_type, xsize):
     model, optimizer = nnx.merge(graphdef, state)
+
+    pad_factor = 1 if xsize > 256 else 2
 
     def loss_fn(model, x):
         factor = 0.5 * xsize
@@ -108,12 +112,12 @@ def train_step_volume_adjustment(graphdef, state, x, labels, md, sr, ctf_type, x
 
         # Consider CTF
         if ctf_type == "apply":
-            images = ctfFilter(images, ctf, pad_factor=2)
+            images = ctfFilter(images, ctf, pad_factor=pad_factor)
         elif ctf_type == "wiener":
-            x = wiener2DFilter(x, ctf, pad_factor=2)
+            x = wiener2DFilter(x, ctf, pad_factor=pad_factor)
         elif ctf_type == "squared":
-            x = ctfFilter(x, ctf, pad_factor=2)
-            images = ctfFilter(images, ctf * ctf, pad_factor=2)
+            x = ctfFilter(x, ctf, pad_factor=pad_factor)
+            images = ctfFilter(images, ctf * ctf, pad_factor=pad_factor)
 
         # Loss
         loss = dm_pix.mse(images[..., None], x[..., None]).mean()
@@ -133,10 +137,10 @@ def train_step_volume_adjustment(graphdef, state, x, labels, md, sr, ctf_type, x
         cs = md["ctfSphericalAberration"][labels]
         kv = md["ctfVoltage"][labels][0]
         ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
-                         sr, [2 * xsize, int(2 * 0.5 * xsize + 1)],
+                         sr, [pad_factor * xsize, int(pad_factor * 0.5 * xsize + 1)],
                          x.shape[0], True)
     else:
-        ctf = jnp.ones([x.shape[0], 2 * xsize, int(2.0 * 0.5 * xsize + 1)], dtype=x.dtype)
+        ctf = jnp.ones([x.shape[0], pad_factor * xsize, int(pad_factor * 0.5 * xsize + 1)], dtype=x.dtype)
 
     if ctf_type == "precorrect":
         # Wiener filter
