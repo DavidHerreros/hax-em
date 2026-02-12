@@ -1,5 +1,6 @@
 import sys
 from tqdm import tqdm
+from contextlib import closing
 
 import pynndescent
 from cuml.neighbors.nearest_neighbors import NearestNeighbors
@@ -137,7 +138,9 @@ def estimate_noise_stddev(images, radius_fraction=0.5):
 
 def filter_latent_space(space, thr=1.0, k=10, return_ids=False, batch_size=64):
     # Prepare data loader
-    data_loader = NumpyGenerator(space).return_tf_dataset(batch_size=batch_size, preShuffle=False, shuffle=False, prefetch=20)
+    data_loader = NumpyGenerator(space).return_grain_dataset(batch_size=batch_size, preShuffle=False, shuffle=False,
+                                                             num_epochs=1, num_workers=0)
+    steps_per_epoch = int(np.ceil(space.shape[0] / batch_size))
 
     # Compute distance distributions
     distribution = []
@@ -155,11 +158,14 @@ def filter_latent_space(space, thr=1.0, k=10, return_ids=False, batch_size=64):
         raise ValueError(f"Backend {jax.default_backend()} not supported")
 
     print(f"{bcolors.OKCYAN}\n###### Filtering latents... ######")
-    pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green")
-    for (z, _) in pbar:
-        distances = nn_fn(z)
-        distribution.append(jnp.mean(distances[:, 1:], axis=1))
-    distribution = jnp.hstack(distribution)
+    pbar = tqdm(range(steps_per_epoch), desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green",
+                bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
+    with closing(iter(data_loader)) as iter_data_loader:
+        for _ in pbar:
+            (z, _) = next(iter_data_loader)
+            distances = nn_fn(z)
+            distribution.append(jnp.mean(distances[:, 1:], axis=1))
+        distribution = jnp.hstack(distribution)
 
     # Compute Z-Scores
     z_scores = jnp.abs((distribution - jnp.mean(distribution)) / jnp.std(distribution))
