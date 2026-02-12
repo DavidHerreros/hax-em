@@ -34,7 +34,7 @@ def main():
                          f"saved as {bcolors.ITALIC}.txt{bcolors.ENDC} or {bcolors.ITALIC}.npy{bcolors.ENDC}")
 
     # Reload neural network
-    network = NeuralNetworkCheckpointer.load(None, args.reload, mode="pickle")
+    network = NeuralNetworkCheckpointer.load(args.reload)
 
     # Split network (faster JIT)
     graphdef, state = nnx.split(network)
