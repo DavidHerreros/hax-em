@@ -91,7 +91,7 @@ def main():
     args = parser.parse_args()
 
     # Load neural network (note it MUST be saved in pickle mode to make this script general)
-    model = NeuralNetworkCheckpointer.load(None, args.pickled_nn, mode="pickle")
+    model = NeuralNetworkCheckpointer.load(args.pickled_nn)
 
     # Prepare metadata
     generator = MetaDataGenerator(args.md)
