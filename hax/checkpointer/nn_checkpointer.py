@@ -60,7 +60,8 @@ class NeuralNetworkCheckpointer:
         checkpoint_path = ocp.test_utils.erase_and_create_empty(os.path.abspath(os.path.join(checkpoint_path, 'checkpoints')))
 
         # Config file
-        model = nnx.merge(graphdef, state)[0]
+        training_bundle = nnx.merge(graphdef, state)
+        model = training_bundle[0]
         config = model.config
 
         # Save model configuration
