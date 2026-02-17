@@ -15,12 +15,37 @@ def calculate_dist(permutation, distance_matrix):
 
 @jax.jit
 def two_opt_swap(permutation, i, j):
-    """Performs a 2-opt swap (reverses the segment between i and j)."""
-    # Standard 2-opt: reverse the chunk from i to j
-    start = permutation[:i]
-    middle = permutation[i:j + 1][::-1]
-    end = permutation[j + 1:]
-    return jnp.concatenate([start, middle, end])
+    """
+    Performs a 2-opt swap by generating a reversed index map.
+    This avoids dynamic slice sizes, keeping shapes static.
+    """
+    n = permutation.shape[0]
+
+    # 1. Ensure strictly i <= j to define the segment clearly
+    # Using min/max handles cases where random inputs might be disordered
+    start = jnp.minimum(i, j)
+    end = jnp.maximum(i, j)
+
+    # 2. Create a static grid of indices: [0, 1, 2, ..., N-1]
+    idx = jnp.arange(n)
+
+    # 3. Create a mask for the segment we want to reverse
+    # Example: N=6, start=2, end=4 -> Mask: [F, F, T, T, T, F]
+    mask = (idx >= start) & (idx <= end)
+
+    # 4. Calculate reversed indices using simple arithmetic
+    # The formula `start + end - k` flips the index k around the center of the segment
+    # If start=2, end=4:
+    # k=2 becomes 2+4-2 = 4
+    # k=3 becomes 2+4-3 = 3
+    # k=4 becomes 2+4-4 = 2
+    reversed_idx = start + end - idx
+
+    # 5. Select either the reversed index (inside segment) or original (outside)
+    final_idx = jnp.where(mask, reversed_idx, idx)
+
+    # 6. Gather the values
+    return permutation[final_idx]
 
 
 # --- 1. Simulated Annealing (Heuristic) ---

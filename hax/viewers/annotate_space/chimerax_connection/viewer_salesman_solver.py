@@ -27,8 +27,9 @@
 
 
 import numpy as np
+import jax.numpy as jnp
 from scipy.spatial.distance import cdist
-from python_tsp.heuristics import solve_tsp_simulated_annealing, solve_tsp_local_search
+from hax.utils import solve_tsp_local_search_jax, solve_tsp_simulated_annealing_jax
 
 
 def compute_distances(coordinates):
@@ -59,9 +60,8 @@ def salesmanSolver(coords, outpath):
     distance_matrix[:, 0] = 0  # No need to be a closed path
 
     # Shortest path
-    permutation_mh, distance_mh = solve_tsp_simulated_annealing(distance_matrix)
-    permutation_mh_lc, distance_mh_lc = solve_tsp_local_search(distance_matrix, x0=permutation_mh,
-                                                               perturbation_scheme="ps3")
+    permutation_mh, distance_mh = solve_tsp_simulated_annealing_jax(jnp.array(distance_matrix))
+    permutation_mh_lc, distance_mh_lc = solve_tsp_local_search_jax(jnp.array(distance_matrix), x0=permutation_mh)
 
     # Save optimum path and fitness
     with open(outpath, 'w') as fid:
