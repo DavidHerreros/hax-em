@@ -9,7 +9,6 @@ class Attention(nnx.Module):
         self.proj2 = nnx.Linear(C, C, rngs=rngs, dtype=jnp.bfloat16)
         self.num_heads = num_heads
         self.dropout_prob = dropout_prob
-        self.rngs = rngs
 
     def __call__(self, x, train):
         h, w = x.shape[1], x.shape[2]
