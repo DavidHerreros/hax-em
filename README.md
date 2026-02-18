@@ -41,8 +41,12 @@ Hax needs `pip` to install its dependencies. The installation on a independent C
 We recommend installing the package directly from Pypi using the command:
 
 ```bash
-
-  pip install hax
+  
+  # Cuda 13 command
+  pip install hax[cuda13]
+  
+  # Cuda 12 command
+  pip install hax[cuda12]
 
 ```
 
@@ -54,7 +58,7 @@ If you prefer to have a local copy of this repository, you may also clone direct
 ```
 
 > [!WARNING]
-> Supported NVIDIA drivers version: >= 525 (Cuda 12 will be installed along the package, so there is no need to have CUDA already installed in your system).
+> Supported NVIDIA drivers version: >= 525 (Cuda 12/13 will be installed along the package, so there is no need to have CUDA already installed in your system).
 
 
 # References
