@@ -119,9 +119,9 @@ class Encoder(nnx.Module):
         self.logstd_x = Linear(1024, lat_dim, rngs=rngs)
 
     def sample_gaussian(self, mean, logstd, *, rngs):
-        return logstd * jnr.normal(rngs.distributions(), shape=mean.shape) + mean
+        return logstd * jnr.normal(rngs, shape=mean.shape) + mean
 
-    def __call__(self, x, return_diversity_loss=False, *, rngs: nnx.Rngs = None):
+    def __call__(self, x, return_diversity_loss=False, *, rngs=None):
         # Resize images
         x = jax.image.resize(x, (x.shape[0], self.input_conv_dim, self.input_conv_dim, 1), method="bilinear")
 
@@ -583,10 +583,9 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
     model, optimizer_pose, optimizer_volume, optimizer_het, optimizer_lagrangian = nnx.merge(graphdef, state)
 
     # Random keys
-    key, swd_key, uniform_key, choice_key = jax.random.split(key, 4)
-    inner_rngs = nnx.Rngs(key)
+    key, swd_key, uniform_key, choice_key, distributions_key = jax.random.split(key, 5)
 
-    def loss_fn(model, x, inner_rngs: nnx.Rngs):
+    def loss_fn(model, x):
         # Correct CTF in images for encoder if needed
         if model.ctf_type == "apply":
             x_ctf_corrected = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
@@ -594,7 +593,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
             x_ctf_corrected = x
 
         # Get euler angles and shifts
-        rotations, shifts, diversity_loss, (sample, latent, logstd) = model.encoder(x_ctf_corrected, return_diversity_loss=True, rngs=inner_rngs)
+        rotations, shifts, diversity_loss, (sample, latent, logstd) = model.encoder(x_ctf_corrected, return_diversity_loss=True, rngs=distributions_key)
 
         # Decode volume
         coords, values = model.delta_volume_decoder()
@@ -718,7 +717,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
         loss_uniform = uniform_angular_distribution_loss #+ diversity_loss
 
         loss = (recon_loss_all + 0.001 * l1_loss + 0.001 * (l1_grad_loss + l2_grad_loss) + 0.000001 * kl_loss +
-                jax.lax.stop_gradient(model.get_alpha_uniform_lamda()) * (loss_uniform - 0.001))
+                0.001 * loss_uniform)
         # loss = (recon_loss_all + 0.001 * l1_loss + 0.001 * (l1_grad_loss + l2_grad_loss) + 0.0001 * kl_loss +
         #         0.01 * uniform_angular_distribution_loss + 0.01 * diversity_loss)
         return loss, (recon_loss, loss_uniform, euler_angles)
@@ -768,7 +767,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
         x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
     grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, (params_pose, params_volume, params_het)), has_aux=True)
-    (loss, (recon_loss, loss_uniform, euler_angles)), grads_combined = grad_fn(model, x, inner_rngs)
+    (loss, (recon_loss, loss_uniform, euler_angles)), grads_combined = grad_fn(model, x)
 
     grads_pose, grads_volume, grads_het = grads_combined.split(params_pose, params_volume, params_het)
 
@@ -776,12 +775,12 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
     optimizer_volume.update(model, grads_volume)
     optimizer_het.update(model, grads_het)
 
-    grad_lambda_fn = nnx.grad(lambda_loss_fn, argnums=nnx.DiffState(0, params_lagrangian), has_aux=False)
-    grads_lambda_combined = grad_lambda_fn(model, x)
-
-    grads_lagrangian, _ = grads_lambda_combined.split(params_lagrangian, ...)
-
-    optimizer_lagrangian.update(model, grads_lagrangian)
+    # grad_lambda_fn = nnx.grad(lambda_loss_fn, argnums=nnx.DiffState(0, params_lagrangian), has_aux=False)
+    # grads_lambda_combined = grad_lambda_fn(model, x)
+    #
+    # grads_lagrangian, _ = grads_lambda_combined.split(params_lagrangian, ...)
+    #
+    # optimizer_lagrangian.update(model, grads_lagrangian)
 
     # Update memory bank
     model.enqueue(euler_angles)
@@ -796,10 +795,9 @@ def validation_step_reconsiren(graphdef, state, x, labels, md, key):
     model, optimizer_pose, optimizer_volume, optimizer_het, optimizer_lagrangian = nnx.merge(graphdef, state)
 
     # Random keys
-    key, choice_key = jax.random.split(key, 2)
-    inner_rngs = nnx.Rngs(key)
+    key, choice_key, distributions_key = jax.random.split(key, 3)
 
-    def loss_fn(model, x, inner_rngs: nnx.Rngs):
+    def loss_fn(model, x):
         # Correct CTF in images for encoder if needed
         if model.ctf_type == "apply":
             x_ctf_corrected = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
@@ -807,7 +805,7 @@ def validation_step_reconsiren(graphdef, state, x, labels, md, key):
             x_ctf_corrected = x
 
         # Get euler angles and shifts
-        rotations, shifts, _, _ = model.encoder(x_ctf_corrected, return_diversity_loss=True, rngs=inner_rngs)
+        rotations, shifts, _, _ = model.encoder(x_ctf_corrected, return_diversity_loss=True, rngs=distributions_key)
 
         # Decode volume
         coords, values = model.delta_volume_decoder()
@@ -904,7 +902,7 @@ def validation_step_reconsiren(graphdef, state, x, labels, md, key):
         # Wiener filter
         x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
-    loss = loss_fn(model, x, inner_rngs)
+    loss = loss_fn(model, x)
 
     return loss
 
@@ -913,8 +911,7 @@ def validation_step_reconsiren(graphdef, state, x, labels, md, key):
 def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md, key):
     model = nnx.merge(graphdef, state)
 
-    _, key = jax.random.split(key, 2)
-    inner_rngs = nnx.Rngs(key)
+    distributions_key, key = jax.random.split(key, 2)
 
     # Recover alignments in metadata if refining them
     if model.refine_current_assignment:
@@ -952,7 +949,7 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md, k
         x_ctf_corrected = x
 
     # Get euler angles and shifts
-    rotations, shifts, diversity_loss, (_, latent, _) = model.encoder(x_ctf_corrected, return_diversity_loss=True, rngs=inner_rngs)
+    rotations, shifts, diversity_loss, (_, latent, _) = model.encoder(x_ctf_corrected, return_diversity_loss=True, rngs=distributions_key)
 
     # Decode volume
     coords, values = model.delta_volume_decoder()
@@ -1314,6 +1311,7 @@ def main():
 
                     # For progress bar (TQDM)
                     step = 1
+                    step_validation = 1
                     pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
 
                     if i > 0 and i % 5 == 0:
@@ -1388,9 +1386,10 @@ def main():
                                                                      labels_validation,
                                                                      md_columns, rng)
                         total_validation_loss += loss_validation
+                        step_validation += 1
 
                     writer.add_scalars('Reconstruction loss (ReconSIREN)',
-                                       {"validation": total_validation_loss / steps_per_val},
+                                       {"validation": total_validation_loss / step_validation},
                                        i * steps_per_epoch + step)
 
                 step += 1
@@ -1429,7 +1428,7 @@ def main():
         with closing(iter(data_loader)) as iter_data_loader:
             for _ in pbar:
                 (x, labels) = next(iter_data_loader)
-                rotations, shifts, latent = predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md_columns)
+                rotations, shifts, latent = predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md_columns, rng)
 
                 # Convert rotation to Euler angles in Xmipp format
                 euler_angles = xmippEulerFromMatrix(rotations)
