@@ -6,6 +6,7 @@ from glob import glob
 import numpy as np
 import random
 from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
+from multiprocessing import get_context
 from tqdm import tqdm
 from jax import numpy as jnp
 from jax.tree_util import tree_map
@@ -202,7 +203,7 @@ class MetaDataGenerator:
 
                 # Submit processes
                 with tqdm(total=n, file=sys.stdout, ascii=" >=", colour="green") as pbar:
-                    with ProcessPoolExecutor(max_workers=num_workers) as ex:
+                    with ProcessPoolExecutor(max_workers=num_workers, mp_context=get_context('forkserver')) as ex:
                         futures = [
                             ex.submit(_write_one_shard_array_record, path, idxs, self.md.getMetaDataImage)
                             for (path, idxs) in shards
