@@ -762,10 +762,14 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
     md_columns = extract_columns(generator.md)
 
     # Grain dataset
-    generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4,
-                                         precision=np.float16, group_size=1, shard_size=10000)
+    if mmap_output_dir is not None:
+        load_to_ram = False
+        generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4,
+                                             precision=np.float16, group_size=1, shard_size=10000)
+    else:
+        load_to_ram = True
     data_loader = generator.return_grain_dataset(batch_size=batch_size, shuffle="global",
-                                                 num_epochs=None, num_workers=8, num_threads=1)
+                                                 num_epochs=None, num_workers=8, num_threads=1, load_to_ram=load_to_ram)
     steps_per_epoch = int(len(generator.md) / batch_size)
 
     # Global vs local
