@@ -401,7 +401,7 @@ def training_step_volume(graphdef, state, target, update=True):
 
         recon_loss = jnp.mean((recon - target) ** 2.)
 
-        l1_loss = 0.1 * jnp.mean(jnp.abs(recon))
+        l1_loss = 0.001 * jnp.mean(jnp.abs(recon))
 
         # diff_x = recon[1:, :, :] - recon[:-1, :, :]
         # diff_y = recon[:, 1:, :] - recon[:, :-1, :]
@@ -602,19 +602,20 @@ def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densi
     means = model.means.get_value()
     weights = model.weights.get_value()
 
-    # Prune threshold
-    signal_std = jnp.std(target_vol, where=(mask == 1))
-    signal_mean = jnp.mean(target_vol, where=(mask == 1))
-    prune_threshold = signal_mean - signal_std
+    if not fixed_gaussians:
+        # Prune threshold
+        signal_std = jnp.std(target_vol, where=(mask == 1))
+        signal_mean = jnp.mean(target_vol, where=(mask == 1))
+        prune_threshold = signal_mean - signal_std
 
-    # Signal-aware pruning
-    actual_weights = nnx.relu(weights)
-    keep_mask = actual_weights > prune_threshold
-    cc_mask = get_outlier_mask(means[keep_mask])
+        # Signal-aware pruning
+        actual_weights = nnx.relu(weights)
+        keep_mask = actual_weights > prune_threshold
+        cc_mask = get_outlier_mask(means[keep_mask])
 
-    # Filter arrays
-    means = means[keep_mask][cc_mask]
-    weights = weights[keep_mask][cc_mask]
+        # Filter arrays
+        means = means[keep_mask][cc_mask]
+        weights = weights[keep_mask][cc_mask]
 
     # Set final means and weights
     model.means = nnx.Param(means)
