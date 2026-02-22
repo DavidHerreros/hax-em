@@ -355,7 +355,7 @@ def main():
         # Prepare data loader
         data_loader = ArrayListGenerator(input_spaces).return_grain_dataset(batch_size=args.batch_size, shuffle=True, preShuffle=True,
                                                                             num_workers=-1, num_epochs=None)
-        steps_per_epoch = int(np.ceil(input_spaces.shape[0] / args.batch_size))
+        steps_per_epoch = int(np.ceil(input_spaces[0].shape[0] / args.batch_size))
 
         # Optimizers (FlexConsensus)
         optimizer = nnx.Optimizer(flexconsensus, optax.adam(args.learning_rate), wrt=nnx.Param)
@@ -376,8 +376,7 @@ def main():
 
                     # For progress bar (TQDM)
                     step = 1
-                    print(f'\nTraining epoch {i + 1}/{args.epochs} |')
-                    pbar = tqdm(data_loader, desc=f"Epoch {i + 1}/{args.epochs}", file=sys.stdout, ascii=" >=", colour="green")
+                    pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
 
                     if i % 5 == 0:
                         tensorboard_latents = []
@@ -406,17 +405,17 @@ def main():
                 pbar.set_postfix_str(f"loss={total_loss / step:.5f} | encoder_loss={encoder_loss / step:.5f} | " + loss_str_decoder_loss)
 
                 # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * len(data_loader))) == 0:
+                if step % int(np.ceil(0.5 * steps_per_epoch)) == 0:
                     writer.add_scalar('Training loss (FlexConsensus)',
                                       total_loss / step,
-                                      i * len(data_loader) + step)
+                                      i * steps_per_epoch + step)
                     writer.add_scalar('Encoder loss (FlexConsensus)',
                                       encoder_loss / step,
-                                      i * len(data_loader) + step)
+                                      i * steps_per_epoch + step)
                     for key, value in total_decoder_loss.items():
                         writer.add_scalar(f'Decoder loss ({key})',
                                           value / step,
-                                          i * len(data_loader) + step)
+                                          i * steps_per_epoch + step)
                 step += 1
 
         flexconsensus, optimizer = nnx.merge(graphdef, state)
@@ -441,7 +440,7 @@ def main():
             # Prepare data loader
             data_loader = NumpyGenerator(input_spaces[idx]).return_grain_dataset(batch_size=args.batch_size, shuffle=False, preShuffle=False,
                                                                                  num_workers=0, num_epochs=1)
-            steps_per_epoch = int(np.ceil(input_spaces.shape[0] / args.batch_size))
+            steps_per_epoch = int(np.ceil(input_spaces[0].shape[0] / args.batch_size))
 
             if input_spaces_name is not None and input_spaces_name[idx] in flexconsensus.input_spaces_name:
                 print(f"Valid identifier {input_spaces_name[idx]} provided for this input")
@@ -483,7 +482,7 @@ def main():
                                 decoded_latents_trial.append(decoded)
                                 representation_error_trial += jnp.mean(jnp.square(x - decoded), axis=-1).mean()
 
-                        representation_error_trial /= len(data_loader)
+                        representation_error_trial /= steps_per_epoch
 
                         if representation_error_trial < representation_error:
                             consensus_latents = consensus_latents_trial
