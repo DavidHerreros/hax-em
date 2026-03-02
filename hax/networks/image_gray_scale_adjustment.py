@@ -482,7 +482,7 @@ def main():
 
         # Prepare data loader
         data_loader = generator.return_grain_dataset(batch_size=args.batch_size, shuffle=False, num_epochs=1,
-                                                     num_workers=0, load_to_ram=args.load_images_to_ram)
+                                                     num_workers=6, load_to_ram=args.load_images_to_ram)
         steps_per_epoch = int(np.ceil(len(generator.md) / args.batch_size))
 
         # Jitted prediction function
@@ -490,28 +490,26 @@ def main():
 
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting image adjustment... ######")
-        pbar = tqdm(range(steps_per_epoch), desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green",
+        pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green", total=steps_per_epoch,
                     bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
         imgs_adjusted = []
         adjustment_a = []
         adjustment_b = []
-        with closing(iter(data_loader)) as iter_data_loader:
-            for _ in pbar:
-                (x, labels) = next(iter_data_loader)
-                a, b = predict_fn(x)
-                a = np.nan_to_num(1. / a, nan=0.0, posinf=0.0, neginf=0.0)
-                b = -b * a
+        for (x, labels) in pbar:
+            a, b = predict_fn(x)
+            a = np.nan_to_num(1. / a, nan=0.0, posinf=0.0, neginf=0.0)
+            b = -b * a
 
-                # Adjust shapes of a and b
-                if imageAdjustment.predict_value:
-                    adjustment_a.append(a)
-                    adjustment_b.append(b)
-                    a = a[:, None, None]
-                    b = b[:, None, None]
+            # Adjust shapes of a and b
+            if imageAdjustment.predict_value:
+                adjustment_a.append(a)
+                adjustment_b.append(b)
+                a = a[:, None, None]
+                b = b[:, None, None]
 
-                adjustment = np.asarray(a * x[..., 0] + b)
-                imgs_adjusted.append(adjustment)
+            adjustment = np.asarray(a * x[..., 0] + b)
+            imgs_adjusted.append(adjustment)
         imgs_adjusted = np.concatenate(imgs_adjusted, axis=0)
 
         # Save new images
@@ -527,5 +525,5 @@ def main():
         md.write(os.path.join(args.output_path, "adjusted_images" +  os.path.splitext(args.md)[1]))
 
     # If exists, clean MMAP
-    if not args.load_images_to_ram and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):
-        shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap_grain"))
+    # if not args.load_images_to_ram and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):
+    #     shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap_grain"))
