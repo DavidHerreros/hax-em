@@ -242,19 +242,18 @@ class MultiEncoder(nnx.Module):
 
 
 class DeltaVolumeDecoder(nnx.Module):
-    def __init__(self, total_voxels, lat_dim, volume_size, coords, reference_values, transport_mass=False, is_implicit=True, *, rngs: nnx.Rngs):
+    def __init__(self, total_voxels, lat_dim, volume_size, coords, reference_values, transport_mass=False, is_implicit=True, hybrid_pe=False, *, rngs: nnx.Rngs):
         self.volume_size = volume_size
         self.reference_values = reference_values[None, ...]
         self.total_voxels = total_voxels
         self.transport_mass = transport_mass
         self.is_implicit = is_implicit
+        self.hybrid_pe = hybrid_pe
 
         # Indices to (normalized) coords
         mins, maxs = coords.min(axis=0), coords.max(axis=0)
-        # self.centering = 0.5 * (mins + maxs)[None, None, ...]
         self.scale = 0.5 * max(maxs[0] - mins[0], maxs[1] - mins[1], maxs[2] - mins[2])
         self.centering = jnp.array((0.5 * volume_size, 0.5 * volume_size, 0.5 * volume_size))[None, None, ...]
-        # self.scale = 0.5 * volume_size
         self.coords = ((coords[None, ...] - self.centering) / self.scale)
 
         # Scale value for SIREN2
@@ -263,8 +262,8 @@ class DeltaVolumeDecoder(nnx.Module):
         vol_for_psi = splat_weights_trilinear(volume_size, coords_for_psi, reference_values)
         vol_for_psi = FastVariableBlur3D((volume_size, volume_size, volume_size))(vol_for_psi[None, ..., None], sigma=1.0)[0, ..., 0]
         psi = calculate_spectral_centroid_3d(vol_for_psi)
-        s0 = 2.0 * (1. - jnp.exp(-5. * psi))
-        s1 = 0.5 * psi
+        s0 = 50. * (1. - jnp.exp(5. * psi * 32.))
+        s1 = 0.4 * psi / 32.
 
         # Graph from coordinates
         if not jnp.all(reference_values == 0) and transport_mass:
@@ -280,18 +279,35 @@ class DeltaVolumeDecoder(nnx.Module):
 
         if transport_mass:
             if self.is_implicit:
-                # Implicit version
-                hidden_coords = [Siren2Linear(in_features=lat_dim // 2 + 3, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=True, w0=30.0, s=s0)]
-                hidden_coords.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=False, w0=1.0, s=s1))
-                for _ in range(7):
-                    hidden_coords.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=False, w0=1.0, s=0.0))
-                hidden_coords.append(nnx.Linear(in_features=32, out_features=3, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init()))
+                if not self.hybrid_pe:
+                    # Implicit version
+                    hidden_coords = [Siren2Linear(in_features=lat_dim // 2 + 3, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=True, w0=30.0, s=s0, use_bias=False)]
+                    hidden_coords.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=False, w0=1.0, s=s1, use_bias=False))
+                    for _ in range(7):
+                        hidden_coords.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=False, w0=1.0, s=0.0, use_bias=False))
+                    hidden_coords.append(nnx.Linear(in_features=32, out_features=3, rngs=rngs, use_bias=False, kernel_init=nnx.initializers.zeros_init()))
 
-                hidden_values = [Siren2Linear(in_features=lat_dim // 2 + 3, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=True, w0=30.0, s=s0)]
-                hidden_values.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=False, w0=1.0, s=s1))
-                for _ in range(7):
-                    hidden_values.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.bfloat16, is_first=False, w0=1.0, s=0.0))
-                hidden_values.append(nnx.Linear(in_features=32, out_features=1, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init()))
+                    hidden_values = [Siren2Linear(in_features=lat_dim // 2 + 3, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=True, w0=30.0, s=s0, use_bias=False)]
+                    hidden_values.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=False, w0=1.0, s=s1, use_bias=False))
+                    for _ in range(7):
+                        hidden_values.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=False, w0=1.0, s=0.0, use_bias=False))
+                    hidden_values.append(nnx.Linear(in_features=32, out_features=1, rngs=rngs, use_bias=False, kernel_init=nnx.initializers.zeros_init()))
+
+                else:
+                    # Implicit version
+                    kernel_init = nnx.initializers.variance_scaling(scale=1. / 3., mode="fan_in", distribution="uniform")
+                    hidden_coords = [nnx.Linear(in_features=lat_dim // 2 + 3 * 10 * 2, out_features=32, rngs=rngs, dtype=jnp.float32, use_bias=False, kernel_init=kernel_init)]
+                    for _ in range(8):
+                        hidden_coords.append( nnx.Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.float32, use_bias=False, kernel_init=kernel_init))
+                    hidden_coords.append(nnx.Linear(in_features=32, out_features=3, rngs=rngs, dtype=jnp.float32, use_bias=False, kernel_init=kernel_init))
+                    hidden_coords.append(nnx.Linear(in_features=3, out_features=3, rngs=rngs, use_bias=False, kernel_init=kernel_init))
+
+                    hidden_values = [Siren2Linear(in_features=lat_dim // 2 + 3, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=True, w0=30.0, s=s0, use_bias=False)]
+                    hidden_values.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=False, w0=1.0, s=s1, use_bias=False))
+                    for _ in range(7):
+                        hidden_values.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=False, w0=1.0, s=0.0, use_bias=False))
+                    hidden_values.append(Siren2Linear(in_features=32, out_features=1, rngs=rngs, dtype=jnp.float32, is_first=False, w0=1.0, s=0.0, use_bias=False))
+                    hidden_values.append(nnx.Linear(in_features=1, out_features=1, rngs=rngs, use_bias=False, kernel_init=nnx.initializers.zeros_init()))
 
             else:
                 # Standard version
@@ -333,8 +349,13 @@ class DeltaVolumeDecoder(nnx.Module):
                 x_coords, x_map = jnp.split(x, indices_or_sections=2, axis=-1)
 
                 # Join coords and latents
-                x_coords = jnp.concatenate([x_coords, c], axis=-1)
-                x_map = jnp.concatenate([x_map, c], axis=-1)
+                if self.hybrid_pe:
+                    c_pe = positional_encoding(c[0], 10, self.scale)
+                    c_pe = jnp.tile(c_pe[None, ...], (x.shape[0], 1, 1))
+                    x_coords = jnp.concatenate([c_pe, x_coords], axis=-1)
+                else:
+                    x_coords = jnp.concatenate([c, x_coords], axis=-1)
+                x_map = jnp.concatenate([c, x_map], axis=-1)
 
                 # Decode values
                 x_map = self.hidden_values[0](x_map)
@@ -343,10 +364,16 @@ class DeltaVolumeDecoder(nnx.Module):
                 x_map = self.hidden_values[-1](x_map)[..., 0]
 
                 # Decode coords
-                x_coords = self.hidden_coords[0](x_coords)
-                for layer in self.hidden_coords[1:-1]:
-                    x_coords = layer(x_coords)
-                x_coords = self.hidden_coords[-1](x_coords)
+                if self.hybrid_pe:
+                    x_coords = nnx.elu(self.hidden_coords[0](x_coords))
+                    for layer in self.hidden_coords[1:-1]:
+                        x_coords = nnx.elu(layer(x_coords))
+                    x_coords = self.hidden_coords[-1](x_coords)
+                else:
+                    x_coords = self.hidden_coords[0](x_coords)
+                    for layer in self.hidden_coords[1:-1]:
+                        x_coords = layer(x_coords)
+                    x_coords = self.hidden_coords[-1](x_coords)
 
             else:
                 x_coords, x_map = jnp.split(x, indices_or_sections=2, axis=1)
@@ -556,8 +583,8 @@ class HetSIREN(nnx.Module):
         )
 
         # Gaussians size
-        self.sigma = nnx.Param(sigma)
-        # self.sigma = sigma
+        # self.sigma = nnx.Param(sigma)
+        self.sigma = sigma
 
     def __call__(self, x, rngs=None, **kwargs):
         if self.isVae:
@@ -645,7 +672,7 @@ class HetSIREN(nnx.Module):
         if x.ndim == 4:
             # Consider refinement and rigid registration alignments
             rotations = jnp.matmul(rotations, rotations_rigid)
-            shifts = shifts + self.delta_volume_decoder.scale * shifts_rigid
+            shifts = shifts + shifts_rigid
 
         # CTF corruption
         if not corrupt_projection_with_ctf:
@@ -1512,7 +1539,7 @@ def main():
 
                     # Adjust to images
                     model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
-                                                        num_epochs=3, is_global=True)
+                                                        num_epochs=3, is_global=True, ctf_type=args.ctf_type)
 
                     # Save model
                     NeuralNetworkCheckpointer.save(model, fit_path)
@@ -1733,7 +1760,7 @@ def main():
 
         # Prepare data loader
         data_loader = generator.return_grain_dataset(batch_size=args.batch_size, shuffle=False, num_epochs=1,
-                                                     num_workers=6, load_to_ram=args.load_images_to_ram)
+                                                     num_workers=-1, load_to_ram=args.load_images_to_ram)
         steps_per_epoch = int(np.ceil(len(generator.md) / args.batch_size))
 
         # Jitted prediction functions
