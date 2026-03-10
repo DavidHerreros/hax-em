@@ -112,7 +112,7 @@ def main():
 
     # Prepare data loader
     data_loader = generator.return_grain_dataset(batch_size=args.batch_size, shuffle=False, num_epochs=1,
-                                                 num_workers=6, load_to_ram=args.load_images_to_ram)
+                                                 num_workers=-1, load_to_ram=args.load_images_to_ram)
     steps_per_epoch = int(np.ceil(len(generator.md) / args.batch_size))
 
     # Estimate covariances
