@@ -72,7 +72,7 @@ def calculate_spectral_centroid_3d(data_grid):
 
 
 class Siren2Linear(nnx.Module):
-    def __init__(self, in_features, out_features, rngs, is_first=False, custom_init=False, is_residual=False, w0=30.0, s=0.0, dtype=jnp.float32):
+    def __init__(self, in_features, out_features, rngs, is_first=False, custom_init=False, is_residual=False, w0=30.0, s=0.0, dtype=jnp.float32, use_bias=True):
         self.w0 = w0
         self.is_first = is_first
         self.is_residual = is_residual
@@ -91,7 +91,8 @@ class Siren2Linear(nnx.Module):
             in_features, out_features,
             kernel_init=kernel_init,
             rngs=rngs,
-            dtype=dtype
+            dtype=dtype,
+            use_bias=use_bias
         )
 
         # SIREN2 (WINNER) Perturbation
