@@ -421,10 +421,16 @@ class MetaDataGenerator:
         if self.grain_dataset_type == "ArrayRecord":
             shard_files = glob(os.path.join(self.mmap_output_dir, "dataset-*.arrayrecord"))
             shard_files.sort()
-            sources = ArrayRecordDataSource(shard_files, reader_options={"index_storage_option": "in_memory"})
-            dataset_train = grain.MapDataset.source(sources)
+
             if split_fraction is not None:
-                dataset_val = grain.MapDataset.source(sources)
+                split_point = int(split_fraction[0] * len(shard_files))
+                sources_train = ArrayRecordDataSource(shard_files[:split_point], reader_options={"index_storage_option": "in_memory"})
+                sources_val = ArrayRecordDataSource(shard_files[split_point:], reader_options={"index_storage_option": "in_memory"})
+                dataset_train = grain.MapDataset.source(sources_train)
+                dataset_val = grain.MapDataset.source(sources_val)
+            else:
+                sources_train = ArrayRecordDataSource(shard_files, reader_options={"index_storage_option": "in_memory"})
+                dataset_train = grain.MapDataset.source(sources_train)
 
         elif self.grain_dataset_type == "MMAP":
             from mmap_ninja import numpy as np_ninja
@@ -469,10 +475,16 @@ class MetaDataGenerator:
 
             shard_paths = glob(os.path.join(self.mmap_output_dir, "dataset-*"))
             shard_paths.sort()
-            sources = LazyNinjaGrainSource(shard_paths)
-            dataset_train = grain.MapDataset.source(sources)
+
             if split_fraction is not None:
-                dataset_val = grain.MapDataset.source(source)
+                split_point = int(split_fraction[0] * len(shard_paths))
+                sources_train = LazyNinjaGrainSource(shard_paths[split_point:])
+                sources_val = LazyNinjaGrainSource(shard_paths[:split_point])
+                dataset_train = grain.MapDataset.source(sources_train)
+                dataset_val = grain.MapDataset.source(sources_val)
+            else:
+                sources_train = LazyNinjaGrainSource(shard_paths)
+                dataset_train = grain.MapDataset.source(sources_train)
 
         elif self.grain_dataset_type == "RAM":
 
@@ -488,10 +500,15 @@ class MetaDataGenerator:
                 def __getitem__(self, idx):
                     return self._data[idx], idx
 
-            sources = NumpyDataSource(images)
-            dataset_train = grain.MapDataset.source(sources)
             if split_fraction is not None:
-                dataset_val = grain.MapDataset.source(sources)
+                split_point = int(split_fraction[0] * len(images))
+                sources_train = NumpyDataSource(images[split_point:])
+                sources_val = NumpyDataSource(images[:split_point])
+                dataset_train = grain.MapDataset.source(sources_train)
+                dataset_val = grain.MapDataset.source(sources_val)
+            else:
+                sources_train = NumpyDataSource(images)
+                dataset_train = grain.MapDataset.source(sources_train)
 
         else:
             raise ValueError("Unknown grain dataset type")
@@ -541,6 +558,61 @@ class MetaDataGenerator:
             if split_fraction is not None:
                 dataset_val = dataset_val.mp_prefetch(options=mp_options)
 
+        elif shuffle == "global_data_loader":
+            # Operations
+            operations = []
+            if self.grain_dataset_type == "ArrayRecord":
+                class ParseAndDecompress(grain.transforms.Map):
+                    def map(self, x):
+                        return parse_and_decompress(x)
+                operations = [ParseAndDecompress()]
+            operations.append(grain.transforms.Batch(batch_size=batch_size))
+
+            # Index sampler
+            sampler_train = grain.samplers.IndexSampler(
+                num_records=len(sources_train),
+                shuffle=True,
+                seed=random.randint(0, 2 ** 32 - 1),
+                num_epochs=num_epochs,
+                shard_options=grain.sharding.NoSharding()
+            )
+            if split_fraction is not None:
+                sampler_val = grain.samplers.IndexSampler(
+                    num_records=len(sources_val),
+                    shuffle=True,
+                    seed=random.randint(0, 2 ** 32 - 1),
+                    num_epochs=1,
+                    shard_options=grain.sharding.NoSharding()
+                )
+
+            # Workers detection
+            if num_workers == -1:
+                dataset_train = dataset_train.to_iter_dataset().batch(batch_size)
+                performance_config = grain.experimental.pick_performance_config(
+                    ds=dataset_train,
+                    ram_budget_mb=1024,
+                    max_workers=12,
+                    max_buffer_size=None
+                )
+                num_workers = performance_config.multiprocessing_options.num_workers
+
+
+            # Data loader
+            # The DataLoader coordinates the workers and the sampler
+            dataset_train = grain.DataLoader(
+                data_source=sources_train,
+                sampler=sampler_train,
+                operations=operations,
+                worker_count=num_workers,
+            )
+            if split_fraction is not None:
+                dataset_val = grain.DataLoader(
+                    data_source=sources_val,
+                    sampler=sampler_val,
+                    operations=operations,
+                    worker_count=num_workers,
+                )
+
         elif shuffle == "hierarchical":
             seed = random.randint(0, 2 ** 32 - 1)
 
@@ -585,21 +657,33 @@ class MetaDataGenerator:
             # Index sampler
             if num_epochs == 1:
                 sampler_train = grain.samplers.SequentialSampler(
-                    num_records=len(sources),
+                    num_records=len(sources_train),
                     shard_options=grain.sharding.NoSharding()
                 )
             else:
                 sampler_train = grain.samplers.IndexSampler(
-                    num_records=len(sources),
+                    num_records=len(sources_train),
                     shuffle=False,
                     num_epochs=num_epochs,
                     shard_options=grain.sharding.NoSharding()
                 )
 
+            # Workers detection
+            if num_workers == -1:
+                dataset_train = dataset_train.to_iter_dataset().batch(batch_size)
+                performance_config = grain.experimental.pick_performance_config(
+                    ds=dataset_train,
+                    ram_budget_mb=1024,
+                    max_workers=12,
+                    max_buffer_size=None
+                )
+                num_workers = performance_config.multiprocessing_options.num_workers
+
+
             # Data loader
             # The DataLoader coordinates the workers and the sampler
             dataset_train = grain.DataLoader(
-                data_source=sources,
+                data_source=sources_train,
                 sampler=sampler_train,
                 operations=operations,
                 worker_count=num_workers,
