@@ -25,7 +25,7 @@ hax_project_manager = "hax.cli:main"
 [project.optional-dependencies]
 torch_datasets = ["torch<=2.0.1"]
 tensorflow_datasets = ["tensorflow<=2.19.0", "tensorflow-datasets<=4.9.9"]
-cuda12 = ["jax[cuda12]==0.9.0", "cuml-cu12==25.6.*"]
+cuda12 = ["jax[cuda12]==0.9.0", "cuml-cu12==25.12.*", "cupy-cuda13x>13.6.0,<=14.0.1"]
 cuda13 = ["jax[cuda13]==0.9.0", "cuml-cu13==25.12.*", "cupy-cuda13x>13.6.0,<=14.0.1"]
 
 [tool.setuptools.packages.find]
