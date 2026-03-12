@@ -67,7 +67,7 @@ class NumpyGenerator:
             performance_config = grain.experimental.pick_performance_config(
                 ds=dataset,
                 ram_budget_mb=1024,
-                max_workers=None,
+                max_workers=12,
                 max_buffer_size=None
             )
             mp_options = performance_config.multiprocessing_options
