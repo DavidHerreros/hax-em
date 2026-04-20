@@ -41,7 +41,7 @@ class PrintSummary(argparse.Action):
         print(f"\n{bcolors.HEADER}Example of usage:{bcolors.ENDC}\n")
         print("     hax_project_manager --gpu 0 {Run only on this GPU} program --program_arg_1 #Val_1 --program arg_2 #Val_2 ...\n")
         print(f"{bcolors.HEADER}Additional help on how to execute each is available through:{bcolors.ENDC}\n")
-        print(f"     hax_project_manager {bcolors.ITALIC}{bcolors.BOLD}program{bcolors.ENDC} {-h or --help}\n")
+        print(f"     hax_project_manager {bcolors.ITALIC}{bcolors.BOLD}program{bcolors.ENDC} {{-h or --help}}\n")
         print(f"{bcolors.WARNING}If you experience any issue or have suggestions, you are welcome to write an issue in our GitHub!: {bcolors.UNDERLINE}https://github.com/DavidHerreros/Hax/issues\n{bcolors.ENDC}\n")
         print(f"{bcolors.OKBLUE}We also provide tutorials on how to use the software with Scipion in the following link: {bcolors.UNDERLINE}VERY SOON!\n{bcolors.ENDC}\n")
         parser.exit(0)
