@@ -11,7 +11,7 @@ on:
     branches: [ main ]
 
 env:
-  WORKING_DIR: hax
+  WORKING_DIR: hax-em
   PACKAGE_DIR: hax
   
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
