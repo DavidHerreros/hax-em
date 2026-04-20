@@ -43,10 +43,10 @@ We recommend installing the package directly from Pypi using the command:
 ```bash
   
   # Cuda 13 command
-  pip install hax[cuda13]
+  pip install hax-em[cuda13]
   
   # Cuda 12 command
-  pip install hax[cuda12]
+  pip install hax-em[cuda12]
 
 ```
 
