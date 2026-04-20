@@ -17,7 +17,7 @@ MODULES_DICT = {
     "filter_latents": ("hax.programs.filter_latents", "Filtering of latent spaces based on z-scores"),
     "display_metrics": ("hax.metrics.writer", "Display the model metrics (training curves, validation curves...) extracted while training a neural network"),
     "annotate_space": ("hax.viewers.annotate_space.annotate_space", "Interactive latent space analysis with real time map generation"),
-    "reconsiren": ("hax.networks.reconsiren", "Ab initio estimation of particle pose, shifts and initial volume with neural networks"),
+    "reconsiren": ("hax.networks.reconsiren_het_only", "Ab initio estimation of particle pose, shifts and initial volume with neural networks"),
     "modart": ("hax.programs.modart", "ART based volume reconstruction with motion correction to motion blurr artifacts")
 }
 
@@ -39,9 +39,9 @@ class PrintSummary(argparse.Action):
             print(f"     - {bcolors.ITALIC}{bcolors.BOLD}{key}{bcolors.ENDC}: {value[1]}")
 
         print(f"\n{bcolors.HEADER}Example of usage:{bcolors.ENDC}\n")
-        print("     project manager --gpu 0 {Run only on this GPU} program --program_arg_1 #Val_1 --program arg_2 #Val_2 ...\n")
+        print("     hax_project_manager --gpu 0 {Run only on this GPU} program --program_arg_1 #Val_1 --program arg_2 #Val_2 ...\n")
         print(f"{bcolors.HEADER}Additional help on how to execute each is available through:{bcolors.ENDC}\n")
-        print("     project manager program {-h or --help}\n")
+        print(f"     hax_project_manager {bcolors.ITALIC}{bcolors.BOLD}program{bcolors.ENDC} {-h or --help}\n")
         print(f"{bcolors.WARNING}If you experience any issue or have suggestions, you are welcome to write an issue in our GitHub!: {bcolors.UNDERLINE}https://github.com/DavidHerreros/Hax/issues\n{bcolors.ENDC}\n")
         print(f"{bcolors.OKBLUE}We also provide tutorials on how to use the software with Scipion in the following link: {bcolors.UNDERLINE}VERY SOON!\n{bcolors.ENDC}\n")
         parser.exit(0)
