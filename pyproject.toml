@@ -9,7 +9,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hax-em"
 dynamic = ["version",]
-description = "Hax dependencies"
+description = "Hax - A suite for Heterogeneity analysis for CryoEM data"
+readme = "README.md"
 requires-python = ">=3.11,<3.12"
 # tfp-nightly[jax]<0.27.0
 # jaxkd<=0.1.2
