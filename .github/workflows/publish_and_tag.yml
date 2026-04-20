@@ -47,9 +47,7 @@ jobs:
         pip install build twine
 
     - name: Build package
-      # We move into the folder, build, and the 'dist' folder will be created inside 'Package'
       run: |
-        cd ${{ env.WORKING_DIR }}
         python -m build
 
     - name: Publish to PyPI
