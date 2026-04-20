@@ -1,4 +1,4 @@
-<h1 align='center'>HAX</h1>
+<h1 align='center'>Hax - A suite for Heterogeneity analysis for CryoEM data</h1>
 
 <p align="center">
         
