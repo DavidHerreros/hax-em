@@ -46,6 +46,6 @@ jobs:
 
     - name: Get version and tag
       run: |
-        export PACKAGE_VERSION=$(python -c "import $FOLDER_WITH_VERSION; print('VERSION', 'v'+$FOLDER_WITH_VERSION.__version__)" | grep VERSION | sed "s/VERSION //g")
+        export PACKAGE_VERSION=$(python -c "import hax; print('VERSION', 'v'+hax.__version__)" | grep VERSION | sed "s/VERSION //g")
         git tag $PACKAGE_VERSION
         git push origin $PACKAGE_VERSION
