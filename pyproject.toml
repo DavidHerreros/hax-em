@@ -7,7 +7,7 @@ requires = ["setuptools<81", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "hax"
+name = "hax-em"
 dynamic = ["version",]
 description = "Hax dependencies"
 requires-python = ">=3.11,<3.12"
