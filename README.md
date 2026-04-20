@@ -10,7 +10,7 @@
 
 <p align="center">
         
-<img alt="HAX" width="300" src="hax/viewers/annotate_space/media/logo.png">
+<img alt="HAX" width="300" src="https://github.com/DavidHerreros/hax-em/blob/main/hax/viewers/annotate_space/media/logo.png">
 
 </p>
 
