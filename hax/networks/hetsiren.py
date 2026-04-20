@@ -805,10 +805,10 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
                                                centering, ctf, model.ctf_type, model.sigma, 0.0)
             images_corrected_field = images_corrected
 
-        if not model.delta_volume_decoder.transport_mass:
-            consensus_coords, consensus_values = model.delta_volume_decoder(jnp.zeros_like(latent))
-            images_consensus, _ = phys_decoder(x, consensus_values, consensus_coords, model.xsize, rotations_refined, shifts_refined,
-                                               centering, ctf, model.ctf_type, model.sigma, 0.0)
+        # if not model.delta_volume_decoder.transport_mass:
+        #     consensus_coords, consensus_values = model.delta_volume_decoder(jnp.zeros_like(latent))
+        #     images_consensus, _ = phys_decoder(x, consensus_values, consensus_coords, model.xsize, rotations_refined, shifts_refined,
+        #                                        centering, ctf, model.ctf_type, model.sigma, 0.0)
 
         # Projection "mask" in case of no mass transport
         if not model.delta_volume_decoder.transport_mass and model.local_reconstruction:
@@ -824,28 +824,28 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         images_corrected = jnp.squeeze(images_corrected)
         images_corrected_field = jnp.squeeze(images_corrected_field)
         x = jnp.squeeze(x)
-        if not model.delta_volume_decoder.transport_mass:
-            images_consensus = jnp.squeeze(images_consensus)
+        # if not model.delta_volume_decoder.transport_mass:
+        #     images_consensus = jnp.squeeze(images_consensus)
 
         # Consider CTF if Wiener mode (only for loss)
         if model.ctf_type == "wiener":
             x_loss = wiener2DFilter(x, ctf, pad_factor=pad_factor)
             images_corrected_loss = wiener2DFilter_vmap(images_corrected, ctf, pad_factor)
             images_corrected_field_loss = wiener2DFilter_vmap(images_corrected_field, ctf, pad_factor)
-            if not model.delta_volume_decoder.transport_mass:
-                images_consensus_loss = wiener2DFilter_vmap(images_consensus, ctf, pad_factor)
+            # if not model.delta_volume_decoder.transport_mass:
+            #     images_consensus_loss = wiener2DFilter_vmap(images_consensus, ctf, pad_factor)
         elif model.ctf_type == "squared":
             x_loss = ctfFilter(x, ctf, pad_factor=pad_factor)
             images_corrected_loss = ctfFilter_vmap(images_corrected, ctf, pad_factor)
             images_corrected_field_loss = ctfFilter_vmap(images_corrected_field, ctf, pad_factor)
-            if not model.delta_volume_decoder.transport_mass:
-                images_consensus_loss = ctfFilter_vmap(images_consensus, ctf, pad_factor)
+            # if not model.delta_volume_decoder.transport_mass:
+            #     images_consensus_loss = ctfFilter_vmap(images_consensus, ctf, pad_factor)
         else:
             x_loss = x
             images_corrected_loss = images_corrected
             images_corrected_field_loss = images_corrected_field
-            if not model.delta_volume_decoder.transport_mass:
-                images_consensus_loss = images_consensus
+            # if not model.delta_volume_decoder.transport_mass:
+            #     images_consensus_loss = images_consensus
 
         if M > 1:
             x_loss = x_loss[:, None, ...]
@@ -854,18 +854,22 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         x_loss = x_loss * projected_mask
         images_corrected_loss = images_corrected_loss * projected_mask
         images_corrected_field_loss = images_corrected_field_loss * projected_mask
-        if not model.delta_volume_decoder.transport_mass:
-            images_consensus_loss = images_consensus_loss * projected_mask
+        # if not model.delta_volume_decoder.transport_mass:
+        #     images_consensus_loss = images_consensus_loss * projected_mask
 
         # recon_loss = dm_pix.mae(images_corrected_loss[..., None], x_loss[..., None]).mean()
         recon_loss = 0.1 * mse(images_corrected_loss[..., None], x_loss[..., None]) + 0.9 * mse(images_corrected_field_loss[..., None], x_loss[..., None])
-        if model.delta_volume_decoder.transport_mass:
-            recons_loss_all = recon_loss.mean()
-        else:
-            recons_loss_all = 0.5 * (recon_loss.mean() + mse(images_consensus_loss[..., None], x_loss[..., None]).mean())
+        # if model.delta_volume_decoder.transport_mass:
+        recons_loss_all = recon_loss.mean()
+        # else:
+        #     recons_loss_all = 0.5 * (recon_loss.mean() + mse(images_consensus_loss[..., None], x_loss[..., None]).mean())
 
         # L1 based denoising
         l1_loss = jnp.mean(jnp.abs(values))
+
+        # L1 denoising for negative values
+        values_neg = jnp.where(values < 0.0, -values, 0.0)
+        l1_loss += jnp.mean(values_neg, where=values_neg > 0.0)
 
         # L1 and L2 total variation (old version - no sparse)
         # diff_x = volumes[:, 1:, :, :] - volumes[:, :-1, :, :]
@@ -987,8 +991,8 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         else:
             decoupling_loss = 0.0
 
-        loss = (nll + 0.000001 * kl_loss + 0.000001 * kl_pose + 0.0001 * decoupling_loss
-                + l1_lambda * l1_loss + graph_lambda * loss_graph + 100. * hist_loss + 0.0001 * loss_dp + 0.0001 * loss_cm)
+        loss = (nll + 0.000001 * kl_loss + 0.000001 * kl_pose + 0.01 * decoupling_loss
+                + l1_lambda * l1_loss + graph_lambda * loss_graph + 100. * hist_loss + 0.01 * loss_dp + 0.0001 * loss_cm)
         return loss, (recon_loss.mean(), latent)
 
     # Check if Tomo mode
@@ -1564,12 +1568,12 @@ def main():
 
                     # Consensus volume
                     if args.num_gaussians is not None:
-                        model, _, _ = fit_volume(vol, mask=mask_fit, iterations=20000, learning_rate=0.001, n_init=args.num_gaussians, fixed_gaussians=True)
+                        model, _, _ = fit_volume(vol * mask_fit, mask=mask_fit, iterations=20000, learning_rate=0.001, n_init=args.num_gaussians, fixed_gaussians=True)
                     else:
-                        model, _, _ = fit_volume(vol, mask=mask_fit, iterations=20000, learning_rate=0.01, grad_threshold=1e-5, densify_interval=2000, n_init=2500)
+                        model, _, _ = fit_volume(vol * mask_fit, mask=mask_fit, iterations=20000, learning_rate=0.01, grad_threshold=1e-5, densify_interval=2000, n_init=2500)
 
                     # Adjust to images
-                    model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
+                    model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.0001,
                                                         num_epochs=3, is_global=True, ctf_type=args.ctf_type)
 
                     # Save model
@@ -1670,7 +1674,7 @@ def main():
                 total_validation_loss = 0
 
                 # Compute graph lambda
-                if args.vol is not None and model.delta_volume_decoder.transport_mass:
+                if args.vol is not None and hetsiren.delta_volume_decoder.transport_mass:
                     graph_lambda = 0.9
                 else:
                     graph_lambda = 0.0
