@@ -34,10 +34,9 @@ jobs:
         python -m pip install --upgrade pip
         pip install setuptools wheel twine
 
-    - name: Get package version
+    - name: Extract version without installing
       run: |
-        # We extract the version and save it to the environment for later steps
-        VERSION=$(python -c "import ${{ env.FOLDER_WITH_VERSION }}; print(${{ env.FOLDER_WITH_VERSION }}.__version__)")
+        VERSION=$(python -c "import re; f=open('${{ env.FOLDER_WITH_VERSION }}/__init__.py'); print(re.search(r'__version__\s*=\s*[\"\']([^\"\']+)[\"\']', f.read()).group(1))")
         echo "PACKAGE_VERSION=v$VERSION" >> $GITHUB_ENV
 
     - name: Build and publish Pypi
