@@ -44,9 +44,10 @@ jobs:
         python -m pip install --upgrade pip
         pip install build twine
 
-    - name: Extract version without installing
+    - name: Get package version
       run: |
-        VERSION=$(python -c "import re; f=open('${{ env.FOLDER_WITH_VERSION }}/__init__.py'); print(re.search(r'__version__\s*=\s*[\"\']([^\"\']+)[\"\']', f.read()).group(1))")
+        # Safe extraction without importing
+        VERSION=$(python -c "import re; f=open('${{ env.PACKAGE_DIR }}/__init__.py'); print(re.search(r'__version__\s*=\s*[\"\']([^\"\']+)[\"\']', f.read()).group(1))")
         echo "PACKAGE_VERSION=v$VERSION" >> $GITHUB_ENV
 
     - name: Publish to PyPI
