@@ -991,8 +991,8 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         else:
             decoupling_loss = 0.0
 
-        loss = (nll + 0.000001 * kl_loss + 0.000001 * kl_pose + 0.01 * decoupling_loss
-                + l1_lambda * l1_loss + graph_lambda * loss_graph + 100. * hist_loss + 0.01 * loss_dp + 0.0001 * loss_cm)
+        loss = (nll + 0.000001 * kl_loss + 0.000001 * kl_pose + 0.0001 * decoupling_loss
+                + l1_lambda * l1_loss + graph_lambda * loss_graph + 100. * hist_loss + 0.0001 * loss_dp + 0.0001 * loss_cm)
         return loss, (recon_loss.mean(), latent)
 
     # Check if Tomo mode
