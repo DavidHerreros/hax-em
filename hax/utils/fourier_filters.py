@@ -36,20 +36,36 @@ class FastVariableBlur2D(nnx.Module):
         # IRFFT (Complex -> Real)
         return jnp.fft.irfft2(filtered_spectrum, s=(self.h, self.w), axes=(1, 2))
 
-def low_pass_3d(x, std=1.0):
-    size = x.shape[0]
+def low_pass_3d(x, std=1.0, kernel_size=9):
+    size = x.shape
 
-    std = std * np.pi * np.sqrt(size)
-    gauss_1d = signal.windows.gaussian(size, std)
-    ft_kernel = np.einsum('i,j,k->ijk', gauss_1d, gauss_1d, gauss_1d)
-    ft_kernel = jnp.array(ft_kernel)
+    n = jnp.arange(kernel_size)
+    center = (kernel_size - 1.0) / 2.0
+    gauss_1d = jnp.exp(-0.5 * ((n - center) / std) ** 2)
+    gauss_1d = gauss_1d / jnp.sum(gauss_1d)
+    kernel = jnp.einsum('i,j,k->ijk', gauss_1d, gauss_1d, gauss_1d)
+
+    # Calculate how much padding is needed on each side to reach target_shape
+    pad_width = []
+    for i in range(3):
+        total_pad = size[i] - kernel.shape[i]
+        pad_before = total_pad // 2
+        pad_after = total_pad - pad_before
+        pad_width.append((pad_before, pad_after))
+
+    # Pad the small kernel with zeros to match the image size (e.g., 128^3)
+    padded_kernel = jnp.pad(kernel, pad_width)
+
+    # Shift the kernel center to [0, 0, 0] to prevent spatial translation
+    shifted_kernel = jnp.fft.ifftshift(padded_kernel)
+
+    # Compute the 3D FFT (The kernel will be complex numbers)
+    ft_kernel = jnp.fft.fftn(shifted_kernel)
 
     # Apply kernel Fourier
-    ft_x = jnp.fft.fftshift(jnp.fft.fftn(x))
-    ft_x_real = ft_x.real * ft_kernel
-    ft_x_imag = ft_x.imag * ft_kernel
-    ft_x = jlx.complex(ft_x_real, ft_x_imag)
-    return jnp.fft.ifftn(jnp.fft.ifftshift(ft_x)).real
+    ft_x = jnp.fft.fftn(x)
+    ft_x = ft_x * ft_kernel
+    return jnp.fft.ifftn(ft_x).real
 
 def bspline_3d(x):
     size = x.shape[0]
