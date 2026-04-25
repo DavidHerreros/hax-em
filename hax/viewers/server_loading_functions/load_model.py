@@ -24,8 +24,8 @@ class HeterogeneityProgramInterface:
 
         idx = 1
         for latent_vector in latent:
-            if hasattr(self.model, "decode_volume_het"):
-                state = np.array(self.model.decode_volume_het(latent_vector))
+            if hasattr(self.model, "decode_het_volume"):
+                state = np.array(self.model.decode_het_volume(latent_vector))
             else:
                 state = np.array(self.model.decode_volume(latent_vector))
             ImageHandler().write(state, filename=self.path_template.format(idx), overwrite=True)
