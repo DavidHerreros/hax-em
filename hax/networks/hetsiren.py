@@ -157,10 +157,10 @@ class EncoderTomo(nnx.Module):
                 return latent
 
 class MultiEncoder(nnx.Module):
-    def __init__(self, input_dim, lat_dim=10, n_layers=3, isVae=False, architecture="convnn", isTomoSIREN=False, *, rngs: nnx.Rngs):
+    def __init__(self, input_dim, d_hid=100, lat_dim=10, n_layers=3, isVae=False, architecture="convnn", isTomoSIREN=False, *, rngs: nnx.Rngs):
         if isTomoSIREN:
             self.encoders = nnx.Dict({"encoder_exp": Encoder(input_dim, lat_dim, n_layers=3, architecture=architecture, rngs=rngs),
-                                      "encoder_dec": EncoderTomo(100, lat_dim, n_layers=n_layers, rngs=rngs)})
+                                      "encoder_dec": EncoderTomo(d_hid, lat_dim, n_layers=n_layers, rngs=rngs)})
         else:
             self.encoders = nnx.Dict({"encoder_exp": Encoder(input_dim, lat_dim, n_layers=3, architecture=architecture, rngs=rngs),
                                       "encoder_dec": Encoder(input_dim, lat_dim, n_layers=n_layers, architecture=architecture, rngs=rngs)})
@@ -511,12 +511,11 @@ class PhysDecoder:
 
             num = jnp.square(bposf - c_sampling).sum(axis=-1)
             sigma = 1.
-            bamp = values * jnp.exp(-num / (2. * sigma ** 2.))
-
+            bamp = values * jnp.exp(-num[:, None, :] / (2. * sigma ** 2.))
         def scatter_img(image, bpos_i, bamp_i):
             return image.at[bpos_i[..., 0], bpos_i[..., 1]].add(bamp_i)
 
-        images = jax.vmap(scatter_img)(images, bposi, bamp)
+        images = jax.vmap(scatter_img)(images, bposi, jnp.mean(bamp, axis=1))
 
         # Gaussian filter (needed by forward interpolation)
         if filter:
@@ -552,7 +551,7 @@ class PhysDecoder:
 class HetSIREN(nnx.Module):
 
     @save_config
-    def __init__(self, lat_dim, reference_volume, reconstruction_mask, coords, values, xsize, sr, bank_size=1024, ctf_type="apply",
+    def __init__(self, lat_dim, reference_volume, reconstruction_mask, coords, values, xsize, sr, d_hid=100, bank_size=1024, ctf_type="apply",
                  sigma=1.0, decoupling=False, isVae=False, transport_mass=False, local_reconstruction=False, architecture="convnn",
                  is_implicit=True, isTomoSIREN=False, *, rngs: nnx.Rngs):
         super(HetSIREN, self).__init__()
@@ -566,9 +565,10 @@ class HetSIREN(nnx.Module):
         self.reference_volume = reference_volume
         self.reconstruction_mask = reconstruction_mask.astype(float)
         self.coords = jnp.array(coords)
+        self.d_hid = d_hid
         self.lat_dim = lat_dim
         self.has_reference_volume = not bool(np.all(reference_volume == 0.0))
-        self.encoder = MultiEncoder(self.xsize, lat_dim, n_layers=3, isVae=isVae, architecture=architecture, isTomoSIREN=isTomoSIREN, rngs=rngs) \
+        self.encoder = MultiEncoder(self.xsize, d_hid, lat_dim, n_layers=3, isVae=isVae, architecture=architecture, isTomoSIREN=isTomoSIREN, rngs=rngs) \
             if decoupling or isTomoSIREN else Encoder(self.xsize, lat_dim, isVae=isVae, architecture=architecture, rngs=rngs)
         self.delta_volume_decoder = DeltaVolumeDecoder(self.coords.shape[0], lat_dim, self.xsize, self.coords, values, transport_mass=transport_mass, is_implicit=is_implicit, rngs=rngs)
 
@@ -1389,7 +1389,7 @@ def main():
     from hax.generators import MetaDataGenerator, extract_columns, NumpyGenerator
     from hax.networks import train_step_hetsiren
     from hax.metrics import JaxSummaryWriter
-    from hax.programs import fit_volume, adjust_weights_to_images
+    from hax.programs.gaussian_volume_fitting import fit_volume, adjust_weights_to_images, splat_weights_bilinear
     # from hax.schedulers import CosineAnnealingScheduler
 
     def list_of_floats(arg):
@@ -1424,10 +1424,12 @@ def main():
                              f'to be analyzed by HetSIREN.')
     parser.add_argument("--num_gaussians", required=False, type=int,
                         help="Before training the network, HetSIREN will try to fit a set of Gaussians in the reference volume to recreate it. "
-                            "The default criterium is to automatically determine the number of Gaussians neede to reproduce the reference volume "
+                            "The default criterium is to automatically determine the number of Gaussians needed to reproduce the reference volume "
                             "with high-fidelity. However, if you prefer to fix the number of Gaussians in advance based on your own criterium (e.g., "
                             "the number of residues in your protein), you can set this parameter. When set, the HetSIREN will fit this fixed number of Gaussians "
                             "so that the reproduce the reference volume as well as possible.")
+    parser.add_argument("--sharpening", required=False, action='store_true',
+                        help='')
     parser.add_argument("--local_reconstruction", action='store_true',
                         help=f'When set, HetSIREN will turn to local heterogeneous reconstruction/refinement mod, focusing the analysis of heterogeneity to a region of interest enclosed by the provided refernece mask. '
                              f'{bcolors.WARNING}WARNING{bcolors.ENDC}: IF PROVIDED, TRANSPORT MASS WILL BE OVERRIDDEN AND NOT CONSIDERED. '
@@ -1446,9 +1448,9 @@ def main():
                              f"to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions")
     parser.add_argument("--learning_rate", required=False, type=float, default=1e-4,
                         help=f"The learning rate ({bcolors.ITALIC}lr{bcolors.ENDC}) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the {bcolors.ITALIC}lr{bcolors.ENDC} "
-                             f"is the size of the step it takes on each attempt. A large {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}0.01{bcolors.ENDC}) is like taking huge leaps — it's fast but can be unstable, "
+                             f"is the size of the step it takes on each attempt. A large {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}0.01{bcolors.ENDC}) is like taking huge leaps ? it's fast but can be unstable, "
                              f"overshoot the lowest point, or cause {bcolors.ITALIC}NAN{bcolors.ENDC} errors. A small {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}1e-6{bcolors.ENDC}) is like taking tiny "
-                             f"shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often {bcolors.ITALIC}0.0001{bcolors.ENDC}. If training fails or errors explode, "
+                             f"shuffles ? it's stable but very slow and might get stuck before reaching the bottom. A good default is often {bcolors.ITALIC}0.0001{bcolors.ENDC}. If training fails or errors explode, "
                              f"try making the {bcolors.ITALIC}lr{bcolors.ENDC} 10 times smaller (e.g., {bcolors.ITALIC}0.001{bcolors.ENDC} --> {bcolors.ITALIC}0.0001{bcolors.ENDC}).")
     parser.add_argument("-dataset_split_fraction", required=False, type=list_of_floats, default=[0.8, 0.2],
                         help=f"Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: {bcolors.ITALIC}training_fraction{bcolors.ENDC},"
@@ -1482,7 +1484,12 @@ def main():
                          f"to fulfill this requirement.")
 
     # Prepare metadata
-    generator = MetaDataGenerator(args.md)
+    if args.sharpening:
+        d_hid = 256
+        generator = MetaDataGenerator(args.md, mode="tomo", d_hid=d_hid)
+    else:
+        d_hid = 100
+        generator = MetaDataGenerator(args.md)
     md_columns = extract_columns(generator.md)
 
     # Check if TomoSIREN is needed
@@ -1587,16 +1594,10 @@ def main():
             if transport_mass:
                 # Prepare network (HetSIREN)
                 factor = 0.5 * generator.md.getMetaDataImage(0).shape[0]
-                if args.vol is not None:
-                    coords = np.array(factor * model.means.get_value() + factor)
-                    coords = np.stack([coords[..., 2], coords[..., 1], coords[..., 0]], axis=1)
-                    values = np.array(jax.nn.relu(model.weights.get_value()))
-                    sigma = jax.nn.relu(model.sigma_param.get_value())
-                else:
-                    inds = np.asarray(np.where(mask > 0.0)).T
-                    coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)
-                    values = jnp.zeros((inds.shape[0],))
-                    sigma = 1.0
+                coords = np.array(factor * model.means.get_value() + factor)
+                coords = np.stack([coords[..., 2], coords[..., 1], coords[..., 0]], axis=1)
+                values = np.array(jax.nn.relu(model.weights.get_value()))
+                sigma = jax.nn.relu(model.sigma_param.get_value())
             else:
                 inds = np.asarray(np.where(mask > 0.0)).T
                 coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)
@@ -1609,7 +1610,7 @@ def main():
                     sigma = jax.nn.relu(model.sigma_param.get_value())
 
             hetsiren = HetSIREN(args.lat_dim, vol, mask, coords, values,
-                                generator.md.getMetaDataImage(0).shape[0], args.sr, sigma=sigma,
+                                generator.md.getMetaDataImage(0).shape[0], args.sr, d_hid=d_hid, sigma=sigma,
                                 ctf_type=args.ctf_type, decoupling=True, isVae=True, transport_mass=transport_mass,
                                 local_reconstruction=local_reconstruction, bank_size=1024,
                                 isTomoSIREN=isTomoSIREN, is_implicit=args.implicit_network,
@@ -1617,10 +1618,7 @@ def main():
         hetsiren.train()
 
         # Example of training data for Tensorboard
-        if hetsiren.isTomoSIREN:
-            (x_example, _), labels_example = next(iter(data_loader_train))
-        else:
-            x_example, labels_example = next(iter(data_loader_train))
+        x_example, _, labels_example = next(iter(data_loader_train))
         x_example = jax.vmap(min_max_scale)(x_example)
         writer.add_images("Training data batch", x_example, dataformats="NHWC")
 
@@ -1662,7 +1660,10 @@ def main():
 
         iter_data_loader_train = iter(data_loader_train)
         for total_steps in pbar:
-            (x, labels) = next(iter_data_loader_train)
+            if isTomoSIREN:
+                (x, subtomo_labels, labels) = next(iter_data_loader_train)
+            else:
+                (x, _, labels) = next(iter_data_loader_train)
 
             if total_steps % steps_per_epoch == 0:
                 total_loss = 0
@@ -1670,10 +1671,7 @@ def main():
                 total_validation_loss = 0
 
                 # Compute graph lambda
-                if args.vol is not None and model.delta_volume_decoder.transport_mass:
-                    graph_lambda = 0.9
-                else:
-                    graph_lambda = 0.0
+                graph_lambda = 0.9
                 # num_warmup_epochs = 3
                 # if i < num_warmup_epochs:
                 #     graph_lambda = 1.0
@@ -1695,10 +1693,7 @@ def main():
 
                 # Log intermediate results at the begining of the epoch
                 # Get first 5 images from batch
-                if hetsiren.isTomoSIREN:
-                    x_for_tb = x[0][:5]
-                else:
-                    x_for_tb = x[:5]
+                x_for_tb = x[:5]
                 labels_for_tb = labels[:5]
 
                 # Decode some images and show them in Tensorboard
@@ -1750,8 +1745,11 @@ def main():
                                                                 epoch=i)
 
                 i += 1
-
-            loss, recon_loss, state, rng = train_step_hetsiren(graphdef, state, x, labels, md_columns, rng,
+            if isTomoSIREN:
+                x_total = (x, subtomo_labels)
+            else:
+                x_total = x
+            loss, recon_loss, state, rng = train_step_hetsiren(graphdef, state, x_total, labels, md_columns, rng,
                                                                l1_lambda=args.denoising_strength,
                                                                graph_lambda=graph_lambda)
             total_loss += loss
@@ -1826,10 +1824,14 @@ def main():
         # For progress bar (TQDM)
         pbar = tqdm(data_loader, file=sys.stdout, ascii=" >=", colour="green", total=steps_per_epoch,
                     bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
+        if isTomoSIREN:
+            iterable = pbar
+        else:
+            iterable = ((x, None, labels) for (x, labels) in pbar)
 
         md_pred = generator.md
         md_pred[:, 'latent_space'] = np.asarray([",".join(np.char.mod('%f', item)) for item in np.zeros((len(md_pred), args.lat_dim))])
-        for (x, labels) in pbar:
+        for (x, _, labels) in iterable:
             if isinstance(x, tuple):
                 x = x[0]
 
