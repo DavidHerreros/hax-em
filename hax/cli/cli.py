@@ -18,7 +18,8 @@ MODULES_DICT = {
     "display_metrics": ("hax.metrics.writer", "Display the model metrics (training curves, validation curves...) extracted while training a neural network"),
     "annotate_space": ("hax.viewers.annotate_space.annotate_space", "Interactive latent space analysis with real time map generation"),
     "reconsiren": ("hax.networks.reconsiren", "Ab initio estimation of particle pose, shifts and initial volume with neural networks"),
-    "modart": ("hax.programs.modart", "ART based volume reconstruction with motion correction to motion blurr artifacts")
+    "modart": ("hax.programs.modart", "ART based volume reconstruction with motion correction to motion blurr artifacts"),
+    "cryocheck": ("hax.networks.cryocheck", " Misalignment detection neural network for CryoEM maps")
 }
 
 
