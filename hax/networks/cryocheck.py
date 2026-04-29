@@ -68,7 +68,7 @@ class BottleneckBlock(nnx.Module):
     return out
 
 
-class ResNet(nnx.Module):
+class CryoCheck(nnx.Module):
   def __init__ (self, rngs:nnx.Rngs, block=BottleneckBlock, layers=[3, 4, 6, 3], num_classes=1):
     
     self.in_channels = 64
@@ -332,7 +332,7 @@ def main():
 
   # Prepare network
   rngs = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
-  cryoCheck = ResNet(rngs=nnx.Rngs(rngs))
+  cryoCheck = CryoCheck(rngs=nnx.Rngs(rngs))
 
   # Reload network
   if args.reload is not None:
