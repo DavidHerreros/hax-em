@@ -13,7 +13,7 @@ import numpy as np
 
 from hax import * 
 
-# Bottleneck block that is gonna be repeated [3 4 6 3] times for each layer
+# Bottleneck block that is gonna be iterated [3 4 6 3] times for each layer
 class BottleneckBlock(nnx.Module):
 
   expansion = 4
@@ -138,7 +138,6 @@ class CryoCheck(nnx.Module):
     x = self.layer4(x)
 
     # Pooling and classification
-    print(f"Shape prima del pooling: {x.shape}")
     x = jnp.mean(x, axis=(1,2))
     x = self.fc(x)
 
@@ -166,21 +165,22 @@ def cryoCheck_step(model, optimizer, x, labels, train: bool):
     else:
       loss = loss_fn(model, x, labels)
 
-    return loss, model
+    return loss, model 
 
 
 
 # Utils
 
-# Extracting metadata : euler angles, shifts, ctf
+# Extracting metadata for a batch : euler angles, shifts, ctf
 def md_extraction(md_columns, index, vol, args):
 
+    # Precompute batch alignments 
     euler_angles = md_columns["euler_angles"][index] 
 
     # Precompute batch shifts
     shifts = md_columns["shifts"][index]
 
-    #precompute batch CTFs
+    # Precompute batch CTFs
     defocusU = md_columns["ctfDefocusU"][index] 
     defocusV = md_columns["ctfDefocusV"][index]
     defocusAngle = md_columns["ctfDefocusAngle"][index]
@@ -198,7 +198,7 @@ def md_extraction(md_columns, index, vol, args):
     return(euler_angles, shifts, ctf)
 
 
-# Projecting the volume 
+# Projecting the batch volume 
 def Preprocessing(vol, mask, euler_angles, shifts, ctf):
 
     inds = np.asarray(np.where(mask > 0.0)).T #z,y,x voxel
@@ -220,7 +220,7 @@ def Preprocessing(vol, mask, euler_angles, shifts, ctf):
   
     # Scatter image
     B = euler_angles.shape[0]  
-    xsize=vol.shape[0]
+    xsize=vol.shape[0] #o vol.shape[1]
     c_sampling = jnp.stack([coords[..., 1], coords[..., 0]], axis=2)
     images = jnp.zeros((B, xsize, xsize), dtype=vol.dtype) 
 
@@ -231,7 +231,7 @@ def Preprocessing(vol, mask, euler_angles, shifts, ctf):
     bposi = bposf.astype(jnp.int32)
     bposf = c_sampling - bposf
 
-    # Split voxels intensity in 4 weights assigned to the four nearest pixels of a targeted one
+    # Split voxels intensity in 4 weights assigned to the four nearest pixels of the targeted one
     bamp0 = bamp * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1])
     bamp1 = bamp * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1])
     bamp2 = bamp * (bposf[:, :, 0]) * (bposf[:, :, 1])
@@ -497,10 +497,11 @@ def main():
       
       predictions = predict_fn(prediction_imgs)
 
-    final_predictions = labels_prediction.append(np.array(predictions))
+    labels_prediction.append(np.array(predictions))
+    final_predictions = np.concatenate(labels_prediction, axis=0)
     
   # Save results 
   md=generator.md #potresti farlo direttamente con md_columns
-  md[:, "final predictions"] = np.concatenate(final_predictions, axis=0)
+  md[:, "final predictions"] = final_predictions
   md.write(os.path.join(args.output_path, "md_final" +  os.path.splitext(args.md)[1]))
 
