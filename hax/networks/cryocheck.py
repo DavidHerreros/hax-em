@@ -14,7 +14,8 @@ import numpy as np
 from hax import * 
 
 #import - da rivedere se sono tutte necessarie
-from hax.utils.ctf import computeCTF, ctfFilter
+from hax.utils.ctf import computeCTF
+from hax.utils.fourier_filters import ctfFilter
 from hax.utils.euler import euler_matrix_batch
 
 
