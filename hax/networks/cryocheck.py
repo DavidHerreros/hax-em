@@ -13,6 +13,11 @@ import numpy as np
 
 from hax import * 
 
+#import - da rivedere se sono tutte necessarie
+from hax.utils.ctf import computeCTF, ctfFilter
+from hax.utils.euler import euler_matrix_batch
+
+
 # Bottleneck block that is gonna be iterated [3 4 6 3] times for each layer
 class BottleneckBlock(nnx.Module):
 
