@@ -152,6 +152,7 @@ class CryoCheck(nnx.Module):
 
 # Training and Validation
 @nnx.jit
+@jax.jit(static_argnames=['train'])
 def cryoCheck_step(model, optimizer, x, labels, train: bool):
 
     def loss_fn(model, x, labels):
