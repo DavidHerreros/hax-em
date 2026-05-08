@@ -169,7 +169,7 @@ def cryoCheck_step(model, optimizer, x, labels,*, train: bool):
 
       loss, grads = grad_fn(model, x, labels)
 
-      optimizer.update(grads)
+      optimizer.update(model,grads)
 
     else:
       loss = loss_fn(model, x, labels)
