@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 
+from pyexpat import model
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -151,8 +153,8 @@ class CryoCheck(nnx.Module):
   
 
 # Training and Validation
-@nnx.jit
-@nnx.jit(static_argnames=['train'])
+
+@nnx.jit(static_argnames='train')
 def cryoCheck_step(model, optimizer, x, labels,*, train: bool):
 
     def loss_fn(model, x, labels):
@@ -162,7 +164,7 @@ def cryoCheck_step(model, optimizer, x, labels,*, train: bool):
 
         return loss
 
-    if train == True:
+    if train:
       grad_fn = nnx.value_and_grad(loss_fn)
 
       loss, grads = grad_fn(model, x, labels)
