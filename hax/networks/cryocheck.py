@@ -417,10 +417,9 @@ def main():
         imgs=jnp.concatenate([aligned_imgs, misaligned_imgs], axis=0)
         labels=jnp.concatenate([alignes_labels, misalignes_labels], axis=0)
 
-        print(f"DEBUG - Steps per val: {steps_per_val}")
-
+        
         # VALIDATION STEP at the end of each epoch  
-        if total_steps % steps_per_epoch == 0 and total_steps != 0:    
+        if total_steps % steps_per_epoch == 0:    
           
           total_loss = 0
           total_validation_loss = 0 
