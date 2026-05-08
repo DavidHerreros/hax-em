@@ -125,7 +125,7 @@ class CryoCheck(nnx.Module):
       x=x.reshape(x.shape[0],int(jnp.sqrt(x.shape[1])), int(jnp.sqrt(x.shape[1])), 1)
     elif x.ndim == 4:
       # if x is already a (N,H,W,C), ensure C=1
-      if x.shape[-1] != 50:                  #50?
+      if x.shape[-1] != 1:                  #50?
         raise ValueError("Expected input with 1 channel, but got {} channels.".format(x.shape[-1]))
     else:
       raise ValueError("Unsupported input dimensions: {}.".format(x.shape[-1]))
