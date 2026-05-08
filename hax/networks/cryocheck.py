@@ -417,8 +417,10 @@ def main():
         imgs=jnp.concatenate([aligned_imgs, misaligned_imgs], axis=0)
         labels=jnp.concatenate([alignes_labels, misalignes_labels], axis=0)
 
+        print(f"DEBUG - Steps per val: {steps_per_val}")
+
         # VALIDATION STEP at the end of each epoch  
-        if total_steps % steps_per_epoch == 0:    
+        if total_steps % steps_per_epoch == 0 and total_steps != 0:    
           
           total_loss = 0
           total_validation_loss = 0 
@@ -433,9 +435,7 @@ def main():
           for _ in range(steps_per_val):
             try:
               (x_validation, index_validation) = next(iter_data_loader_val)
-              print(f"\n{bcolors.OKGREEN}DEBUG - Batch {steps_per_val} shape: {x_validation.shape}{bcolors.ENDC}")
-
-        
+              
               euler_angles, shifts, ctf = md_extraction (md_columns, index_validation, vol, args)
 
             # Aligned images
@@ -517,7 +517,7 @@ def main():
     final_predictions = np.concatenate(labels_prediction, axis=0)
     
   # Save results 
-  md=generator.md #potresti farlo direttamente con md_columns
+  md=generator.md # md_columns?
   md[:, "final predictions"] = final_predictions
   md.write(os.path.join(args.output_path, "md_final" +  os.path.splitext(args.md)[1]))
 
