@@ -160,7 +160,7 @@ def cryoCheck_step(model, optimizer, x, labels,*, train: bool):
     def loss_fn(model, x, labels):
         logits = model(x)
         # Binary cross entropy
-        loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, labels))
+        loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, labels)) #avg loss per batch
 
         return loss
 
@@ -384,7 +384,9 @@ def main():
                     colour="green",
                     bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
   
-  
+
+    total_loss = 0
+
     with closing(iter(data_loader_train)) as iter_data_loader_train: 
       for total_steps in pbar:
         (x, index) = next(iter_data_loader_train) 
@@ -417,11 +419,14 @@ def main():
         imgs=jnp.concatenate([aligned_imgs, misaligned_imgs], axis=0)
         labels=jnp.concatenate([aligned_labels, misaligned_labels], axis=0)
 
-        print(f"DEBUG - Steps per val: {steps_per_val}") 
+        loss, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs, labels=labels, train=True)
+        total_loss += loss
+
+        
         # VALIDATION STEP at the end of each epoch  
-        if (total_steps + 1) % steps_per_epoch == 0 and total_steps != 0:    
+        if (total_steps + 1) % steps_per_epoch == 0:    
           
-          total_loss = 0
+          #total_loss = 0
           total_validation_loss = 0 
 
           # For progress bar (TQDM)
@@ -471,13 +476,14 @@ def main():
               except StopIteration:
                 print(f"\n{bcolors.FAIL}Stop iteration!{bcolors.ENDC}")
                 break
+                
+                #total loss must be averaged and thenset to zero at the end of each epoch to avoid accumulation across epochs?
 
           i += 1
 
 
-        loss, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs, labels=labels, train=True)
-        total_loss += loss
-  
+        
+   
 
   
   elif args.mode=="predict":
