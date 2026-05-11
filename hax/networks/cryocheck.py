@@ -385,7 +385,7 @@ def main():
                     bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
   
   
-    with closing(iter(data_loader_train)) as iter_data_loader_train, closing(iter(data_loader_val)) as iter_data_loader_val:
+    with closing(iter(data_loader_train)) as iter_data_loader_train: 
       for total_steps in pbar:
         (x, index) = next(iter_data_loader_train) 
 
@@ -399,7 +399,7 @@ def main():
                                  euler_angles=euler_angles,
                                  shifts=shifts,
                                  ctf=ctf) - x)
-        alignes_labels = jnp.ones((batch_size,1))
+        aligned_labels = jnp.ones((batch_size,1))
 
         # Misaligned images - Data Augmentation
         rngs, subkey = jax.random.split(rngs)
@@ -411,15 +411,15 @@ def main():
                                  euler_angles=euler_angles_noisy,
                                  shifts=shifts,
                                  ctf=ctf) - x)
-        misalignes_labels = jnp.zeros((batch_size,1))
+        misaligned_labels = jnp.zeros((batch_size,1))
       
        
         imgs=jnp.concatenate([aligned_imgs, misaligned_imgs], axis=0)
-        labels=jnp.concatenate([alignes_labels, misalignes_labels], axis=0)
+        labels=jnp.concatenate([aligned_labels, misaligned_labels], axis=0)
 
-        
+        print(f"DEBUG - Steps per val: {steps_per_val}") 
         # VALIDATION STEP at the end of each epoch  
-        if total_steps % steps_per_epoch == 0:    
+        if (total_steps + 1) % steps_per_epoch == 0 and total_steps != 0:    
           
           total_loss = 0
           total_validation_loss = 0 
@@ -430,41 +430,47 @@ def main():
 
           # Validation step 
           pbar.set_postfix_str(f"{bcolors.WARNING}Running validation step...{bcolors.ENDC}")
-          
-          for _ in range(steps_per_val):
-            try:
-              (x_validation, index_validation) = next(iter_data_loader_val)
-              
-              euler_angles, shifts, ctf = md_extraction (md_columns, index_validation, vol, args)
 
-            # Aligned images
-              aligned_vimgs = jnp.abs(Preprocessing(vol=vol,
+          # Everytime the validation is reached, a new iterator is created to loop over the validation dataset.
+          with closing(iter(data_loader_val)) as iter_data_loader_val:
+            for _ in range(steps_per_val):
+              try:
+                (x_validation, index_validation) = next(iter_data_loader_val)
+              
+                euler_angles, shifts, ctf = md_extraction (md_columns, index_validation, vol, args)
+
+                batch_size_v = len(index_validation)
+
+              # Aligned images
+                aligned_vimgs = jnp.abs(Preprocessing(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles,
                                  shifts=shifts,
                                  ctf=ctf) - x_validation)
+                aligned_vlabels = jnp.ones((batch_size_v,1))
             
         
-            # Misaligned images
-              rngs, subkey_v = jax.random.split(rngs)
-              noise = (jax.random.normal(subkey_v, shape=euler_angles.shape) * 2) + 5
-              euler_angles_noisy = euler_angles + noise
+              # Misaligned images
+                rngs, subkey_v = jax.random.split(rngs)
+                noise = (jax.random.normal(subkey_v, shape=euler_angles.shape) * 2) + 5
+                euler_angles_noisy = euler_angles + noise
 
-              misaligned_vimgs = jnp.abs(Preprocessing(vol=vol,
+                misaligned_vimgs = jnp.abs(Preprocessing(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles_noisy,
                                  shifts=shifts,
                                  ctf=ctf) - x_validation)
+                misaligned_vlabels = jnp.zeros((batch_size_v,1))
               
-              imgs_validation = jnp.concatenate([aligned_vimgs, misaligned_vimgs],axis=0)
-              
+                imgs_validation = jnp.concatenate([aligned_vimgs, misaligned_vimgs],axis=0)
+                labels_validation = jnp.concatenate([aligned_vlabels, misaligned_vlabels], axis=0)
         
-              loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels, train=False)
-              total_validation_loss += loss_validation
+                loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels_validation, train=False)
+                total_validation_loss += loss_validation
 
-            except StopIteration:
-              print(f"\n{bcolors.FAIL}Stop iteration!{bcolors.ENDC}")
-              break
+              except StopIteration:
+                print(f"\n{bcolors.FAIL}Stop iteration!{bcolors.ENDC}")
+                break
 
           i += 1
 
