@@ -439,43 +439,41 @@ def main():
           # Everytime the validation is reached, a new iterator is created to loop over the validation dataset
           
           for _ in range(steps_per_val):
-            try:
-              (x_validation, index_validation) = next(iter_data_loader_val)
             
-              euler_angles, shifts, ctf = md_extraction (md_columns, index_validation, vol, args)
-
-              batch_size_v = len(index_validation)
-
-            # Aligned images
-              aligned_vimgs = jnp.abs(Preprocessing(vol=vol,
-                                mask=mask,
-                                euler_angles=euler_angles,
-                                shifts=shifts,
-                                ctf=ctf) - x_validation)
-              aligned_vlabels = jnp.ones((batch_size_v,1))
+            (x_validation, index_validation) = next(iter_data_loader_val)
           
-      
-            # Misaligned images
-              rngs, subkey_v = jax.random.split(rngs)
-              noise = (jax.random.normal(subkey_v, shape=euler_angles.shape) * 2) + 5
-              euler_angles_noisy = euler_angles + noise
+            euler_angles, shifts, ctf = md_extraction (md_columns, index_validation, vol, args)
 
-              misaligned_vimgs = jnp.abs(Preprocessing(vol=vol,
-                                mask=mask,
-                                euler_angles=euler_angles_noisy,
-                                shifts=shifts,
-                                ctf=ctf) - x_validation)
-              misaligned_vlabels = jnp.zeros((batch_size_v,1))
+            batch_size_v = len(index_validation)
+
+          # Aligned images
+            aligned_vimgs = jnp.abs(Preprocessing(vol=vol,
+                              mask=mask,
+                              euler_angles=euler_angles,
+                              shifts=shifts,
+                              ctf=ctf) - x_validation)
+            aligned_vlabels = jnp.ones((batch_size_v,1))
+        
+    
+          # Misaligned images
+            rngs, subkey_v = jax.random.split(rngs)
+            noise = (jax.random.normal(subkey_v, shape=euler_angles.shape) * 2) + 5
+            euler_angles_noisy = euler_angles + noise
+
+            misaligned_vimgs = jnp.abs(Preprocessing(vol=vol,
+                              mask=mask,
+                              euler_angles=euler_angles_noisy,
+                              shifts=shifts,
+                              ctf=ctf) - x_validation)
+            misaligned_vlabels = jnp.zeros((batch_size_v,1))
+          
+            imgs_validation = jnp.concatenate([aligned_vimgs, misaligned_vimgs],axis=0)
+            labels_validation = jnp.concatenate([aligned_vlabels, misaligned_vlabels], axis=0)
+    
+            loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels_validation, train=False)
+            total_validation_loss += loss_validation
+
             
-              imgs_validation = jnp.concatenate([aligned_vimgs, misaligned_vimgs],axis=0)
-              labels_validation = jnp.concatenate([aligned_vlabels, misaligned_vlabels], axis=0)
-      
-              loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels_validation, train=False)
-              total_validation_loss += loss_validation
-
-            except StopIteration:
-              print(f"\n{bcolors.FAIL}Stop iteration!{bcolors.ENDC}")
-              break
                 
                 #total loss must be averaged and thenset to zero at the end of each epoch to avoid accumulation across epochs?
 
