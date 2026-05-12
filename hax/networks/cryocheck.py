@@ -2,10 +2,6 @@
 
 from pyexpat import model
 
-import os
-os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
-
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -390,7 +386,7 @@ def main():
 
     total_loss = 0
 
-    with closing(iter(data_loader_train)) as iter_data_loader_train:
+    with closing(iter(data_loader_train)) as iter_data_loader_train, closing(iter(data_loader_val)) as iter_data_loader_val:
       for total_steps in pbar:
         (x, index) = next(iter_data_loader_train) 
 
@@ -448,9 +444,10 @@ def main():
                             bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}",
                             leave=False) 
 
-          with closing(iter(data_loader_val)) as iter_data_loader_val:
-            for _ in range(steps_per_val):
-              
+          
+          for _ in range(steps_per_val):
+            try:
+            
               print("DEBUG: Grain giving a batch...")
               (x_validation, index_validation) = next(iter_data_loader_val)
               print("DEBUG: Batch received, extracting metadata...")
@@ -487,9 +484,13 @@ def main():
               total_validation_loss += loss_validation
 
               val_pbar.update(1)
-              
-            #val_pbar.close()      
-                  #total loss must be averaged and thenset to zero at the end of each epoch to avoid accumulation across epochs?
+            
+            except StopIteration:
+              print("DEBUG: Validation data loader exhausted.")
+              break
+            
+          #val_pbar.close()      
+                #total loss must be averaged and thenset to zero at the end of each epoch to avoid accumulation across epochs?
 
           i += 1
 
