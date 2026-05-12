@@ -366,7 +366,7 @@ def main():
     data_loader_train, data_loader_val = generator.return_grain_dataset(batch_size=args.batch_size, shuffle="global",
                                                                             split_fraction=args.dataset_split_fraction,
                                                                             num_epochs=None,
-                                                                            num_workers=-1, num_threads=1,            
+                                                                            num_workers=0, num_threads=1,            
                                                                             load_to_ram=args.load_images_to_ram)    
     
     steps_per_epoch = int(int(args.dataset_split_fraction[0] * len(generator.md)) / args.batch_size) 
