@@ -449,7 +449,9 @@ def main():
           
           for _ in range(steps_per_val):
             
+            print("DEBUG: Grain giving a batch...")
             (x_validation, index_validation) = next(iter_data_loader_val)
+            print("DEBUG: Batch received, extracting metadata...")
           
             euler_angles, shifts, ctf = md_extraction (md_columns, index_validation, vol, args)
 
@@ -484,7 +486,7 @@ def main():
 
             val_pbar.update(1)
             
-          val_pbar.close()      
+          #val_pbar.close()      
                 #total loss must be averaged and thenset to zero at the end of each epoch to avoid accumulation across epochs?
 
           i += 1
