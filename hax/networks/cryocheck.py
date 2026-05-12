@@ -387,7 +387,7 @@ def main():
 
     total_loss = 0
 
-    with closing(iter(data_loader_train)) as iter_data_loader_train, closing(iter(data_loader_val)) as iter_data_loader_val:
+    with closing(iter(data_loader_train)) as iter_data_loader_train: 
       for total_steps in pbar:
         (x, index) = next(iter_data_loader_train) 
 
@@ -437,41 +437,41 @@ def main():
           pbar.set_postfix_str(f"{bcolors.WARNING}Running validation step...{bcolors.ENDC}")
 
           # Everytime the validation is reached, a new iterator is created to loop over the validation dataset
-          
-          for _ in range(steps_per_val):
+          with closing(iter(data_loader_val)) as iter_data_loader_val:
+            for _ in range(steps_per_val):
+              
+              (x_validation, index_validation) = next(iter_data_loader_val)
             
-            (x_validation, index_validation) = next(iter_data_loader_val)
+              euler_angles, shifts, ctf = md_extraction (md_columns, index_validation, vol, args)
+
+              batch_size_v = len(index_validation)
+
+            # Aligned images
+              aligned_vimgs = jnp.abs(Preprocessing(vol=vol,
+                                mask=mask,
+                                euler_angles=euler_angles,
+                                shifts=shifts,
+                                ctf=ctf) - x_validation)
+              aligned_vlabels = jnp.ones((batch_size_v,1))
           
-            euler_angles, shifts, ctf = md_extraction (md_columns, index_validation, vol, args)
+      
+            # Misaligned images
+              rngs, subkey_v = jax.random.split(rngs)
+              noise = (jax.random.normal(subkey_v, shape=euler_angles.shape) * 2) + 5
+              euler_angles_noisy = euler_angles + noise
 
-            batch_size_v = len(index_validation)
-
-          # Aligned images
-            aligned_vimgs = jnp.abs(Preprocessing(vol=vol,
-                              mask=mask,
-                              euler_angles=euler_angles,
-                              shifts=shifts,
-                              ctf=ctf) - x_validation)
-            aligned_vlabels = jnp.ones((batch_size_v,1))
-        
-    
-          # Misaligned images
-            rngs, subkey_v = jax.random.split(rngs)
-            noise = (jax.random.normal(subkey_v, shape=euler_angles.shape) * 2) + 5
-            euler_angles_noisy = euler_angles + noise
-
-            misaligned_vimgs = jnp.abs(Preprocessing(vol=vol,
-                              mask=mask,
-                              euler_angles=euler_angles_noisy,
-                              shifts=shifts,
-                              ctf=ctf) - x_validation)
-            misaligned_vlabels = jnp.zeros((batch_size_v,1))
-          
-            imgs_validation = jnp.concatenate([aligned_vimgs, misaligned_vimgs],axis=0)
-            labels_validation = jnp.concatenate([aligned_vlabels, misaligned_vlabels], axis=0)
-    
-            loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels_validation, train=False)
-            total_validation_loss += loss_validation
+              misaligned_vimgs = jnp.abs(Preprocessing(vol=vol,
+                                mask=mask,
+                                euler_angles=euler_angles_noisy,
+                                shifts=shifts,
+                                ctf=ctf) - x_validation)
+              misaligned_vlabels = jnp.zeros((batch_size_v,1))
+            
+              imgs_validation = jnp.concatenate([aligned_vimgs, misaligned_vimgs],axis=0)
+              labels_validation = jnp.concatenate([aligned_vlabels, misaligned_vlabels], axis=0)
+      
+              loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels_validation, train=False)
+              total_validation_loss += loss_validation
 
             
                 
