@@ -2,6 +2,10 @@
 
 from pyexpat import model
 
+import os
+os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
+os.environ['XLA_PYTHON_CLIENT_ALLOCATOR'] = 'platform'
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -15,7 +19,6 @@ import numpy as np
 
 from hax import * 
 
-#import - da rivedere se sono tutte necessarie
 from hax.utils.ctf import computeCTF
 from hax.utils.fourier_filters import ctfFilter
 from hax.utils.euler import euler_matrix_batch
@@ -366,7 +369,7 @@ def main():
     data_loader_train, data_loader_val = generator.return_grain_dataset(batch_size=args.batch_size, shuffle="global",
                                                                             split_fraction=args.dataset_split_fraction,
                                                                             num_epochs=None,
-                                                                            num_workers=0, num_threads=1,            
+                                                                            num_workers=-1, num_threads=1,            
                                                                             load_to_ram=args.load_images_to_ram)    
     
     steps_per_epoch = int(int(args.dataset_split_fraction[0] * len(generator.md)) / args.batch_size) 
@@ -445,7 +448,6 @@ def main():
                             bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}",
                             leave=False) 
 
-          # Everytime the validation is reached, a new iterator is created to loop over the validation dataset
           
           for _ in range(steps_per_val):
             
