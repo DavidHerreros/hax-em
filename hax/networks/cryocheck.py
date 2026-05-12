@@ -443,61 +443,56 @@ def main():
                             desc="Validating",
                             bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}",
                             leave=False) 
-
+          
           
           for _ in range(steps_per_val):
-            try:
-            
-              print("DEBUG: Grain giving a batch...")
-              (x_validation, index_validation) = next(iter_data_loader_val)
-              print("DEBUG: Batch received, extracting metadata...")
-            
-              euler_angles, shifts, ctf = md_extraction (md_columns, index_validation, vol, args)
-
-              batch_size_v = len(index_validation)
-
-            # Aligned images
-              aligned_vimgs = jnp.abs(Preprocessing(vol=vol,
-                                mask=mask,
-                                euler_angles=euler_angles,
-                                shifts=shifts,
-                                ctf=ctf) - x_validation)
-              aligned_vlabels = jnp.ones((batch_size_v,1))
           
-      
-            # Misaligned images
-              rngs, subkey_v = jax.random.split(rngs)
-              noise = (jax.random.normal(subkey_v, shape=euler_angles.shape) * 2) + 5
-              euler_angles_noisy = euler_angles + noise
+            print("DEBUG: Grain giving a batch...")
+            (x_validation, index_validation) = next(iter_data_loader_val)
+            print("DEBUG: Batch received, extracting metadata...")
+          
+            euler_angles, shifts, ctf = md_extraction (md_columns, index_validation, vol, args)
 
-              misaligned_vimgs = jnp.abs(Preprocessing(vol=vol,
-                                mask=mask,
-                                euler_angles=euler_angles_noisy,
-                                shifts=shifts,
-                                ctf=ctf) - x_validation)
-              misaligned_vlabels = jnp.zeros((batch_size_v,1))
-            
-              imgs_validation = jnp.concatenate([aligned_vimgs, misaligned_vimgs],axis=0)
-              labels_validation = jnp.concatenate([aligned_vlabels, misaligned_vlabels], axis=0)
-      
-              loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels_validation, train=False)
-              total_validation_loss += loss_validation
+            batch_size_v = len(index_validation)
 
-              val_pbar.update(1)
+          # Aligned images
+            aligned_vimgs = jnp.abs(Preprocessing(vol=vol,
+                              mask=mask,
+                              euler_angles=euler_angles,
+                              shifts=shifts,
+                              ctf=ctf) - x_validation)
+            aligned_vlabels = jnp.ones((batch_size_v,1))
+        
+    
+          # Misaligned images
+            rngs, subkey_v = jax.random.split(rngs)
+            noise = (jax.random.normal(subkey_v, shape=euler_angles.shape) * 2) + 5
+            euler_angles_noisy = euler_angles + noise
+
+            misaligned_vimgs = jnp.abs(Preprocessing(vol=vol,
+                              mask=mask,
+                              euler_angles=euler_angles_noisy,
+                              shifts=shifts,
+                              ctf=ctf) - x_validation)
+            misaligned_vlabels = jnp.zeros((batch_size_v,1))
+          
+            imgs_validation = jnp.concatenate([aligned_vimgs, misaligned_vimgs],axis=0)
+            labels_validation = jnp.concatenate([aligned_vlabels, misaligned_vlabels], axis=0)
+    
+            loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels_validation, train=False)
+            total_validation_loss += loss_validation
+
+            val_pbar.update(1)
             
-            except StopIteration:
-              print("DEBUG: Validation data loader exhausted.")
-              break
-            
+
           #val_pbar.close()      
                 #total loss must be averaged and thenset to zero at the end of each epoch to avoid accumulation across epochs?
 
           i += 1
 
 
-        
-   
-
+      
+  
   
   elif args.mode=="predict":
 
