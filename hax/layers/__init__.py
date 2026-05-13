@@ -5,5 +5,5 @@ from .attention import Attention
 from .hypernetworks import HyperLinear
 from .nnx_wrappers import Linear, Conv, ConvTranspose
 from .pose import PoseDistMatrix, sample_topM_R, importance_weights
-from .mamba_vision import MambaBlock
 from .point_transformer import PointTransformerDecoder, build_geometry
+from .memory_bank import MemoryBank
