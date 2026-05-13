@@ -374,8 +374,7 @@ def main():
     if args.vol is not None:
       fit_path = os.path.join(args.output_path, "Gaussian_volume_fitting")
       if not os.path.isdir(os.path.join(fit_path)):
-        
-
+      
         model, _, _ = fit_volume(vol * mask, mask=mask, iterations=20000, learning_rate=0.001, n_init=args.num_gaussians, fixed_gaussians=True)
         
         # Adjust to images
@@ -454,25 +453,27 @@ def main():
         labels=jnp.concatenate([aligned_labels, misaligned_labels], axis=0)
 
         loss, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs, labels=labels, train=True)
-        # Accumulate loss for the epoch
         total_loss += loss
-        pbar.write(f"Training Step {(total_steps + 1)}/{steps_per_epoch}, Loss: {loss:.4f}")
+        
 
 
         # VALIDATION STEP at the end of each epoch  
         if (total_steps + 1) % steps_per_epoch == 0:    
-          
-          #total_loss = 0
-          total_validation_loss = 0 
+         
+
+           # average loss at the end of each epoch 
+          avg_train_loss = total_loss / steps_per_epoch
+          pbar.write(f"\n--- End of Training for Epoch {int((total_steps + 1) / steps_per_epoch)} ---")
+          pbar.write(f" Loss: {avg_train_loss:.4f}")
+
+          total_loss = 0
+          total_validation_loss = 0
 
           # For progress bar (TQDM)
-          #step = 1
           pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
-
           # Validation step 
           pbar.set_postfix_str(f"{bcolors.WARNING}Running validation step...{bcolors.ENDC}")
 
-          # Creazione della barra di validazione nello stesso stile del training
           val_pbar = tqdm(total=steps_per_val, 
                             file=sys.stdout, 
                             ascii=" >=",
@@ -492,7 +493,7 @@ def main():
 
             batch_size_v = len(index_validation)
 
-          # Aligned images
+            # Aligned images
             aligned_vimgs = jnp.abs(Preprocessing(vol=vol,
                               mask=mask,
                               euler_angles=euler_angles,
@@ -501,7 +502,7 @@ def main():
             aligned_vlabels = jnp.ones((batch_size_v,1))
         
     
-          # Misaligned images
+            # Misaligned images
             rngs, subkey_v = jax.random.split(rngs)
             noise = (jax.random.normal(subkey_v, shape=euler_angles.shape) * 2) + 5
             euler_angles_noisy = euler_angles + noise
@@ -518,15 +519,17 @@ def main():
     
             loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels_validation, train=False)
             total_validation_loss += loss_validation
-            pbar.write(f"Validation Step {(_ + 1)}/{steps_per_val}, Loss: {loss_validation:.4f}")
-
+            #pbar.write(f"Validation Step {(_ + 1)}/{steps_per_val}, Loss: {loss_validation:.4f}")
 
             val_pbar.update(1)
 
-            total_loss = 0
 
-          #val_pbar.close()      
-                #total loss must be averaged and thenset to zero at the end of each epoch to avoid accumulation across epochs?
+          avg_val_loss = total_validation_loss / steps_per_val
+          pbar.write(f"\n--- End of Validation for Epoch {int((total_steps + 1) / steps_per_epoch)} ---")
+          pbar.write(f" Loss validation: {avg_val_loss:.4f}")
+          pbar.write(f"-------------------------------------------\n")
+
+          
 
           i += 1
 
