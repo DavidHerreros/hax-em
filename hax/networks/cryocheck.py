@@ -19,6 +19,7 @@ from hax.utils.ctf import computeCTF
 from hax.utils.fourier_filters import ctfFilter
 from hax.utils.euler import euler_matrix_batch
 
+from hax.programs.gaussian_volume_fitting import fit_volume, adjust_weights_to_images
 
 # Bottleneck block that is gonna be iterated [3 4 6 3] times for each layer
 class BottleneckBlock(nnx.Module):
@@ -325,6 +326,13 @@ def main():
   parser.add_argument("--ssd_scratch_folder", required=False, type=str,
                         help=f"When the parameter {bcolors.UNDERLINE}load_images_to_ram{bcolors.ENDC} is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from "
                              f"the default disk.")
+  parser.add_argument("--num_gaussians", required=True, type=int,
+                        help="Before training the network, HetSIREN will try to fit a set of Gaussians in the reference volume to recreate it. "
+                            "The default criterium is to automatically determine the number of Gaussians neede to reproduce the reference volume "
+                            "with high-fidelity. However, if you prefer to fix the number of Gaussians in advance based on your own criterium (e.g., "
+                            "the number of residues in your protein), you can set this parameter. When set, the HetSIREN will fit this fixed number of Gaussians "
+                            "so that the reproduce the reference volume as well as possible.")
+
   args, _ = parser.parse_known_args()
 
 
@@ -355,17 +363,44 @@ def main():
     generator = MetaDataGenerator(args.md)
     md_columns = extract_columns(generator.md)
 
+    mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
+
     # Prepare grain dataset
-    if not args.load_images_to_ram:
-            mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
-            generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4,
+    if not args.load_images_to_ram:generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4,
                                                  precision=np.float16, group_size=1, shard_size=10000)  #shard: significa che ho più archivi con 10000 immagini ciascuno e non tutti le immagini in uno solo
             
+
+    # Gaussian Splatting to adjust grey levels of the input volume, it helps the network to learn better and faster.
+    if args.vol is not None:
+      fit_path = os.path.join(args.output_path, "Gaussian_volume_fitting")
+      if not os.path.isdir(os.path.join(fit_path)):
+        
+
+        model, _, _ = fit_volume(vol * mask, mask=mask, iterations=20000, learning_rate=0.001, n_init=args.num_gaussians, fixed_gaussians=True)
+        
+        # Adjust to images
+        model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.0001,
+                                                              num_epochs=5, is_global=True, ctf_type="apply")
+
+        # Save model
+        NeuralNetworkCheckpointer.save(model, fit_path)
+
+        # Save adjusted volume and deltas for visualization
+        vol_deltas = np.array(model(place_deltas=True))
+        vol = np.array(model())
+        ImageHandler().write(vol_deltas, os.path.join(args.output_path, "consensus_volume_deltas.mrc"), overwrite=True)
+        ImageHandler().write(vol, os.path.join(args.output_path, "consensus_volume.mrc"), overwrite=True)
+    
+      else:
+        model = NeuralNetworkCheckpointer.load(checkpoint_path=fit_path)
+        vol = np.array(model())
+
+
     # Prepare data loader 
     data_loader_train, data_loader_val = generator.return_grain_dataset(batch_size=args.batch_size, shuffle="global",
                                                                             split_fraction=args.dataset_split_fraction,
                                                                             num_epochs=None,
-                                                                            num_workers=2, num_threads=1,            
+                                                                            num_workers=-1, num_threads=1,            
                                                                             load_to_ram=args.load_images_to_ram)    
     
     steps_per_epoch = int(int(args.dataset_split_fraction[0] * len(generator.md)) / args.batch_size) 
@@ -419,9 +454,11 @@ def main():
         labels=jnp.concatenate([aligned_labels, misaligned_labels], axis=0)
 
         loss, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs, labels=labels, train=True)
+        # Accumulate loss for the epoch
         total_loss += loss
+        pbar.write(f"Training Step {(total_steps + 1)}/{steps_per_epoch}, Loss: {loss:.4f}")
 
-        
+
         # VALIDATION STEP at the end of each epoch  
         if (total_steps + 1) % steps_per_epoch == 0:    
           
@@ -447,9 +484,9 @@ def main():
           
           for _ in range(steps_per_val):
           
-            print("DEBUG: Grain giving a batch...")
+            
             (x_validation, index_validation) = next(iter_data_loader_val)
-            print("DEBUG: Batch received, extracting metadata...")
+           
           
             euler_angles, shifts, ctf = md_extraction (md_columns, index_validation, vol, args)
 
@@ -481,9 +518,12 @@ def main():
     
             loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels_validation, train=False)
             total_validation_loss += loss_validation
+            pbar.write(f"Validation Step {(_ + 1)}/{steps_per_val}, Loss: {loss_validation:.4f}")
+
 
             val_pbar.update(1)
-            
+
+            total_loss = 0
 
           #val_pbar.close()      
                 #total loss must be averaged and thenset to zero at the end of each epoch to avoid accumulation across epochs?
@@ -492,7 +532,6 @@ def main():
 
 
       
-  
   
   elif args.mode=="predict":
 
@@ -535,8 +574,8 @@ def main():
     labels_prediction.append(np.array(predictions))
     final_predictions = np.concatenate(labels_prediction, axis=0)
     
-  # Save results 
-  md=generator.md # md_columns?
-  md[:, "final predictions"] = final_predictions
-  md.write(os.path.join(args.output_path, "md_final" +  os.path.splitext(args.md)[1]))
+    # Save results 
+    md=generator.md # md_columns?
+    md[:, "final predictions"] = final_predictions
+    md.write(os.path.join(args.output_path, "md_final" +  os.path.splitext(args.md)[1]))
 
