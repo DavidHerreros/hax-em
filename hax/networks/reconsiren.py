@@ -89,13 +89,14 @@ class Encoder(nnx.Module):
         hidden_6d_rotation.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         hidden_6d_rotation.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         if refine_current_assignment:
-            hidden_6d_rotation.append(Linear(1024, self.num_components * 6, rngs=rngs))
-            self.alpha_rotations = nnx.Param(jnp.array(1e-4))
+            hidden_6d_rotation.append(Linear(1024, self.num_components * 6, kernel_init=nnx.initializers.zeros_init(), rngs=rngs))
         else:
             identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...]
             identity_6d = jnp.tile(identity_6d, (1, self.num_components))
             kernel_init = jax.nn.initializers.normal(stddev=1e-2)
             bias_init = lambda key, shape, dtype: identity_6d
+            # kernel_init = nnx.initializers.zeros_init()
+            # bias_init = nnx.initializers.normal(stddev=1.0)
             hidden_6d_rotation.append(Linear(1024, self.num_components * 6, kernel_init=kernel_init, bias_init=bias_init, rngs=rngs))
         self.hidden_6d_rotation = nnx.List(hidden_6d_rotation)
 
@@ -104,10 +105,9 @@ class Encoder(nnx.Module):
         hidden_shifts.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         hidden_shifts.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         if refine_current_assignment:
-            hidden_shifts.append(Linear(1024, 2, rngs=rngs, kernel_init=normal_initializer_mean(mean=0.0, stddev=1e-4)))
-            self.alpha_shifts = nnx.Param(jnp.array(1e-4))
+            hidden_shifts.append(Linear(1024, 2, rngs=rngs, kernel_init=nnx.initializers.zeros_init()))
         else:
-            hidden_shifts.append(Linear(1024, 2, rngs=rngs, kernel_init=normal_initializer_mean(mean=0.0, stddev=1e-4)))
+            hidden_shifts.append(Linear(1024, 2, rngs=rngs, kernel_init=nnx.initializers.zeros_init()))
         self.hidden_shifts = nnx.List(hidden_shifts)
 
         # Layers to latent
@@ -127,7 +127,7 @@ class Encoder(nnx.Module):
 
         # Pyramid filter
         pyramid_levels_imgs = []
-        for i in range(self.pyramid_levels ):
+        for i in range(self.pyramid_levels):
             scale_factor = 2 ** i
             if scale_factor == 1:
                 processed_level = x
@@ -165,7 +165,7 @@ class Encoder(nnx.Module):
         rotations_6d = rotations_6d.reshape(x.shape[0] * self.num_components, 6)
         if self.refine_current_assignment:
             identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...].repeat(rotations_6d.shape[0], axis=0)
-            rotations_6d = identity_6d + self.alpha_rotations * rotations_6d
+            rotations_6d = identity_6d + rotations_6d
         a1, a2 = jnp.split(rotations_6d, 2, axis=-1)
         b1 = a1 / jnp.clip(jnp.linalg.norm(a1, axis=-1, keepdims=True), a_min=1e-6)
         a2_ortho = a2 - jnp.sum(a2 * b1, axis=-1, keepdims=True) * b1
@@ -180,8 +180,6 @@ class Encoder(nnx.Module):
             in_plane_shifts = nnx.gelu(in_plane_shifts + layer(in_plane_shifts))
         # in_plane_shifts = 0.5 * self.input_dim * self.hidden_shifts[-1](in_plane_shifts)
         in_plane_shifts = self.hidden_shifts[-1](in_plane_shifts)
-        if self.refine_current_assignment:
-            in_plane_shifts = self.alpha_shifts * in_plane_shifts
 
         # Broadcast shifts to euler angles shape
         in_plane_shifts = jnp.broadcast_to(in_plane_shifts[:, None, :], (in_plane_shifts.shape[0], self.num_components, 2))
@@ -218,6 +216,11 @@ class DeltaVolumeDecoder(nnx.Module):
         coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)[None, ...]
         self.coords = (coords - self.factor) / self.factor
 
+        if jnp.all(reference_values == 0):
+            kernel_init = nnx.initializers.glorot_uniform()
+        else:
+            kernel_init = nnx.initializers.zeros_init()
+
         if transport_mass or learn_delta_volume:
             hidden_linear = [Linear(in_features=total_voxels * 3, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init_first(c=1.))]
             for _ in range(3):
@@ -226,13 +229,13 @@ class DeltaVolumeDecoder(nnx.Module):
 
         if transport_mass:
             if learn_delta_volume:
-                hidden_linear.append(Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs))
+                hidden_linear.append(Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs, kernel_init=kernel_init))
             else:
-                hidden_linear.append(Linear(in_features=8, out_features=3 * total_voxels, rngs=rngs))
+                hidden_linear.append(Linear(in_features=8, out_features=3 * total_voxels, rngs=rngs, kernel_init=kernel_init))
             self.hidden_linear = nnx.List(hidden_linear)
         else:
             if learn_delta_volume:
-                hidden_linear.append(Linear(in_features=8, out_features=total_voxels, rngs=rngs))
+                hidden_linear.append(Linear(in_features=8, out_features=total_voxels, rngs=rngs, kernel_init=kernel_init))
             self.hidden_linear = nnx.List(hidden_linear)
 
 
@@ -579,7 +582,7 @@ class ReconSIREN(nnx.Module):
 
 
 @jax.jit
-def train_step_reconsiren(graphdef, state, x, labels, md, key):
+def train_step_reconsiren(graphdef, state, x, labels, md, key, lambda_uniform=0.0005):
     model, optimizer_pose, optimizer_volume, optimizer_het, optimizer_lagrangian = nnx.merge(graphdef, state)
 
     # Random keys
@@ -717,7 +720,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key):
         loss_uniform = uniform_angular_distribution_loss #+ diversity_loss
 
         loss = (recon_loss_all + 0.001 * l1_loss + 0.001 * (l1_grad_loss + l2_grad_loss) + 0.000001 * kl_loss +
-                0.0005 * loss_uniform)
+                lambda_uniform * loss_uniform)
         # loss = (recon_loss_all + 0.001 * l1_loss + 0.001 * (l1_grad_loss + l2_grad_loss) + 0.0001 * kl_loss +
         #         0.01 * uniform_angular_distribution_loss + 0.01 * diversity_loss)
         return loss, (recon_loss, loss_uniform, euler_angles)
@@ -1087,7 +1090,7 @@ def main():
                              f"overshoot the lowest point, or cause {bcolors.ITALIC}NAN{bcolors.ENDC} errors. A small {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}1e-6{bcolors.ENDC}) is like taking tiny "
                              f"shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often {bcolors.ITALIC}0.0001{bcolors.ENDC}. If training fails or errors explode, "
                              f"try making the {bcolors.ITALIC}lr{bcolors.ENDC} 10 times smaller (e.g., {bcolors.ITALIC}0.001{bcolors.ENDC} --> {bcolors.ITALIC}0.0001{bcolors.ENDC}).")
-    parser.add_argument("-dataset_split_fraction", required=False, type=list_of_floats, default=[0.8, 0.2],
+    parser.add_argument("--dataset_split_fraction", required=False, type=list_of_floats, default=[0.8, 0.2],
                         help=f"Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: {bcolors.ITALIC}training_fraction{bcolors.ENDC},"
                              f"{bcolors.ITALIC}validation_fraction{bcolors.ENDC}. While the training subset will be used to train/update the network parameters, the validation subset will only be used to evaluate the "
                              f"accuracy of the network when faced with new data. Therefore, the validation subset will never be used to update the networks parameters. {bcolors.WARNING}NOTE{bcolors.ENDC}: the sum of "
@@ -1125,7 +1128,7 @@ def main():
     # Prepare grain dataset
     if not args.load_images_to_ram and args.mode in ["train", "predict"]:
         mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
-        generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4,
+        generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=True, num_workers=4,
                                              precision=np.float16, group_size=1, shard_size=10000)
 
     # Preprocess volume (and mask)
@@ -1314,7 +1317,7 @@ def main():
                     step_validation = 1
                     pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
 
-                    if i > 0 and i % 5 == 0:
+                    if i > 0 and i % 1 == 0:
                         pbar.set_postfix_str(f"{bcolors.WARNING}Generating intermediate results...{bcolors.ENDC}")
 
                         # Example of predicted data for Tensorboard
@@ -1359,7 +1362,7 @@ def main():
 
                     i += 1
 
-                loss, recon_loss, state, rng = train_step_reconsiren(graphdef, state, x, labels, md_columns, rng)
+                loss, recon_loss, state, rng = train_step_reconsiren(graphdef, state, x, labels, md_columns, rng, lambda_uniform=0.0005)
                 total_loss += loss
                 total_recon_loss += recon_loss
 
@@ -1408,7 +1411,7 @@ def main():
 
         # Prepare data loader
         data_loader = generator.return_grain_dataset(batch_size=args.batch_size, shuffle=False, num_epochs=1,
-                                                     num_workers=6, load_to_ram=args.load_images_to_ram)
+                                                     num_workers=-1, load_to_ram=args.load_images_to_ram)
         steps_per_epoch = int(np.ceil(len(generator.md) / args.batch_size))
 
         # Jitted functions for volume prediction

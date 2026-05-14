@@ -1056,7 +1056,7 @@ def main():
                              f"overshoot the lowest point, or cause {bcolors.ITALIC}NAN{bcolors.ENDC} errors. A small {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}1e-6{bcolors.ENDC}) is like taking tiny "
                              f"shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often {bcolors.ITALIC}0.0001{bcolors.ENDC}. If training fails or errors explode, "
                              f"try making the {bcolors.ITALIC}lr{bcolors.ENDC} 10 times smaller (e.g., {bcolors.ITALIC}0.001{bcolors.ENDC} --> {bcolors.ITALIC}0.0001{bcolors.ENDC}).")
-    parser.add_argument("-dataset_split_fraction", required=False, type=list_of_floats, default=[0.8, 0.2],
+    parser.add_argument("--dataset_split_fraction", required=False, type=list_of_floats, default=[0.8, 0.2],
                         help=f"Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: {bcolors.ITALIC}training_fraction{bcolors.ENDC},"
                              f"{bcolors.ITALIC}validation_fraction{bcolors.ENDC}. While the training subset will be used to train/update the network parameters, the validation subset will only be used to evaluate the "
                              f"accuracy of the network when faced with new data. Therefore, the validation subset will never be used to update the networks parameters. {bcolors.WARNING}NOTE{bcolors.ENDC}: the sum of "
@@ -1145,15 +1145,15 @@ def main():
             if not os.path.isdir(os.path.join(fit_path)):
                 # Consensus volume
                 if args.num_gaussians is not None:
-                    model, _, _ = fit_volume(vol, mask=mask, iterations=20000, learning_rate=0.001,
+                    model, _, _ = fit_volume(vol * mask, mask=mask, iterations=20000, learning_rate=0.001,
                                              n_init=args.num_gaussians, fixed_gaussians=True)
                 else:
-                    model, _, _ = fit_volume(vol, mask=mask, iterations=20000, learning_rate=0.01, grad_threshold=1e-5,
+                    model, _, _ = fit_volume(vol * mask, mask=mask, iterations=20000, learning_rate=0.01, grad_threshold=1e-5,
                                              densify_interval=2000, n_init=2500)
 
                 # Adjust to images
                 model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
-                                                    num_epochs=3, is_global=True, ctf_type=args.ctf_type)
+                                                    num_epochs=5, is_global=True, ctf_type=args.ctf_type)
 
                 # Save model
                 NeuralNetworkCheckpointer.save(model, fit_path)

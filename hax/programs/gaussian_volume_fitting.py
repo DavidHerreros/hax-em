@@ -367,7 +367,7 @@ class GaussianSplatModel(nnx.Module):
         # Forward pass logic
         means = self.means.get_value()
         weights = nnx.relu(self.weights.get_value())
-        sigma = nnx.relu(self.sigma_param.get_value())
+        sigma = jnp.maximum(nnx.relu(self.sigma_param.get_value()), 1.0)
 
         if "projection_parameters" in kwargs.keys():
             projection_parameters = kwargs.pop("projection_parameters")
@@ -590,7 +590,7 @@ def training_step_local_adjustment(graphdef, state, target, projection_parameter
                          projection_parameters["sr"],
                          [pad_factor * model.grid_size, int(pad_factor * 0.5 * model.grid_size + 1)],
                          target.shape[0], True)
-        target = wiener2DFilter(jnp.squeeze(target), ctf)[..., None]
+        target = wiener2DFilter(jnp.squeeze(target), ctf)
 
     loss_val, grads = nnx.value_and_grad(loss_fn)(model, target)
 
@@ -639,7 +639,7 @@ def training_step_global_adjustment(graphdef, state, target, projection_paramete
                 dtype=means.dtype)
 
         if ctf_type in ["wiener", "precorrect"]:
-            target = wiener2DFilter(jnp.squeeze(target), ctf)[..., None]
+            target = wiener2DFilter(jnp.squeeze(target), ctf)
             ctf = jnp.ones_like(ctf)
 
         recon_images = splat_weights_bilinear(grid_size, means, weights, sigma, rotations, shifts, ctf, pdb=pdb)
@@ -697,7 +697,7 @@ def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densi
         model, _ = nnx.merge(graphdef, state)
         loss_history.append(loss_val)
         k_history.append(model.means.get_value().shape[0])
-        s = float(nnx.relu(model.sigma_param.get_value())[0])
+        s = jnp.maximum(float(nnx.relu(model.sigma_param.get_value())[0]), 1.0)
 
         # Progress bar update  (TQDM)
         pbar.set_postfix_str(f"| Loss: {loss_val:.6f} | K: {model.means.get_value().shape[0]:04d} | Sigma: {s:.3f}")
@@ -715,7 +715,6 @@ def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densi
     # FINAL PRUNING
     means = model.means.get_value()
     weights = model.weights.get_value()
-    sigma = model.sigma_param.get_value()
 
     actual_weights = nnx.relu(weights)
     noise_floor = jnp.max(actual_weights) * 0.01
@@ -731,6 +730,7 @@ def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densi
 
     model.means = nnx.Param(final_means)
     model.weights = nnx.Param(final_weights)
+    model.sigma_param = nnx.Param(jnp.maximum(model.sigma_param.get_value(), 1.0))
 
     # Update config file
     model.update_config()
@@ -811,7 +811,7 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
             model, _ = nnx.merge(graphdef, state)
             loss_history.append(loss_val)
             k_history.append(model.means.get_value().shape[0])
-            s = float(nnx.relu(model.sigma_param.get_value())[0])
+            s = jnp.maximum(float(nnx.relu(model.sigma_param.get_value())[0]), 1.0)
 
             # Progress bar update  (TQDM)
             if len(loss_history) > 1000:
@@ -860,6 +860,7 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
     # Set final means and weights
     model.means = nnx.Param(means)
     model.weights = nnx.Param(weights)
+    model.sigma_param = nnx.Param(jnp.maximum(model.sigma_param.get_value(), 1.0))
 
     # Update config file
     model.update_config()
@@ -889,7 +890,7 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
         model_global_adjustment = GlobalAdjustment()
 
         # Init Optimizer (nnx.Optimizer automatically tracks model params)
-        optimizer = nnx.Optimizer(model_global_adjustment, optax.adamw(learning_rate), wrt=nnx.Param)
+        optimizer = nnx.Optimizer(model_global_adjustment, optax.sgd(learning_rate), wrt=nnx.Param)
         graphdef, state = nnx.split((model_global_adjustment, optimizer))
 
         # Prepare gaussian params
@@ -918,7 +919,7 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
             (x, _, labels) = next(iter_data_loader)
             # --- TRAIN STEP ---
             projection_parameters = {"euler_angles": md_columns["euler_angles"][labels],
-                                     "shifts": md_columns["shifts"][labels] / sr}
+                                     "shifts": md_columns["shifts"][labels]}
             if ctf_type in ["apply", "wiener", "squared", "precorrect"]:
                 ctf_parameters = {"ctfDefocusU": md_columns["ctfDefocusU"][labels],
                                   "ctfDefocusV": md_columns["ctfDefocusV"][labels],

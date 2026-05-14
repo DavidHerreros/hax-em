@@ -1,0 +1,51 @@
+# Workflow to send master to pypi and tag  the branch:
+# You need to edit FOLDER_WITH_VERSION with the folder that has the __version__ value.
+
+name: master to pypi with comments and tag
+
+
+# Controls when the action will run. Triggers the workflow on push or pull request
+# events but only for the main branch
+on:
+  push:
+    branches: [ main ]
+  
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  deploy:
+
+    runs-on: ubuntu-latest
+
+    environment: pypi
+
+    permissions:
+      id-token: write
+      contents: write
+
+    steps:
+    - uses: actions/checkout@v2
+
+    - name: Set up Python
+      uses: actions/setup-python@v3
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install build twine
+
+    - name: Build package
+      run: |
+        python -m build
+
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        print-hash: true
+
+    - name: Get version and tag
+      run: |
+        export PACKAGE_VERSION=$(python -c "import hax; print('VERSION', 'v'+hax.__version__)" | grep VERSION | sed "s/VERSION //g")
+        git tag $PACKAGE_VERSION
+        git push origin $PACKAGE_VERSION
