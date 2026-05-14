@@ -1436,6 +1436,8 @@ def main():
                         help='')
     parser.add_argument("--densify_interval", required=False, type=int, default=500,
                         help='')
+    parser.add_argument("--max_gaussians", required=False, type=int, default=50000,
+                        help='')
     parser.add_argument("--local_reconstruction", action='store_true',
                         help=f'When set, HetSIREN will turn to local heterogeneous reconstruction/refinement mod, focusing the analysis of heterogeneity to a region of interest enclosed by the provided refernece mask. '
                              f'{bcolors.WARNING}WARNING{bcolors.ENDC}: IF PROVIDED, TRANSPORT MASS WILL BE OVERRIDDEN AND NOT CONSIDERED. '
@@ -1577,7 +1579,8 @@ def main():
 
                     # Consensus volume
                     num_gaussians = args.num_gaussians if args.num_gaussians else 2500
-                    model, _, _ = fit_volume(vol, mask=mask_fit, iterations=20000, learning_rate=0.01, densify_interval=args.densify_interval, n_init=num_gaussians)
+                    model, _, _ = fit_volume(vol, mask=mask_fit, iterations=20000, learning_rate=0.01,
+                                             densify_interval=args.densify_interval, n_init=num_gaussians, max_gaussians=args.max_gaussians)
 
                     # Adjust to images
                     model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.0001,

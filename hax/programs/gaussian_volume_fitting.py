@@ -438,13 +438,12 @@ class GlobalAdjustment(nnx.Module):
 
 # --- 3. ADAPTIVE LOGIC (NNX Compatible) ---
 
-def adapt_gaussians(model, grads, lr=None, optimizer=None):
+def adapt_gaussians(model, grads, max_gaussians=50000, lr=None, optimizer=None):
     """
     Modifies the model structure (adds/removes params) and re-initializes optimizer.
     """
     means = model.means.get_value()
     weights_param = model.weights.get_value()
-    sigma_val = nnx.relu(model.sigma_param.get_value())
 
     actual_weights = nnx.relu(weights_param)
     prune_threshold = jnp.maximum(
@@ -479,6 +478,13 @@ def adapt_gaussians(model, grads, lr=None, optimizer=None):
 
     final_means = jnp.concatenate(new_means_list, axis=0)
     final_weights = jnp.concatenate(new_weights_list, axis=0)
+
+    current_k = final_means.shape[0]
+    if current_k > max_gaussians:
+        final_actual_weights = nnx.relu(final_weights)
+        top_indices = jnp.argsort(-final_actual_weights)[:max_gaussians]
+        final_means = final_means[top_indices]
+        final_weights = final_weights[top_indices]
 
     model.means = nnx.Param(final_means)
     model.weights = nnx.Param(final_weights)
@@ -656,7 +662,7 @@ def training_step_global_adjustment(graphdef, state, target, projection_paramete
     return loss_val, state
 
 
-def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densify_interval=500, n_init=2500):
+def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densify_interval=500, n_init=2500, max_gaussians=50000):
     # Grid size
     grid_size = target_vol.shape[0]
 
@@ -706,7 +712,7 @@ def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densi
         if i > 0 and i % densify_interval == 0:
             # We pass the optimizer because we might need to replace it
             model, optimizer = nnx.merge(graphdef, state)
-            optimizer = adapt_gaussians(model, grads, optimizer=optimizer)
+            optimizer = adapt_gaussians(model, grads, max_gaussians=max_gaussians, optimizer=optimizer)
             graphdef, state = nnx.split((model, optimizer))
 
 
@@ -730,7 +736,6 @@ def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densi
 
     model.means = nnx.Param(final_means)
     model.weights = nnx.Param(final_weights)
-    model.sigma_param = nnx.Param(jnp.maximum(model.sigma_param.get_value(), 1.0))
 
     # Update config file
     model.update_config()
@@ -739,7 +744,7 @@ def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densi
 
 
 def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256, learning_rate=0.01,
-               densify_interval=200, grad_threshold=1e-5, save_partial=True, n_init=2500):
+               densify_interval=200, save_partial=True, n_init=2500, max_gaussians=50000):
     # Prepare metadata
     generator = MetaDataGenerator(md_path)
     md_columns = extract_columns(generator.md)
@@ -821,15 +826,8 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
 
             # --- ADAPTIVE STEP ---
             if i > 0 and i % densify_interval == 0:
-                # We pass the optimizer because we might need to replace it
-                # lr = get_cosine_reg_strength(i, len_dataset // 3, learning_rate, 0.001)
-
-                # Prune threshold
-                corner_slice = x[:, :10, :10]
-                prune_threshold = jnp.mean(corner_slice) + (2.0 * jnp.std(corner_slice))
-
                 model, optimizer = nnx.merge(graphdef, state)
-                optimizer = adapt_gaussians(model, grads, lr=learning_rate)
+                optimizer = adapt_gaussians(model, grads, max_gaussians=max_gaussians, lr=learning_rate)
                 graphdef, state = nnx.split((model, optimizer))
 
             # --- SAVE PARTIAL ---
@@ -860,7 +858,6 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
     # Set final means and weights
     model.means = nnx.Param(means)
     model.weights = nnx.Param(weights)
-    model.sigma_param = nnx.Param(jnp.maximum(model.sigma_param.get_value(), 1.0))
 
     # Update config file
     model.update_config()
