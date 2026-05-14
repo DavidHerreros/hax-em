@@ -454,7 +454,7 @@ class DeltaVolumeDecoder(nnx.Module):
                                bposi + jnp.array((0, 1, 1)), bposi + jnp.array((1, 0, 1)), bposi + jnp.array((1, 1, 0)), bposi + jnp.array((1, 1, 1))], axis=1)
         else:
             bamp = values
-            bposi = jnp.floor(coords).astype(jnp.int32)
+            bposi = coords
 
         def scatter_volume(vol, bpos_i, bamp_i):
             return vol.at[bpos_i[..., 2], bpos_i[..., 1], bpos_i[..., 0]].add(bamp_i)
@@ -510,7 +510,7 @@ class PhysDecoder:
             bposi = bposf.astype(jnp.int32)
 
             num = jnp.square(bposf - c_sampling).sum(axis=-1)
-            sigma = 1.
+            #sigma = 1.
             bamp = values * jnp.exp(-num[:, None, :] / (2. * sigma ** 2.))
         def scatter_img(image, bpos_i, bamp_i):
             return image.at[bpos_i[..., 0], bpos_i[..., 1]].add(bamp_i)
@@ -1430,6 +1430,8 @@ def main():
                             "so that the reproduce the reference volume as well as possible.")
     parser.add_argument("--sharpening", required=False, action='store_true',
                         help='')
+    parser.add_argument("--densify_interval", required=False, type=int, default=500,
+                        help='')
     parser.add_argument("--local_reconstruction", action='store_true',
                         help=f'When set, HetSIREN will turn to local heterogeneous reconstruction/refinement mod, focusing the analysis of heterogeneity to a region of interest enclosed by the provided refernece mask. '
                              f'{bcolors.WARNING}WARNING{bcolors.ENDC}: IF PROVIDED, TRANSPORT MASS WILL BE OVERRIDDEN AND NOT CONSIDERED. '
@@ -1570,10 +1572,8 @@ def main():
                         mask_fit = ImageHandler().generateMask(inputFn=vol, boxsize=64)
 
                     # Consensus volume
-                    if args.num_gaussians is not None:
-                        model, _, _ = fit_volume(vol, mask=mask_fit, iterations=20000, learning_rate=0.001, n_init=args.num_gaussians, fixed_gaussians=True)
-                    else:
-                        model, _, _ = fit_volume(vol, mask=mask_fit, iterations=20000, learning_rate=0.01, grad_threshold=1e-5, densify_interval=2000, n_init=2500)
+                    num_gaussians = args.num_gaussians if args.num_gaussians else 2500
+                    model, _, _ = fit_volume(vol, mask=mask_fit, iterations=20000, learning_rate=0.01, densify_interval=args.densify_interval, n_init=num_gaussians)
 
                     # Adjust to images
                     model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
