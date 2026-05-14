@@ -506,8 +506,8 @@ class MetaDataGenerator:
 
             if split_fraction is not None:
                 split_point = int(split_fraction[0] * len(shard_paths))
-                sources_train = LazyNinjaGrainSource(shard_paths[split_point:], self.md, self.sinusoid_table)
-                sources_val = LazyNinjaGrainSource(shard_paths[:split_point], self.md, self.sinusoid_table)
+                sources_train = LazyNinjaGrainSource(shard_paths[:split_point], self.md, self.sinusoid_table)
+                sources_val = LazyNinjaGrainSource(shard_paths[split_point:], self.md, self.sinusoid_table)
                 dataset_train = grain.MapDataset.source(sources_train)
                 dataset_val = grain.MapDataset.source(sources_val)
             else:
