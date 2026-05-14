@@ -367,7 +367,7 @@ class GaussianSplatModel(nnx.Module):
         # Forward pass logic
         means = self.means.get_value()
         weights = nnx.relu(self.weights.get_value())
-        sigma = jnp.maximum(nnx.relu(self.sigma_param.get_value()), 1.0)
+        sigma = nnx.relu(self.sigma_param.get_value())
 
         if "projection_parameters" in kwargs.keys():
             projection_parameters = kwargs.pop("projection_parameters")
@@ -703,7 +703,7 @@ def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densi
         model, _ = nnx.merge(graphdef, state)
         loss_history.append(loss_val)
         k_history.append(model.means.get_value().shape[0])
-        s = jnp.maximum(float(nnx.relu(model.sigma_param.get_value())[0]), 1.0)
+        s = float(nnx.relu(model.sigma_param.get_value())[0])
 
         # Progress bar update  (TQDM)
         pbar.set_postfix_str(f"| Loss: {loss_val:.6f} | K: {model.means.get_value().shape[0]:04d} | Sigma: {s:.3f}")
@@ -816,7 +816,7 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
             model, _ = nnx.merge(graphdef, state)
             loss_history.append(loss_val)
             k_history.append(model.means.get_value().shape[0])
-            s = jnp.maximum(float(nnx.relu(model.sigma_param.get_value())[0]), 1.0)
+            s = float(nnx.relu(model.sigma_param.get_value())[0])
 
             # Progress bar update  (TQDM)
             if len(loss_history) > 1000:
