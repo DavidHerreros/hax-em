@@ -537,9 +537,9 @@ class MetaDataGenerator:
 
             if split_fraction is not None:
                 split_point = int(split_fraction[0] * len(images))
-                sources_train = NumpyDataSource(images[split_point:], labels[split_point:], self.md,
+                sources_train = NumpyDataSource(images[:split_point], labels[:split_point], self.md,
                                                 self.sinusoid_table)
-                sources_val = NumpyDataSource(images[:split_point], labels[:split_point], self.md, self.sinusoid_table)
+                sources_val = NumpyDataSource(images[split_point:], labels[split_point:], self.md, self.sinusoid_table)
                 dataset_train = grain.MapDataset.source(sources_train)
                 dataset_val = grain.MapDataset.source(sources_val)
             else:
