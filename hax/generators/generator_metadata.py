@@ -549,11 +549,6 @@ class MetaDataGenerator:
         else:
             raise ValueError("Unknown grain dataset type")
 
-        if split_fraction is not None:
-            split_point = int(split_fraction[0] * len(self.md))
-            dataset_train = dataset_train[:split_point]
-            dataset_val = dataset_val[split_point:]
-
         # Shuffling type
         if shuffle == "global":
             seed = random.randint(0, 2 ** 32 - 1)
