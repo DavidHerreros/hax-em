@@ -21,6 +21,8 @@ from hax.utils.euler import euler_matrix_batch
 
 from hax.programs.gaussian_volume_fitting import fit_volume, adjust_weights_to_images
 
+
+
 # Bottleneck block that is gonna be iterated [3 4 6 3] times for each layer
 class BottleneckBlock(nnx.Module):
 
@@ -354,7 +356,7 @@ def main():
   if args.reload is not None:
       cryoCheck = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "Trained_CryoCheck"))
 
-  # Train network
+  ### Train network ###
   if args.mode == "train":
     
     cryoCheck.train()
@@ -370,7 +372,7 @@ def main():
                                                  precision=np.float16, group_size=1, shard_size=10000)  #shard: significa che ho più archivi con 10000 immagini ciascuno e non tutti le immagini in uno solo
             
 
-    # Gaussian Splatting to adjust grey levels of the input volume, it helps the network to learn better and faster.
+    # Gaussian Splatting to adjust grey levels of the input volume
     if args.vol is not None:
       fit_path = os.path.join(args.output_path, "Gaussian_volume_fitting")
       if not os.path.isdir(os.path.join(fit_path)):
@@ -417,7 +419,6 @@ def main():
                     colour="green",
                     bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
   
-
     total_loss = 0
 
     with closing(iter(data_loader_train)) as iter_data_loader_train, closing(iter(data_loader_val)) as iter_data_loader_val:
@@ -457,11 +458,10 @@ def main():
         
 
 
-        # VALIDATION STEP at the end of each epoch  
+        #VALIDATION STEP at the end of each epoch  
         if (total_steps + 1) % steps_per_epoch == 0:    
          
-
-           # average loss at the end of each epoch 
+           # average training loss at the end of each epoch 
           avg_train_loss = total_loss / steps_per_epoch
           pbar.write(f"\n--- End of Training for Epoch {int((total_steps + 1) / steps_per_epoch)} ---")
           pbar.write(f" Loss: {avg_train_loss:.4f}")
@@ -484,11 +484,9 @@ def main():
           
           
           for _ in range(steps_per_val):
-          
             
             (x_validation, index_validation) = next(iter_data_loader_val)
            
-          
             euler_angles, shifts, ctf = md_extraction (md_columns, index_validation, vol, args)
 
             batch_size_v = len(index_validation)
@@ -517,12 +515,13 @@ def main():
             imgs_validation = jnp.concatenate([aligned_vimgs, misaligned_vimgs],axis=0)
             labels_validation = jnp.concatenate([aligned_vlabels, misaligned_vlabels], axis=0)
     
+
             loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels_validation, train=False)
             total_validation_loss += loss_validation
-            #pbar.write(f"Validation Step {(_ + 1)}/{steps_per_val}, Loss: {loss_validation:.4f}")
-
+            
             val_pbar.update(1)
 
+          val_pbar.close()
 
           avg_val_loss = total_validation_loss / steps_per_val
           pbar.write(f"\n--- End of Validation for Epoch {int((total_steps + 1) / steps_per_epoch)} ---")
