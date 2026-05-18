@@ -19,6 +19,6 @@ from .reconstruction import reconstruct_volume_streaming
 from .optimal_transport_functions import compute_swd_matrix
 from .plots import plot_angular_distribution
 from .hyperparameter_tuning import find_max_batch_size
-from .image_transformations import apply_batch_translations
+from .image_transformations import apply_batch_translations, prepare_image_cryocrab
 from .jax_tsp import solve_tsp_simulated_annealing_jax, solve_tsp_local_search_jax
 from .decorators import save_config
