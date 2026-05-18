@@ -229,7 +229,7 @@ def correlation_coefficient_loss(x, y):
     y_square_sum = jnp.sum(ym * ym, axis=[1, 2])
     r_den = jnp.sqrt(x_square_sum * y_square_sum)
     r = r_num / (r_den + epsilon)
-    return jnp.mean(1. - r)
+    return jnp.mean(1. - r, axis=-1)
 
 def simae(
     a: chex.Array,
