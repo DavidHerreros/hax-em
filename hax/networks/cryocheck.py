@@ -532,7 +532,8 @@ def main():
 
           i += 1
 
-
+    # Save model
+    NeuralNetworkCheckpointer.save(cryocheck, os.path.join(args.output_path, "cryocheck_model"))
       
   
   elif args.mode=="predict":
@@ -578,6 +579,6 @@ def main():
     
     # Save results 
     md=generator.md # md_columns?
-    md[:, "final predictions"] = final_predictions
-    md.write(os.path.join(args.output_path, "md_final" +  os.path.splitext(args.md)[1]))
+    md[:, "misalignment_score"] = final_predictions
+    md.write(os.path.join(args.output_path, "md_final_predictions" +  os.path.splitext(args.md)[1]))
 
