@@ -36,10 +36,17 @@ def generate_uniform_rotations(num_rots=4000):
 
     return rots
 
-def save_mrc(data, apix, path):
+def save_mrc(data, apix, path, centering=False):
+    data_array = np.array(data, dtype=np.float32)
+    nx, ny, nz = data_array.shape
     with mrcfile.new(path, overwrite=True) as mrc:
-        mrc.set_data(np.array(data).astype(np.float32))
+        mrc.set_data(data_array)
         mrc.voxel_size = apix
+
+        if not centering:
+            mrc.header.origin.x = -(nx / 2.0) * apix
+            mrc.header.origin.y = -(ny / 2.0) * apix
+            mrc.header.origin.z = -(nz / 2.0) * apix
 
 
 @jit
@@ -442,11 +449,10 @@ class RigidEngine:
         print(f"Saving results to {self.out_dir}...")
         all_final_coords = self.get_transformed_coords(self.transformation)
         all_final_coords_np = np.array(all_final_coords)
-        if needsCentering:
-            if not is_aligned:
-                all_final_coords_np = all_final_coords_np - jnp.array(self.vol_shape) * self.apix / 2.0
-            else:
-                all_final_coords_np = all_final_coords_np - self.topo.com
+        if not is_aligned:
+            all_final_coords_np = all_final_coords_np - jnp.array(self.vol_shape) * self.apix / 2.0
+        else:
+            all_final_coords_np = all_final_coords_np - self.topo.com
 
         ext = os.path.splitext(self.topo.pdb_path)[1].lower()
 
@@ -459,7 +465,11 @@ class RigidEngine:
 
         sim_vol = self.rasterizer(jnp.array(all_final_coords_np), self.topo.atom_weights)
         save_mrc(sim_vol.T, self.apix, os.path.join(self.out_dir, f"{output_name}_sim.mrc"))
-        save_mrc(self.vol_raw.T, self.apix, os.path.join(self.out_dir, f"{output_name}_input_norm.mrc"))
+        if needsCentering:
+            save_mrc(self.vol_raw.T, self.apix, os.path.join(self.out_dir, f"{output_name}_center.mrc"), centering=True)
+            save_mrc(self.vol_raw.T, self.apix, os.path.join(self.out_dir, f"{output_name}_input_norm.mrc"), centering=False)
+        else:
+            save_mrc(self.vol_raw.T, self.apix, os.path.join(self.out_dir, f"{output_name}_input_norm.mrc"), centering=False)
 
     def _write_pdb(self, in_path, out_path, coords):
         with open(in_path, 'r') as f_in, open(out_path, 'w') as f_out:
