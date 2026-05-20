@@ -328,12 +328,9 @@ def main():
   parser.add_argument("--ssd_scratch_folder", required=False, type=str,
                         help=f"When the parameter {bcolors.UNDERLINE}load_images_to_ram{bcolors.ENDC} is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from "
                              f"the default disk.")
-  parser.add_argument("--num_gaussians", required=True, type=int,
-                        help="Before training the network, HetSIREN will try to fit a set of Gaussians in the reference volume to recreate it. "
-                            "The default criterium is to automatically determine the number of Gaussians neede to reproduce the reference volume "
-                            "with high-fidelity. However, if you prefer to fix the number of Gaussians in advance based on your own criterium (e.g., "
-                            "the number of residues in your protein), you can set this parameter. When set, the HetSIREN will fit this fixed number of Gaussians "
-                            "so that the reproduce the reference volume as well as possible.")
+  parser.add_argument("--num_gaussians", required=False, type=int, default=5000,
+                        help="Number of Gaussians to fit the input volume to recreate it. This is a crucial step to adjust the grey levels of the input volume to the ones of the images.")
+                        
 
   args, _ = parser.parse_known_args()
 
