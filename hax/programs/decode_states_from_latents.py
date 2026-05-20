@@ -46,10 +46,13 @@ def main():
         return model.decode_volume(x)
 
     # Decode and save the volumes
-    volumes = []
-    for latent in latents:
-        volumes.append(np.array(decode_volume(graphdef, state, latent)))
-
-    # Save volumes to file
-    for idx in range(latents.shape[0]):
-        ImageHandler().write(volumes[idx], os.path.join(args.output_path, f"decoded_volume_{idx:04d}.mrc"), overwrite=True)
+    if latents.ndim > 1:
+        volumes = []
+        for latent in latents:
+            volumes.append(np.array(decode_volume(graphdef, state, latent)))
+        # Save volumes to file
+        for idx in range(latents.shape[0]):
+            ImageHandler().write(volumes[idx], os.path.join(args.output_path, f"decoded_volume_{idx:04d}.mrc"), overwrite=True)
+    else:
+        volume = decode_volume(graphdef, state, latents)
+        ImageHandler().write(volume, os.path.join(args.output_path, f"decoded_volume_00.mrc"), overwrite=True)
