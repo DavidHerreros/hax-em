@@ -463,7 +463,7 @@ class RigidEngine:
             out_file = os.path.join(self.out_dir, f"{output_name}_fitted.pdb")
             self._write_pdb(self.topo.pdb_path, out_file, all_final_coords_np)
 
-        sim_vol = self.rasterizer(jnp.array(all_final_coords_np), self.topo.atom_weights)
+        sim_vol = self.rasterizer(jnp.array(all_final_coords), self.topo.atom_weights)
         save_mrc(sim_vol.T, self.apix, os.path.join(self.out_dir, f"{output_name}_sim.mrc"))
         if needsCentering:
             save_mrc(self.vol_raw.T, self.apix, os.path.join(self.out_dir, f"{output_name}_center.mrc"), centering=True)
