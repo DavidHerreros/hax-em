@@ -466,20 +466,10 @@ def main():
           total_loss = 0
           total_validation_loss = 0
 
-          # For progress bar (TQDM)
-          pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
+          
           # Validation step 
-          pbar.set_postfix_str(f"{bcolors.WARNING}Running validation step...{bcolors.ENDC}")
+          print(f"{bcolors.WARNING}\n###### Running Validation Step... ######{bcolors.ENDC}")
 
-          val_pbar = tqdm(total=steps_per_val, 
-                            file=sys.stdout, 
-                            ascii=" >=",
-                            colour="yellow", 
-                            desc="Validating",
-                            bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}",
-                            leave=False) 
-          
-          
           for _ in range(steps_per_val):
             
             (x_validation, index_validation) = next(iter_data_loader_val)
@@ -516,9 +506,6 @@ def main():
             loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels_validation, train=False)
             total_validation_loss += loss_validation
             
-            val_pbar.update(1)
-
-          val_pbar.close()
 
           avg_val_loss = total_validation_loss / steps_per_val
           pbar.write(f"\n--- End of Validation for Epoch {int((total_steps + 1) / steps_per_epoch)} ---")
@@ -530,7 +517,7 @@ def main():
           i += 1
 
     # Save model
-    NeuralNetworkCheckpointer.save(cryocheck, os.path.join(args.output_path, "cryocheck_model"))
+    NeuralNetworkCheckpointer.save(cryoCheck, os.path.join(args.output_path, "cryocheck_model"))
       
   
   elif args.mode=="predict":
