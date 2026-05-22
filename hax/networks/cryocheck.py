@@ -540,6 +540,9 @@ def main():
 
     # Save model
     NeuralNetworkCheckpointer.save(cryoCheck, os.path.join(args.output_path, "cryoCheck"))
+
+    # Remove checkpoint
+    shutil.rmtree(os.path.join(args.output_path, "cryoCheck_CHECKPOINT"))
       
   
   elif args.mode=="predict":
