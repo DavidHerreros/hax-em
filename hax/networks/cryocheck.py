@@ -18,6 +18,7 @@ from hax import *
 from hax.utils.ctf import computeCTF
 from hax.utils.fourier_filters import ctfFilter
 from hax.utils.euler import euler_matrix_batch
+from hax.utils.decorators import save_config
 
 from hax.programs.gaussian_volume_fitting import fit_volume, adjust_weights_to_images
 
