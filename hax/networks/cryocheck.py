@@ -28,7 +28,6 @@ from hax.programs.gaussian_volume_fitting import fit_volume, adjust_weights_to_i
 class BottleneckBlock(nnx.Module):
 
   expansion = 4
-  @save_config
   def __init__(self, in_channels, out_channels, rngs:nnx.Rngs, stride = 1, downsample=True):   
 
     self.in_channels = in_channels
@@ -80,6 +79,7 @@ class BottleneckBlock(nnx.Module):
 
 
 class CryoCheck(nnx.Module):
+  @save_config
   def __init__ (self, rngs:nnx.Rngs, block=BottleneckBlock, layers=[3, 4, 6, 3], num_classes=1):
     
     self.in_channels = 64
