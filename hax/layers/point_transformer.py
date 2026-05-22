@@ -1,39 +1,3 @@
-"""
-Point Transformer decoder for CryoEM structural heterogeneity analysis.
-
-This implementation includes three optional architectural changes designed
-to suppress per-Gaussian noise at high N (5000-10000 Gaussians):
-
-  1. ``predict_at_coarse_level``:  the head outputs deltas at the
-     n2=1024 hierarchy level, which are then interpolated to N points
-     using fixed Gaussian-weighted interpolation.  Per-Gaussian deltas
-     are no longer independent parameters of the model, so per-particle
-     noise can't be absorbed into them.
-
-  2. ``head_rank``:  factorize the head's output projection through a
-     low-rank bottleneck.  The output deltas live in a r-dimensional
-     basis shared across all points, encoding the prior that real
-     protein motions are low-rank (a small number of "modes").
-
-  3. ``use_local_frames``:  the head outputs deltas in a per-Gaussian
-     local coordinate frame (PCA of each Gaussian's neighborhood),
-     which is then rotated back to global coordinates.  Encodes the
-     prior that motions tend to be along structural axes (helices,
-     sheets) rather than in arbitrary global directions.
-
-Each flag is independent; you can ablate them by toggling individually.
-
-Output API
-----------
-``out_channels`` may be an ``int`` (single output array of that channel
-count) or a tuple/list of ints (one independent head per entry, returned
-as an ``nnx.List``).
-
-When ``use_local_frames=True``, the FIRST head must produce exactly 3
-output channels (the position delta), since local-frame rotation only
-makes sense for spatial outputs.  Amplitude/sigma heads are unaffected.
-"""
-
 from __future__ import annotations
 from typing import Sequence, Union
 
@@ -43,16 +7,10 @@ import numpy as np
 from flax import nnx, struct
 
 
-# ---------------------------------------------------------------------------
-# Small helpers
-# ---------------------------------------------------------------------------
-
 default_kernel_init = nnx.initializers.lecun_normal()
 
 
 class MLP(nnx.Module):
-    """Two-layer MLP, configurable hidden size, ReLU between, no norm."""
-
     def __init__(
         self,
         in_dim: int,
@@ -76,10 +34,6 @@ class MLP(nnx.Module):
     def __call__(self, x):
         return self.fc2(nnx.relu(self.fc1(x)))
 
-
-# ---------------------------------------------------------------------------
-# Point Transformer layer
-# ---------------------------------------------------------------------------
 
 class PointTransformerLayer(nnx.Module):
     def __init__(self, dim: int, nk: int = 512, *, rngs: nnx.Rngs,
@@ -133,10 +87,6 @@ class PTBlock(nnx.Module):
         return y0 + yk
 
 
-# ---------------------------------------------------------------------------
-# Transition Up — feature upsampler used by the trunk
-# ---------------------------------------------------------------------------
-
 class TransitionUp(nnx.Module):
     def __init__(self, in_dim: int, out_dim: int, *, rngs: nnx.Rngs):
         self.proj = nnx.Linear(in_dim, out_dim, dtype=jnp.bfloat16, rngs=rngs)
@@ -159,29 +109,8 @@ def interp_no_proj(x_coarse, upsample_idx, upsample_w):
     return jnp.sum(gathered * upsample_w[None, :, :, None], axis=2)
 
 
-# ---------------------------------------------------------------------------
-# Geometry
-# ---------------------------------------------------------------------------
-
 @struct.dataclass
 class Geometry:
-    """All pre-computed geometry tables.
-
-    Beyond the standard fields we add two optional ones used by the new
-    architectural toggles:
-
-    * ``local_frames``:  list-wrapped (N, 3, 3) per-Gaussian rotation
-      matrix array, taking "local frame" deltas to "global frame"
-      deltas.  Used by ``use_local_frames=True``.  Stored as a list of
-      one tensor (rather than a bare tensor) so that Orbax can restore
-      it in-place via list-element mutation — the dataclass itself is
-      immutable.  If unused, contains a single (1, 1, 1) dummy.
-    * ``coarse_to_fine_idx`` /
-      ``coarse_to_fine_w``: indices and weights for the n2 -> N output
-      interpolation.  Used by ``predict_at_coarse_level=True``.
-      Identical to ``up_idx[-1]`` / ``up_w[-1]`` (just renamed for
-      clarity at the call site).
-    """
     positions:  list
     neighbours: list
     rel_pos:    list
@@ -189,15 +118,7 @@ class Geometry:
     up_w:       list
     res_idx:    list
     res_w:      list
-    # New optional field.  Wrapped in a list of length 1 so that the
-    # restore path can mutate `geom.local_frames[0] = ...` rather than
-    # trying to replace the immutable dataclass attribute.
     local_frames: list
-
-
-# ---------------------------------------------------------------------------
-# Low-rank head: Linear -> small r-dim basis projection -> shared basis
-# ---------------------------------------------------------------------------
 
 class LowRankHead(nnx.Module):
     """Output head with explicit rank-r factorization.
@@ -232,24 +153,7 @@ class LowRankHead(nnx.Module):
         return c @ self.basis.get_value()
 
 
-# ---------------------------------------------------------------------------
-# Decoder
-# ---------------------------------------------------------------------------
-
 class PointTransformerDecoder(nnx.Module):
-    """Point Transformer decoder of GMM parameters.
-
-    See the module docstring for an overview of the three architectural
-    flags this class adds:
-
-      * ``predict_at_coarse_level``  (default True)
-      * ``head_rank``                (default None = full rank)
-      * ``use_local_frames``         (default False)
-
-    With all three off the model is equivalent to the previous
-    reference-faithful implementation.
-    """
-
     def __init__(
         self,
         latent_dim: int,
@@ -263,7 +167,6 @@ class PointTransformerDecoder(nnx.Module):
         input_dropout: float = 0.1,
         attn_dropout: float = 0.2,
         mid_dropout: float = 0.2,
-        # --- new architectural toggles ---
         predict_at_coarse_level: bool = True,
         head_rank: int | None = None,
         use_local_frames: bool = False,
@@ -295,7 +198,7 @@ class PointTransformerDecoder(nnx.Module):
                     "output exactly 3 channels (position delta)."
                 )
 
-        # Input MLP:  z -> 128 -> relu -> dropout -> n0*feat -> reshape
+        # Input MLP:  z -> 128 -> relu -> dropout -> n0 * feat -> reshape
         self.in_lin1 = nnx.Linear(latent_dim, input_bottleneck,
                                   dtype=jnp.bfloat16, rngs=rngs)
         self.in_dropout = nnx.Dropout(input_dropout, rngs=rngs)
@@ -314,22 +217,14 @@ class PointTransformerDecoder(nnx.Module):
         self.tu1 = TransitionUp(feat_dim, feat_dim, rngs=rngs)
         self.tu2 = TransitionUp(feat_dim, feat_dim, rngs=rngs)
 
-        # tu3 (n2 -> N) is only used in the OLD (per-point) prediction mode.
-        # In the new coarse-level mode we apply the head at n2 and use
-        # parameter-free interpolation to N for the output deltas.
         if not predict_at_coarse_level:
             self.tu3 = TransitionUp(feat_dim, feat_dim, rngs=rngs)
 
         # Residual upsamplers (n0, n1) -> {N or n2 depending on mode}
-        # The output of the trunk is concatenated at the level the head
-        # operates on, so the residual upsamplers must end at that level.
         self.res_up1 = TransitionUp(feat_dim, feat_dim, rngs=rngs)
         self.res_up2 = TransitionUp(feat_dim, feat_dim, rngs=rngs)
 
-        # ---- head construction ----
-        # In the coarse-level mode the head operates on n2 points; in the
-        # per-point mode it operates on N.  The head architecture is the
-        # same in either case, only its input *spatial* size differs.
+        # Head construction
         def _make_head(c):
             if head_rank is not None:
                 return LowRankHead(
@@ -391,15 +286,13 @@ class PointTransformerDecoder(nnx.Module):
                          deterministic=deterministic)        # (B, n2, feat)
 
         if self.predict_at_coarse_level:
-            # Path A (NEW): apply head at n2, then interpolate deltas to N.
-            # Residuals upsampled from (n0, n1) -> n2 (via res_idx tables).
             x1_up = self.res_up1(y0k_1, geom.res_idx[0], geom.res_w[0])
             x2_up = self.res_up2(y0k_2, geom.res_idx[1], geom.res_w[1])
 
             cat = jnp.concatenate([y0_n2, x1_up, x2_up], axis=-1)
             cat = cat.astype(jnp.float32)                    # (B, n2, 3*feat)
 
-            # Apply head AT THE COARSE LEVEL
+            # Apply head (coarse level)
             if self._multi_head:
                 outs_coarse = [h(cat) for h in self.head]
             else:
@@ -418,69 +311,42 @@ class PointTransformerDecoder(nnx.Module):
                     outs_coarse, geom.up_idx[2], geom.up_w[2]
                 )
         else:
-            # Path B (LEGACY): residuals at n2, then everything to N.
             x_main = self.tu3(y0_n2, geom.up_idx[2], geom.up_w[2])
             x1_at_n2 = self.res_up1(y0k_1, geom.res_idx[0], geom.res_w[0])
             x2_at_n2 = self.res_up2(y0k_2, geom.res_idx[1], geom.res_w[1])
-            # Bring residuals from n2 to N using parameter-free interp.
             x1_up = interp_no_proj(x1_at_n2, geom.up_idx[2], geom.up_w[2])
             x2_up = interp_no_proj(x2_at_n2, geom.up_idx[2], geom.up_w[2])
 
             cat = jnp.concatenate([x_main, x1_up, x2_up], axis=-1)
-            cat = cat.astype(jnp.float32)                    # (B, N, 3*feat)
+            cat = cat.astype(jnp.float32)                    # (B, N, 3 * feat)
 
             if self._multi_head:
                 outs = [self.output_scale * h(cat) for h in self.head]
             else:
                 outs = self.output_scale * self.head(cat)
 
-        # ---- local-frame rotation (applied to position deltas only) ----
+        # Local-frame rotation
         if self.use_local_frames:
-            # geom.local_frames is a list of one (N, 3, 3) tensor
-            # (list-wrapped for serialization-friendly mutation).
             frames = geom.local_frames[0]                    # (N, 3, 3)
             if isinstance(outs, list):
-                # First head is positions -> (B, N, 3)
                 pos = outs[0]
-                # Rotate: out_global[b, n, :] = frames[n] @ pos[b, n, :]
                 pos_rotated = jnp.einsum("nij,bnj->bni", frames, pos)
                 outs = [pos_rotated] + outs[1:]
             else:
-                # Single head, must be (B, N, 3)
                 outs = jnp.einsum("nij,bnj->bni", frames, outs)
 
         return outs
 
 
-# ---------------------------------------------------------------------------
-# Geometry pre-computation
-# ---------------------------------------------------------------------------
-
 def _compute_local_frames(positions: np.ndarray,
                           neighbours: np.ndarray) -> np.ndarray:
-    """For each point, compute a 3x3 rotation matrix via PCA of its
-    k-nearest neighbours.
-
-    The columns of the returned matrix are the local axes (largest-,
-    medium-, smallest-variance directions).  Multiplying a "local"
-    vector by this matrix yields its "global" expression.
-
-    Returns shape (N, 3, 3).  At init, applying these frames to small
-    random deltas produces small random global deltas with the same
-    statistics, so this is a structure-preserving change of coordinates.
-    """
     N = positions.shape[0]
-    K = neighbours.shape[1]
     frames = np.zeros((N, 3, 3), dtype=np.float32)
     for i in range(N):
         nbrs = positions[neighbours[i]]                  # (K, 3)
         centered = nbrs - nbrs.mean(axis=0, keepdims=True)
-        # SVD-based PCA — numerically stable and works for K >= 3.
         _, _, vh = np.linalg.svd(centered, full_matrices=False)
-        # vh rows are the principal directions, ordered by descending variance.
-        # Build R so that columns are local axes; then global = R @ local.
         R = vh.T                                          # (3, 3)
-        # Ensure right-handed (det > 0)
         if np.linalg.det(R) < 0:
             R[:, -1] *= -1
         frames[i] = R
@@ -530,7 +396,7 @@ def build_geometry(
     assert hierarchical_sizes[-1] < N, \
         "the last PT layer must be coarser than the final GMM"
 
-    # ---- hierarchical point sets via k-means, snapped to actual GMM
+    # Hierarchical point via k-means
     coarse_positions: list[np.ndarray] = []
     for n in hierarchical_sizes:
         km = KMeans(n_clusters=n, n_init=10, max_iter=100,
@@ -542,7 +408,7 @@ def build_geometry(
         coarse_positions.append(snapped)
     all_positions = coarse_positions + [gmm_positions]
 
-    # ---- k-NN inside each PT layer (for self-attention)
+    # k-NN inside each PT layer (for self-attention)
     neighbours, rel_pos = [], []
     for p in coarse_positions:
         nn_ = NearestNeighbors(n_neighbors=k_attn).fit(p)
@@ -551,7 +417,7 @@ def build_geometry(
         neighbours.append(jnp.asarray(idx))
         rel_pos.append(jnp.asarray(rel))
 
-    # ---- auto gauss_scale
+    # auto gauss_scale
     if isinstance(gauss_scale, str):
         assert gauss_scale == "auto"
         coarse_probe, fine_probe = all_positions[-2], all_positions[-1]
@@ -568,7 +434,7 @@ def build_geometry(
         w = np.exp(logits).astype(np.float32)
         return w / w.sum(axis=1, keepdims=True)
 
-    # ---- sequential upsampling P_i -> P_{i+1}
+    # Sequential upsampling P_i -> P_{i+1}
     up_idx, up_w = [], []
     for i in range(len(all_positions) - 1):
         coarse, fine = all_positions[i], all_positions[i + 1]
@@ -577,21 +443,7 @@ def build_geometry(
         up_idx.append(jnp.asarray(idx.astype(np.int32)))
         up_w.append(jnp.asarray(_gaussian_weights(d)))
 
-    # ---- residual upsampling P_0 -> N and P_1 -> N.
-    # NOTE: when predict_at_coarse_level=True the residuals are
-    # consumed at the *n2* level rather than at N, so we want
-    # P_0 -> n2 and P_1 -> n2.  But we don't know which mode the user
-    # will pick at geometry-build time.  Solution: store BOTH paths
-    # (to n2 and to N) — but that doubles the geometry size for a small
-    # gain.  Simpler: store paths to N, and use the existing up_idx[1]
-    # / up_idx[2] tables to route through n2 when in coarse-level mode.
-    #
-    # Decision: we store paths *to n2*, since that's the more
-    # information-conservative target (interpolating to n2 then
-    # parameter-free expanding to N preserves locality better than
-    # interpolating directly to N).  For legacy mode we route via
-    # the existing tu3 path anyway, so this only affects how the
-    # *residuals* end up.
+    # Residual upsampling P_0 -> N and P_1 -> N.
     res_idx, res_w = [], []
     fine_for_res = all_positions[2]                     # n2-level points
     for i in (0, 1):
@@ -601,7 +453,7 @@ def build_geometry(
         res_idx.append(jnp.asarray(idx.astype(np.int32)))
         res_w.append(jnp.asarray(_gaussian_weights(d)))
 
-    # ---- local frames (optional)
+    # Local frames (optional)
     if compute_local_frames:
         nn_frame = NearestNeighbors(n_neighbors=k_frame).fit(gmm_positions)
         frame_idx = nn_frame.kneighbors(gmm_positions, return_distance=False)
