@@ -277,7 +277,7 @@ def main():
   import random
   import numpy as np
   import argparse
-  #import shutil
+  import shutil
   from xmipp_metadata.image_handler import ImageHandler
   import optax
   from contextlib import closing
