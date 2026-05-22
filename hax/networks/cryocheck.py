@@ -284,7 +284,7 @@ def main():
   from hax.checkpointer import NeuralNetworkCheckpointer
   from hax.generators import MetaDataGenerator, extract_columns
   #from hax.networks import train_step_volume_adjustment
-  #from hax.metrics import JaxSummaryWriter
+  from hax.metrics import JaxSummaryWriter
 
   def list_of_floats(arg):
         return list(map(float, arg.split(',')))
@@ -351,12 +351,15 @@ def main():
 
   # Reload network
   if args.reload is not None:
-      cryoCheck = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "Trained_CryoCheck"))
+      cryoCheck = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "cryoCheck"))
 
   ### Train network ###
   if args.mode == "train":
     
     cryoCheck.train()
+
+    # Prepare summary writer
+    writer = JaxSummaryWriter(os.path.join(args.output_path, "CryoCheck_metrics"))
 
     # Load metadata
     generator = MetaDataGenerator(args.md)
@@ -407,12 +410,19 @@ def main():
     # Optimizer
     optimizer = nnx.Optimizer(cryoCheck, optax.adamw(args.learning_rate), wrt=nnx.Param)
 
+    # Resume if checkpoint exists
+    if os.path.isdir(os.path.join(args.output_path, "cryoCheck_CHECKPOINT")):
+      graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "cryoCheck_CHECKPOINT"), optimizer)
+      cryoCheck, optimizer = nnx.merge(graphdef, state)
+      print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
+    else:
+      resume_epoch = 0
 
     #TRAINING LOOP
     print(f"{bcolors.OKCYAN}\n###### Training CryoCheck... ######") 
 
     i = 0 
-    pbar = tqdm(range(args.epochs * steps_per_epoch), file=sys.stdout, ascii=" >=",
+    pbar = tqdm(range(resume_epoch * steps_per_epoch, args.epochs * steps_per_epoch), file=sys.stdout, ascii=" >=",
                     colour="green",
                     bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
   
@@ -452,7 +462,6 @@ def main():
 
         loss, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs, labels=labels, train=True)
         total_loss += loss
-        
 
 
         #VALIDATION STEP at the end of each epoch  
@@ -462,6 +471,11 @@ def main():
           avg_train_loss = total_loss / steps_per_epoch
           pbar.write(f"\n--- End of Training for Epoch {int((total_steps + 1) / steps_per_epoch)} ---")
           pbar.write(f" Loss: {avg_train_loss:.4f}")
+
+          writer.add_scalars('Training loss (cryocheck)',
+                                       {"train": avg_train_loss},
+                                       total_steps + 1)
+        
 
           total_loss = 0
           total_validation_loss = 0
@@ -506,18 +520,25 @@ def main():
             loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels_validation, train=False)
             total_validation_loss += loss_validation
             
-
+      
           avg_val_loss = total_validation_loss / steps_per_val
           pbar.write(f"\n--- End of Validation for Epoch {int((total_steps + 1) / steps_per_epoch)} ---")
           pbar.write(f" Loss validation: {avg_val_loss:.4f}")
           pbar.write(f"-------------------------------------------\n")
 
-          
+          writer.add_scalars('Training loss (cryocheck)',
+                                           {"validation": avg_val_loss},
+                                           total_steps + 1)
+
+          # Save checkpoint model at each epoch
+          graphdef, state = nnx.split((cryoCheck, optimizer))
+          NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "cryoCheck_CHECKPOINT"),
+                                                      epoch=i)  
 
           i += 1
 
     # Save model
-    NeuralNetworkCheckpointer.save(cryoCheck, os.path.join(args.output_path, "cryocheck_model"))
+    NeuralNetworkCheckpointer.save(cryoCheck, os.path.join(args.output_path, "cryoCheck"))
       
   
   elif args.mode=="predict":
