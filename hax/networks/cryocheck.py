@@ -284,7 +284,6 @@ def main():
   from hax.utils.loggers import bcolors
   from hax.checkpointer import NeuralNetworkCheckpointer
   from hax.generators import MetaDataGenerator, extract_columns
-  #from hax.networks import train_step_volume_adjustment
   from hax.metrics import JaxSummaryWriter
 
   def list_of_floats(arg):
@@ -408,16 +407,16 @@ def main():
     steps_per_epoch = int(int(args.dataset_split_fraction[0] * len(generator.md)) / args.batch_size) 
     steps_per_val = int(int(args.dataset_split_fraction[1] * len(generator.md)) / args.batch_size)
 
-    # Optimizer
-    optimizer = nnx.Optimizer(cryoCheck, optax.adamw(args.learning_rate), wrt=nnx.Param)
-
     # Resume if checkpoint exists
     if os.path.isdir(os.path.join(args.output_path, "cryoCheck_CHECKPOINT")):
       graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "cryoCheck_CHECKPOINT"), optimizer)
-      cryoCheck, optimizer = nnx.merge(graphdef, state)
+      cryoCheck = nnx.merge(graphdef, state)
       print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
     else:
       resume_epoch = 0
+
+    # Optimizer
+    optimizer = nnx.Optimizer(cryoCheck, optax.adamw(args.learning_rate), wrt=nnx.Param)
 
     #TRAINING LOOP
     print(f"{bcolors.OKCYAN}\n###### Training CryoCheck... ######") 
@@ -532,7 +531,7 @@ def main():
                                            total_steps + 1)
 
           # Save checkpoint model at each epoch
-          graphdef, state = nnx.split((cryoCheck, optimizer))
+          graphdef, state = nnx.split((cryoCheck))
           NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "cryoCheck_CHECKPOINT"),
                                                       epoch=i)  
 
