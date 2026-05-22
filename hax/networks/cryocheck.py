@@ -410,7 +410,8 @@ def main():
     # Resume if checkpoint exists
     if os.path.isdir(os.path.join(args.output_path, "cryoCheck_CHECKPOINT")):
       graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "cryoCheck_CHECKPOINT"), optimizer)
-      cryoCheck = nnx.merge(graphdef, state)
+      training_bundle = nnx.merge(graphdef, state)
+      cryoCheck = training_bundle[0]
       print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
     else:
       resume_epoch = 0
@@ -531,7 +532,7 @@ def main():
                                            total_steps + 1)
 
           # Save checkpoint model at each epoch
-          graphdef, state = nnx.split((cryoCheck))
+          graphdef, state = nnx.split((cryoCheck,))
           NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "cryoCheck_CHECKPOINT"),
                                                       epoch=i)  
 
