@@ -1,4 +1,4 @@
-from .losses import simae, correlation_coefficient_loss, ncc_loss, gradient_loss, diceLoss, contrastive_ce_loss, triplet_loss, sliced_wasserstein_loss
+from .losses import simae, correlation_coefficient_loss, ncc_loss, gradient_loss, diceLoss, contrastive_ce_loss, triplet_loss, sliced_wasserstein_loss, FRCLoss
 from .geometric_losses import calculate_deformation_regularity_loss, calculate_outlier_loss, calculate_neighbour_loss, calculate_repulsion_loss, calculate_deformation_coherence_loss
 from .ctf import computeCTF
 from .euler import euler_matrix_batch, euler_from_matrix
@@ -19,6 +19,6 @@ from .reconstruction import reconstruct_volume_streaming
 from .optimal_transport_functions import compute_swd_matrix
 from .plots import plot_angular_distribution
 from .hyperparameter_tuning import find_max_batch_size
-from .image_transformations import apply_batch_translations, prepare_image_cryocrab
+from .image_transformations import apply_batch_translations, prepare_image_cryocrab, prepare_image_wiener
 from .jax_tsp import solve_tsp_simulated_annealing_jax, solve_tsp_local_search_jax
 from .decorators import save_config
