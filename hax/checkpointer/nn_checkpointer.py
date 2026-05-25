@@ -69,7 +69,6 @@ class NeuralNetworkCheckpointer:
             cloudpickle.dump((config, epoch), binary_file)
 
         # Save model state
-        _, state = nnx.split(model)
         checkpointer = ocp.StandardCheckpointer()
         checkpointer.save(checkpoint_path / 'state', state)
         checkpointer.wait_until_finished()
@@ -93,11 +92,11 @@ class NeuralNetworkCheckpointer:
 
         # Restore state
         checkpointer = ocp.StandardCheckpointer()
-        _, state = nnx.split(model)
+        _, state = nnx.split(training_bundle)
         restored_state = checkpointer.restore(checkpoint_path / 'state', state)
         nnx.update(training_bundle, restored_state)
 
         if return_as_model:
             return *training_bundle, epoch
         else:
-            return *nnx.split(model), epoch
+            return *nnx.split(training_bundle), epoch
