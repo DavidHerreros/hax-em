@@ -118,8 +118,8 @@ class CryoCheck(nnx.Module):
 
     return nnx.Sequential(*layers)
 
-
-  def __call__(self,x):
+  @nnx.jit(static_argnames='eval')
+  def __call__(self,x, eval=True):
     if x.ndim == 3:
       # if x is (N,H,W) add a channel dimension
       x=jnp.expand_dims(x, -1)
@@ -152,6 +152,9 @@ class CryoCheck(nnx.Module):
     x = jnp.mean(x, axis=(1,2))
     x = self.fc(x)
 
+    if eval:
+      x = nnx.sigmoid(x)
+
     return x
   
 
@@ -161,7 +164,7 @@ class CryoCheck(nnx.Module):
 def cryoCheck_step(model, optimizer, x, labels,*, train: bool):
 
     def loss_fn(model, x, labels):
-        logits = model(x)
+        logits = model(x, eval=False)  # Get raw logits for loss computation
         # Binary cross entropy
         loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, labels)) #avg loss per batch
 
@@ -351,15 +354,15 @@ def main():
 
   # Reload network
   if args.reload is not None:
-      cryoCheck = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "cryoCheck"))
+      #cryoCheck = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "cryoCheck"))
+      cryoCheck = NeuralNetworkCheckpointer.load(args.reload)
 
   ### Train network ###
   if args.mode == "train":
     
     cryoCheck.train()
-
     # Prepare summary writer
-    writer = JaxSummaryWriter(os.path.join(args.output_path, "CryoCheck_metrics"))
+    writer = JaxSummaryWriter(os.path.join(args.output_path, "cryoCheck_metrics"))
 
     # Load metadata
     generator = MetaDataGenerator(args.md)
@@ -417,7 +420,7 @@ def main():
       resume_epoch = 0
 
     # Optimizer
-    optimizer = nnx.Optimizer(cryoCheck, optax.adamw(args.learning_rate), wrt=nnx.Param)
+    optimizer = nnx.Optimizer(cryoCheck, optax.adamw(args.learning_rate), wrt=nnx.Param)  # optax.sgd
 
     #TRAINING LOOP
     print(f"{bcolors.OKCYAN}\n###### Training CryoCheck... ######") 
@@ -443,7 +446,12 @@ def main():
                                  euler_angles=euler_angles,
                                  shifts=shifts,
                                  ctf=ctf) - x)
-        aligned_labels = jnp.ones((batch_size,1))
+     #   aligned_imgs = jnp.abs(Preprocessing(vol=vol,
+     #                            mask=mask,
+     #                            euler_angles=euler_angles,
+     #                            shifts=shifts,
+     #                            ctf=jnp.ones_like(ctf)) - wiener2DFilter(x[..., 0], ctf)[..., None])
+        aligned_labels = jnp.ones((batch_size,1)) #label for aligned imgs is 1
 
         # Misaligned images - Data Augmentation
         rngs, subkey = jax.random.split(rngs)
@@ -455,7 +463,7 @@ def main():
                                  euler_angles=euler_angles_noisy,
                                  shifts=shifts,
                                  ctf=ctf) - x)
-        misaligned_labels = jnp.zeros((batch_size,1))
+        misaligned_labels = jnp.zeros((batch_size,1)) #label for misaligned imgs is 0
       
        
         imgs=jnp.concatenate([aligned_imgs, misaligned_imgs], axis=0)
@@ -468,7 +476,7 @@ def main():
         #VALIDATION STEP at the end of each epoch  
         if (total_steps + 1) % steps_per_epoch == 0:    
          
-           # average training loss at the end of each epoch 
+          # average training loss at the end of each epoch 
           avg_train_loss = total_loss / steps_per_epoch
           pbar.write(f"\n--- End of Training for Epoch {int((total_steps + 1) / steps_per_epoch)} ---")
           pbar.write(f" Loss: {avg_train_loss:.4f}")
@@ -481,6 +489,8 @@ def main():
           total_loss = 0
           total_validation_loss = 0
 
+          val_score = []
+          val_labels = []
           
           # Validation step 
           print(f"{bcolors.WARNING}\n###### Running Validation Step... ######{bcolors.ENDC}")
@@ -521,7 +531,24 @@ def main():
             loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels_validation, train=False)
             total_validation_loss += loss_validation
             
-      
+            val_score.append(predict_fn(imgs_validation,eval=True)) #predictions for the validation step
+            val_labels.append(labels_validation)
+            
+          val_score_np = np.array(val_score).flatten()
+          val_labels_np = np.array(val_labels).flatten()
+          
+          val_score = jnp.concatenate(val_score, axis=0)
+          val_labels = jnp.concatenate(val_labels, axis=0)
+
+          # Roc Curve and Confision Matrix
+
+          #writer.add_roc_curve(val_labels, val_score, global_step=i)
+          optimal_threshold = writer.add_roc_curve(val_labels, val_score, global_step=i)
+           
+          val_score_heavy = val_score > optimal_threshold
+          writer.add_confusion_matrix(val_labels, val_score_heavy, global_step=i)
+
+
           avg_val_loss = total_validation_loss / steps_per_val
           pbar.write(f"\n--- End of Validation for Epoch {int((total_steps + 1) / steps_per_epoch)} ---")
           pbar.write(f" Loss validation: {avg_val_loss:.4f}")
@@ -560,6 +587,7 @@ def main():
     
     # Jitted prediction function
     predict_fn = nnx.jit(cryoCheck.__call__)
+    #predict_fn = nnx.jit(lambda x: cryoCheck(x))
 
     # PREDICTION LOOP
     print(f"{bcolors.OKCYAN}\n###### Predicting CryoCheck... ######")
@@ -581,13 +609,17 @@ def main():
                                  ctf=ctf) - x)
       
       
-      predictions = predict_fn(prediction_imgs)
+      predictions = predict_fn(prediction_imgs,eval=True)
+      #predictions = cryoCheck(prediction_imgs)
 
-    labels_prediction.append(np.array(predictions))
+      labels_prediction.append(np.array(predictions))
+
     final_predictions = np.concatenate(labels_prediction, axis=0)
+    final_predictions_heavy = final_predictions > optimal_threshold
     
     # Save results 
-    md=generator.md # md_columns?
+    md=generator.md 
     md[:, "misalignment_score"] = final_predictions
+    md[:, "misalignment_score_heavy"] = final_predictions_heavy
     md.write(os.path.join(args.output_path, "md_final_predictions" +  os.path.splitext(args.md)[1]))
 
