@@ -74,7 +74,7 @@ class NeuralNetworkCheckpointer:
         checkpointer.wait_until_finished()
 
     @classmethod
-    def load_intermediate(cls, checkpoint_path, *optimizers: nnx.Optimizer, return_as_model=False):
+    def load_intermediate(cls, checkpoint_path, *optimizers: nnx.Optimizer, return_as_model=False, load_model_only=False):
         checkpoint_path = epath.Path(os.path.abspath(os.path.join(checkpoint_path, 'checkpoints')))
 
         with open(checkpoint_path / "config", "rb") as binary_file:
@@ -88,13 +88,26 @@ class NeuralNetworkCheckpointer:
         model = model_class(**config, rngs=nnx.Rngs(jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))))
 
         # Training bundle
-        training_bundle = (model, *optimizers)
+        if load_model_only:
+            training_bundle = model
+        else:
+            training_bundle = (model, *optimizers)
 
         # Restore state
-        checkpointer = ocp.StandardCheckpointer()
-        _, state = nnx.split(training_bundle)
-        restored_state = checkpointer.restore(checkpoint_path / 'state', state)
-        nnx.update(training_bundle, restored_state)
+        graphdef, state = nnx.split(training_bundle)
+        if load_model_only:
+            checkpointer = ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
+            sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
+            partial_target = {0: state}
+            restore_args = jax.tree.map(lambda _: ocp.ArrayRestoreArgs(sharding=sharding), partial_target)
+            restored_state = checkpointer.restore(checkpoint_path / 'state', args=ocp.args.PyTreeRestore(item=partial_target,
+                                                                                                         restore_args=restore_args,
+                                                                                                         partial_restore=True))
+            training_bundle = (nnx.merge(graphdef, restored_state[0]),)
+        else:
+            checkpointer = ocp.StandardCheckpointer()
+            restored_state = checkpointer.restore(checkpoint_path / 'state', state)
+            nnx.update(training_bundle, restored_state)
 
         if return_as_model:
             return *training_bundle, epoch
