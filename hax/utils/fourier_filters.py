@@ -4,6 +4,7 @@ from jax.scipy.ndimage import map_coordinates
 from flax import nnx
 import numpy as np
 from scipy import signal
+from functools import partial
 
 
 class FastVariableBlur2D(nnx.Module):
@@ -66,6 +67,67 @@ def low_pass_3d(x, std=1.0, kernel_size=9):
     ft_x = jnp.fft.fftn(x)
     ft_x = ft_x * ft_kernel
     return jnp.fft.ifftn(ft_x).real
+
+
+def _radial_frequency_grid(shape, pixel_size_A):
+    """|k| in 1/A on the (H, W) grid, in unshifted FFT layout."""
+    fy = jnp.fft.fftfreq(shape[0], d=pixel_size_A)  # cycles / A
+    fx = jnp.fft.fftfreq(shape[1], d=pixel_size_A)
+    ky, kx = jnp.meshgrid(fy, fx, indexing="ij")
+    return jnp.sqrt(ky ** 2 + kx ** 2)
+
+
+def _bandpass_response(k, k_hp, k_lp, filter_type, order):
+    """Multiplicative frequency response in [0, 1], same shape as k."""
+    hp = jnp.ones_like(k)
+    lp = jnp.ones_like(k)
+
+    if filter_type == "gaussian":
+        if k_hp is not None:
+            hp = 1.0 - jnp.exp(-0.5 * (k / k_hp) ** 2)  # 0 at DC, ->1 above k_hp
+        if k_lp is not None:
+            lp = jnp.exp(-0.5 * (k / k_lp) ** 2)  # 1 at DC, ->0 above k_lp
+
+    elif filter_type == "butterworth":
+        if k_hp is not None:
+            safe_k = jnp.where(k > 0, k, 1.0)  # avoid 0/0 at DC
+            hp = 1.0 / (1.0 + (k_hp / safe_k) ** (2 * order))
+            hp = jnp.where(k > 0, hp, 0.0)  # exactly 0 at DC
+        if k_lp is not None:
+            lp = 1.0 / (1.0 + (k / k_lp) ** (2 * order))
+
+    else:
+        raise ValueError(f"unknown filter_type: {filter_type!r}")
+
+    return hp * lp
+
+
+@partial(jax.jit, static_argnames=("highpass_A", "lowpass_A", "filter_type", "order"))
+def bandpass_filter(image, pixel_size_A, highpass_A=40.0, lowpass_A=None,
+                    filter_type="gaussian", order=4):
+    """Band-pass a real-space image or stack of images.
+
+    Args:
+        image: real array with shape (H, W) or (..., H, W). Leading batch
+            dims are handled automatically (jnp.fft.fft2 acts on the last 2).
+        pixel_size_A: pixel spacing in Angstrom.
+        highpass_A: suppress features COARSER than this (Angstrom) -> kills the
+            membrane. Set it to the membrane scale, ~30-50 A. None disables it.
+        lowpass_A: suppress features FINER than this (Angstrom) -> kills noise.
+            None disables it.
+        filter_type: "gaussian" (ringing-free) or "butterworth" (flatter
+            passband, sharper edge, slight ringing at high order).
+        order: Butterworth order (ignored when filter_type == "gaussian").
+
+    Returns:
+        Filtered real array, same shape and dtype family as input.
+    """
+    k = _radial_frequency_grid(image.shape[-2:], pixel_size_A)
+    k_hp = None if highpass_A is None else 1.0 / highpass_A
+    k_lp = None if lowpass_A is None else 1.0 / lowpass_A
+    resp = _bandpass_response(k, k_hp, k_lp, filter_type, order)  # (H, W)
+    f = jnp.fft.fft2(image)  # over last 2 axes, broadcasts batch
+    return jnp.real(jnp.fft.ifft2(f * resp))
 
 def bspline_3d(x):
     size = x.shape[0]
