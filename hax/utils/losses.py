@@ -590,3 +590,12 @@ def recommended_band(
         f"computed minpx={minpx} >= maxpx={maxpx}; check inputs"
     )
     return minpx, maxpx
+
+
+def chamfer_distance(x, y):
+    # x: (N, D), y: (M, D) — N and M can differ
+    diff = x[:, None, :] - y[None, :, :]      # (N, M, D)
+    d2 = jnp.sum(diff ** 2, axis=-1)          # (N, M) squared distances
+    x_to_y = jnp.min(d2, axis=1)              # (N,) nearest y for each x
+    y_to_x = jnp.min(d2, axis=0)              # (M,) nearest x for each y
+    return jnp.mean(x_to_y) + jnp.mean(y_to_x)
