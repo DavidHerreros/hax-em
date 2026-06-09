@@ -5,5 +5,5 @@ from .attention import Attention
 from .hypernetworks import HyperLinear
 from .nnx_wrappers import Linear, Conv, ConvTranspose
 from .pose import PoseDistMatrix, sample_topM_R, importance_weights
-from .point_transformer import PointTransformerDecoder, build_geometry
+from .point_transformer import PointTransformerDecoder, build_geometry, PointCloudEncoder, fps_resample_batched
 from .memory_bank import MemoryBank
