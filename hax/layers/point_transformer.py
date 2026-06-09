@@ -1,5 +1,6 @@
 from __future__ import annotations
 from typing import Sequence, Union
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -472,3 +473,144 @@ def build_geometry(
         res_w=list(res_w),
         local_frames=local_frames,
     )
+
+
+@partial(jax.jit, static_argnums=(1,))
+def farthest_point_sample(points, n_samples, start_idx=0):
+    """Farthest-point sampling -> indices of a near-uniform subset of the support.
+
+    points:    (N, D)
+    n_samples: int (<= N)  -- fixed output size, good for batching net2
+    returns:   (n_samples,) integer indices into `points`
+
+    Idea: greedily pick the point farthest from everything chosen so far, so the
+    selected set spreads evenly over the *shape* regardless of the original
+    sampling density. Fixed output size -> erases density variation at the door.
+    """
+    N = points.shape[0]
+
+    def update_min_dist(idx, dists):
+        d = jnp.sum((points - points[idx]) ** 2, axis=-1)  # (N,)
+        return jnp.minimum(dists, d)
+
+    dists0 = update_min_dist(start_idx, jnp.full((N,), jnp.inf))
+
+    def step(dists, _):
+        next_idx = jnp.argmax(dists)
+        dists = update_min_dist(next_idx, dists)
+        return dists, next_idx
+
+    _, rest = jax.lax.scan(step, dists0, None, length=n_samples - 1)
+    return jnp.concatenate([jnp.array([start_idx], dtype=rest.dtype), rest])
+
+
+def fps_resample(points, n_samples, start_idx=0):
+    """Convenience wrapper returning the resampled coordinates (n_samples, D)."""
+    idx = farthest_point_sample(points, n_samples, start_idx)
+    return points[idx]
+
+
+# Batched version (same n_samples for every cloud in the batch).
+fps_resample_batched = jax.jit(
+    jax.vmap(fps_resample, in_axes=(0, None, None)),
+    static_argnums=(1,),
+)
+
+
+class PointMLPBlock(nnx.Module):
+    """Residual per-point MLP block. Pointwise -> permutation-equivariant."""
+
+    def __init__(
+            self,
+            dim: int,
+            expansion: int = 2,
+            *,
+            dtype: jnp.dtype = jnp.float32,
+            param_dtype: jnp.dtype = jnp.float32,
+            rngs: nnx.Rngs,
+    ):
+        # LayerNorm: keep computation in fp32 for stability, params in fp32.
+        self.norm = nnx.LayerNorm(
+            dim, dtype=jnp.float32, param_dtype=jnp.float32, rngs=rngs
+        )
+        self.fc1 = nnx.Linear(
+            dim, dim * expansion, dtype=dtype, param_dtype=param_dtype, rngs=rngs
+        )
+        self.fc2 = nnx.Linear(
+            dim * expansion, dim, dtype=dtype, param_dtype=param_dtype, rngs=rngs
+        )
+        self.dtype = dtype
+
+    def __call__(self, x):  # x: (B, N, dim) in self.dtype
+        # LayerNorm in fp32, then cast back to compute dtype.
+        h = self.norm(x.astype(jnp.float32)).astype(self.dtype)
+        h = nnx.gelu(self.fc1(h))
+        h = self.fc2(h)
+        return x + h
+
+
+class PointCloudEncoder(nnx.Module):
+    """
+    (B, N, 3) point clouds -> (B, latent_dim) latent vectors.
+    Permutation-invariant. Variable N supported via optional (B, N) bool mask.
+    """
+
+    def __init__(
+            self,
+            latent_dim: int,
+            hidden: int = 256,
+            n_blocks: int = 4,
+            scale_multiplier: float = 1.0,
+            *,
+            dtype: jnp.dtype = jnp.bfloat16,
+            rngs: nnx.Rngs,
+    ):
+        self.scale_multiplier = scale_multiplier
+        self.dtype = dtype
+        self.embed = nnx.Linear(
+            3, hidden, dtype=dtype, rngs=rngs
+        )
+        self.blocks = nnx.List([
+            PointMLPBlock(
+                hidden, dtype=dtype, rngs=rngs
+            )
+            for _ in range(n_blocks)
+        ])
+        self.point_norm = nnx.LayerNorm(
+            hidden, dtype=jnp.float32, rngs=rngs
+        )
+
+        head_in = 2 * hidden  # [max || mean]
+        self.head_norm = nnx.LayerNorm(
+            head_in, dtype=jnp.float32, rngs=rngs
+        )
+        self.head1 = nnx.Linear(
+            head_in, hidden, dtype=dtype, rngs=rngs
+        )
+        self.head2 = nnx.Linear(
+            hidden, latent_dim, dtype=dtype, rngs=rngs
+        )
+
+    def __call__(self, cloud, mask=None, ):
+        # Cast input to compute dtype.
+        x = cloud.astype(self.dtype)  # (B, N, 3)
+        h = self.embed(x)  # (B, N, H)
+        for block in self.blocks:
+            h = block(h)
+        h = self.point_norm(h.astype(jnp.float32)).astype(self.dtype)
+
+        if mask is None:
+            pooled_max = jnp.max(h, axis=1)
+            pooled_mean = jnp.mean(h, axis=1)
+        else:
+            m = mask[..., None]  # (B, N, 1)
+            mf = m.astype(h.dtype)
+            neg_inf = jnp.array(-jnp.inf, dtype=h.dtype)
+            pooled_max = jnp.max(jnp.where(m, h, neg_inf), axis=1)
+            denom = jnp.clip(jnp.sum(mf, axis=1), min=jnp.array(1.0, dtype=h.dtype))
+            pooled_mean = jnp.sum(h * mf, axis=1) / denom
+
+        g = jnp.concatenate([pooled_max, pooled_mean], axis=-1)  # (B, 2H)
+        g = self.head_norm(g.astype(jnp.float32)).astype(self.dtype)
+        g = nnx.gelu(self.head1(g))
+        return self.scale_multiplier * self.head2(g)  # (B, latent_dim) in self.dtype
