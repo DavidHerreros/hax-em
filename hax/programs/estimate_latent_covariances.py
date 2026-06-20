@@ -80,8 +80,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--md", required=True, type=str,
                         help="Xmipp metadata file with the images (+ alignments / CTF) needde to predict the covariances")
-    parser.add_argument("--pickled_nn", required=False, type=str,
-                        help=f"Path to folder containing a pickled neural network (generated from {bcolors.UNDERLINE}mode send_to_pickle{bcolors.ENDC}")
+    parser.add_argument("--nn_path", required=False, type=str,
+                        help=f"Path to folder containing a saved neural network (HetSIREN, Zernike3Deep...)")
     parser.add_argument("--batch_size", required=False, type=int, default=64,
                         help="Determines how many images will be load in the GPU at any moment during training (set by default to 8 - "
                              f"you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like {bcolors.UNDERLINE}nvidia-smi{bcolors.ENDC} "
@@ -98,7 +98,7 @@ def main():
     args, _ = parser.parse_known_args()
 
     # Load neural network (note it MUST be saved in pickle mode to make this script general)
-    model = NeuralNetworkCheckpointer.load(args.pickled_nn)
+    model = NeuralNetworkCheckpointer.load(args.nn_path)
 
     # Prepare metadata
     generator = MetaDataGenerator(args.md)
