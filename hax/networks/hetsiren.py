@@ -869,7 +869,8 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
 
         # L1 denoising for negative values
         values_neg = jnp.where(values < 0.0, -values, 0.0)
-        l1_loss += jnp.mean(values_neg, where=values_neg > 0.0)
+        neg_count = jnp.count_nonzero(values < 0.0)
+        l1_loss += jnp.sum(values_neg) / jnp.maximum(neg_count, 1)
 
         # L1 and L2 total variation (old version - no sparse)
         # diff_x = volumes[:, 1:, :, :] - volumes[:, :-1, :, :]
@@ -1476,6 +1477,10 @@ def main():
                              f"the default disk.")
     args, _ = parser.parse_known_args()
 
+    # Ensure the output path exists for every mode (train creates it via the
+    # metrics writer, but predict/send_to_pickle write straight into it).
+    os.makedirs(args.output_path, exist_ok=True)
+
     # Manually handed parameters
     local_reconstruction = args.local_reconstruction
     transport_mass = args.transport_mass if not local_reconstruction else False
@@ -1801,8 +1806,10 @@ def main():
         # Save model
         NeuralNetworkCheckpointer.save(hetsiren, os.path.join(args.output_path, "HetSIREN"))
 
-        # Remove checkpoint
-        shutil.rmtree(os.path.join(args.output_path, "HetSIREN_CHECKPOINT"))
+        # Remove checkpoint (only written every 5 epochs, so it may not exist)
+        checkpoint_dir = os.path.join(args.output_path, "HetSIREN_CHECKPOINT")
+        if os.path.isdir(checkpoint_dir):
+            shutil.rmtree(checkpoint_dir)
 
     elif args.mode == "predict":
 
