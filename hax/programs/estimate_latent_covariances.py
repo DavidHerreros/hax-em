@@ -60,7 +60,7 @@ def estimate_latent_covariances(model, x, labels, md):
         noise = jax.random.normal(key, x_clean.shape)
         noise = ctfFilter(noise[..., 0], amp_map[..., 0], pad_factor=2)[..., None]
         x_noisy = x_clean_ctf + noise
-        z_rnd.append(model(x_noisy))
+        z_rnd.append(model(x_noisy, return_alignment_refinement=False))
     return jnp.stack(z_rnd, axis=1), latent
 
 
