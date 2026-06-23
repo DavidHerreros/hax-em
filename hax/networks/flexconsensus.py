@@ -356,6 +356,12 @@ def main():
     if args.reload is not None:
         flexconsensus = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "FlexConsensus"))
 
+    # If no explicit names were given (plain paths), fall back to the network's
+    # space names (auto-generated, or restored from a reloaded model) so they can
+    # be used consistently for logging and prediction below.
+    if input_spaces_name is None:
+        input_spaces_name = list(flexconsensus.input_spaces_name)
+
     # Train network
     if args.mode == "train":
 
