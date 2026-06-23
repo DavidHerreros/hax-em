@@ -1077,6 +1077,9 @@ def main():
         raise ValueError(f"The sum of {bcolors.ITALIC}training_fraction{bcolors.ENDC} and {bcolors.ITALIC}validation_fraction{bcolors.ENDC} is not equal one. Please, update the values "
                          f"to fulfill this requirement.")
 
+    # Ensure the output path exists for every mode
+    os.makedirs(args.output_path, exist_ok=True)
+
     # Preprocess volume (and mask)
     vol = ImageHandler(args.vol).getData()
 
@@ -1364,8 +1367,10 @@ def main():
         # Save model
         NeuralNetworkCheckpointer.save(zernike3deep, os.path.join(args.output_path, "Zernike3Deep"))
 
-        # Remove checkpoint
-        shutil.rmtree(os.path.join(args.output_path, "Zernike3Deep_CHECKPOINT"))
+        # Remove checkpoint (only written every 5 epochs, so it may not exist)
+        checkpoint_dir = os.path.join(args.output_path, "Zernike3Deep_CHECKPOINT")
+        if os.path.isdir(checkpoint_dir):
+            shutil.rmtree(checkpoint_dir)
 
     elif args.mode == "predict":
 
