@@ -78,6 +78,32 @@ def parse_and_decompress(record_bytes):
     return image.astype(np.float32, copy=False)[..., None], label
 
 
+class _RecordRangeSource:
+    """A contiguous record-index view over a random-access grain source.
+
+    Lets a dataset be split into train/val at the *record* level (so even a
+    single-shard dataset can be split) while still exposing a random-access
+    source object for ``grain.DataLoader``.
+    """
+    def __init__(self, source, start, stop):
+        self._source = source
+        self._start = start
+        self._stop = stop
+
+    def __len__(self):
+        return self._stop - self._start
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            start, stop, step = idx.indices(len(self))
+            return [self[i] for i in range(start, stop, step)]
+        if idx < 0:
+            idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+        return self._source[self._start + idx]
+
+
 def _write_one_shard_mmap(path, image_indices, getImage_fn, dtype=np.float16):
     from mmap_ninja import numpy as np_ninja
 
@@ -422,14 +448,15 @@ class MetaDataGenerator:
             shard_files = glob(os.path.join(self.mmap_output_dir, "dataset-*.arrayrecord"))
             shard_files.sort()
 
+            sources = ArrayRecordDataSource(shard_files, reader_options={"index_storage_option": "in_memory"})
             if split_fraction is not None:
-                split_point = int(split_fraction[0] * len(shard_files))
-                sources_train = ArrayRecordDataSource(shard_files[:split_point], reader_options={"index_storage_option": "in_memory"})
-                sources_val = ArrayRecordDataSource(shard_files[split_point:], reader_options={"index_storage_option": "in_memory"})
+                split_point = int(split_fraction[0] * len(sources))
+                sources_train = _RecordRangeSource(sources, 0, split_point)
+                sources_val = _RecordRangeSource(sources, split_point, len(sources))
                 dataset_train = grain.MapDataset.source(sources_train)
                 dataset_val = grain.MapDataset.source(sources_val)
             else:
-                sources_train = ArrayRecordDataSource(shard_files, reader_options={"index_storage_option": "in_memory"})
+                sources_train = sources
                 dataset_train = grain.MapDataset.source(sources_train)
 
         elif self.grain_dataset_type == "MMAP":  # TODO: Add labels to LazyNinjaGrainSource
@@ -476,14 +503,15 @@ class MetaDataGenerator:
             shard_paths = glob(os.path.join(self.mmap_output_dir, "dataset-*"))
             shard_paths.sort()
 
+            sources = LazyNinjaGrainSource(shard_paths)
             if split_fraction is not None:
-                split_point = int(split_fraction[0] * len(shard_paths))
-                sources_train = LazyNinjaGrainSource(shard_paths[:split_point])
-                sources_val = LazyNinjaGrainSource(shard_paths[split_point:])
+                split_point = int(split_fraction[0] * len(sources))
+                sources_train = _RecordRangeSource(sources, 0, split_point)
+                sources_val = _RecordRangeSource(sources, split_point, len(sources))
                 dataset_train = grain.MapDataset.source(sources_train)
                 dataset_val = grain.MapDataset.source(sources_val)
             else:
-                sources_train = LazyNinjaGrainSource(shard_paths)
+                sources_train = sources
                 dataset_train = grain.MapDataset.source(sources_train)
 
         elif self.grain_dataset_type == "RAM":
