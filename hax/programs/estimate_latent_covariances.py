@@ -79,7 +79,7 @@ def main():
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--md", required=True, type=str,
-                        help="Xmipp metadata file with the images (+ alignments / CTF) needde to predict the covariances")
+                        help="Xmipp metadata file with the images (+ alignments / CTF) needed to predict the covariances")
     parser.add_argument("--nn_path", required=False, type=str,
                         help=f"Path to folder containing a saved neural network (HetSIREN, Zernike3Deep...)")
     parser.add_argument("--batch_size", required=False, type=int, default=64,
