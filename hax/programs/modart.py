@@ -457,7 +457,8 @@ def main():
     steps_per_epoch = int(len(generator.md) / args.batch_size)
 
     # Example of training data for Tensorboard
-    with closing(iter(data_loader)) as iter_data_loader:
+    example_loader = data_loader_even if args.reconstruct_halves else data_loader
+    with closing(iter(example_loader)) as iter_data_loader:
         x_example, labels_example = next(iter_data_loader)
         x_example = jax.vmap(min_max_scale)(x_example)
         writer.add_images("Example of data batch", x_example, dataformats="NHWC")
