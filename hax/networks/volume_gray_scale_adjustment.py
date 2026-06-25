@@ -386,7 +386,7 @@ def main():
 
         # Resume if checkpoint exists
         if os.path.isdir(os.path.join(args.output_path, "volumeAdjustment_CHECKPOINT")):
-            graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "imageAdjustment_CHECKPOINT"), optimizer)
+            graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "volumeAdjustment_CHECKPOINT"), optimizer)
             print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
         else:
             resume_epoch = 0
