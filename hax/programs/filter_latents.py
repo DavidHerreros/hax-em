@@ -6,6 +6,7 @@ def main():
     import numpy as np
     import argparse
     from hax.utils import filter_latent_space, bcolors
+    from hax.cli import common_args as ca
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--latents", required=True, type=str,
@@ -22,7 +23,7 @@ def main():
                              f"to monitor and/or measure memory usage and adjust this value")
     parser.add_argument("--output_path", required=True, type=str,
                         help="Path to save the filtered latent space")
-    args = parser.parse_args()
+    args = ca.parse_with_config(parser)
 
     # Load latents
     latents = np.load(args.latents)

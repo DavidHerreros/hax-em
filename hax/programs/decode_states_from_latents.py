@@ -12,6 +12,7 @@ def main():
     import argparse
     from xmipp_metadata.image_handler import ImageHandler
     from hax.checkpointer import NeuralNetworkCheckpointer
+    from hax.cli import common_args as ca
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--latents_file", required=True, type=str,
@@ -22,7 +23,7 @@ def main():
                              f"Only networks saved in Pickled format can be supplied here.")
     parser.add_argument("--output_path", required=True, type=str,
                         help=f"Path were the decoded volumes will be saved.")
-    args = parser.parse_args()
+    args = ca.parse_with_config(parser)
 
     # Read latent vectors
     if args.latents_file.endswith(".txt"):
