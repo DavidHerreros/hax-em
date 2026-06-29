@@ -30,6 +30,14 @@ class bcolors:
     ITALIC = '\033[3m'
 
 
+# Mirror hax.utils.loggers: emit ANSI codes only on a real terminal, honoring
+# NO_COLOR / FORCE_COLOR. Kept local so the dispatcher stays free of heavy imports.
+if os.environ.get("NO_COLOR") or (not os.environ.get("FORCE_COLOR") and not sys.stdout.isatty()):
+    for _name in ("HEADER", "OKBLUE", "OKCYAN", "OKGREEN", "WARNING",
+                  "FAIL", "ENDC", "BOLD", "UNDERLINE", "ITALIC"):
+        setattr(bcolors, _name, "")
+
+
 MODULES_DICT = {
     "hetsiren": ("hax.networks.hetsiren", "Heterogeneous volume reconstruction with HetSIREN neural network"),
     "zernike3deep": ("hax.networks.zernike3deep", "Estimation of motions using deep learning version of Zernike3Deep"),
