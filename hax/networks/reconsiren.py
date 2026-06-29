@@ -1073,7 +1073,7 @@ def main():
     ca.add_reload(parser,
                   help="Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data).")
     ca.add_ssd_scratch_folder(parser)
-    args = parser.parse_args()
+    args = ca.parse_with_config(parser)
 
     # Matplotlib plot style
     plt.style.use('dark_background')  # This sets many defaults for a dark theme

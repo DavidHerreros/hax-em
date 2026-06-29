@@ -181,7 +181,7 @@ def main():
     ca.add_reload(parser, help=ca.RELOAD_HELP_BASIC)
     ca.add_load_images_to_ram(parser)
     ca.add_ssd_scratch_folder(parser)
-    args = parser.parse_args()
+    args = ca.parse_with_config(parser)
 
     # Ensure the output path exists (the deconvolved latents / model are written into it)
     os.makedirs(args.output_path, exist_ok=True)

@@ -87,7 +87,7 @@ def main():
     ca.add_output_path(parser, help="Path to save the estimated covariances")
     ca.add_load_images_to_ram(parser)
     ca.add_ssd_scratch_folder(parser)
-    args = parser.parse_args()
+    args = ca.parse_with_config(parser)
 
     # Load neural network (note it MUST be saved in pickle mode to make this script general)
     model = NeuralNetworkCheckpointer.load(args.nn_path)

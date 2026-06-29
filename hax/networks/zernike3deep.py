@@ -1039,7 +1039,7 @@ def main():
                        f"{bcolors.WARNING}NOTE{bcolors.ENDC}: Since Zernike3Deep also learns a gray level adjustment, reload must be the path to a folder containing two additional "
                        f"folders called: {bcolors.UNDERLINE}Zernike3Deep{bcolors.ENDC} and {bcolors.UNDERLINE}Gaussian_volume_fitting{bcolors.ENDC})")
     ca.add_ssd_scratch_folder(parser)
-    args = parser.parse_args()
+    args = ca.parse_with_config(parser)
 
     # Check that training and validation fractions add up to one
     ca.validate_dataset_split_fraction(args.dataset_split_fraction)

@@ -1449,7 +1449,7 @@ def main():
                         help=f'When set, HetSIREN will use an implicit neural network approach to recover conformational states. Implicit neural networks are more memory consuming, but they are also more accurate in the detection of very local motions. '
                              f'If this architecture is selected, we strongly recommend to set as well the parameter {bcolors.ITALIC}total_mass{bcolors.ENDC} to limit the memory consumption of the network and increase its performance.')
     ca.add_ssd_scratch_folder(parser)
-    args = parser.parse_args()
+    args = ca.parse_with_config(parser)
 
     # Ensure the output path exists for every mode (train creates it via the
     # metrics writer, but predict/send_to_pickle write straight into it).

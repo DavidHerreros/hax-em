@@ -305,7 +305,7 @@ def main():
     ca.add_output_path(parser)
     ca.add_reload(parser, help=ca.RELOAD_HELP_BASIC)
     ca.add_ssd_scratch_folder(parser)
-    args = parser.parse_args()
+    args = ca.parse_with_config(parser)
 
     # Check that training and validation fractions add up to one
     if sum(args.dataset_split_fraction) != 1:

@@ -16,6 +16,10 @@ Design notes:
   introspected from it) is unchanged.
 """
 
+import os
+import sys
+import json
+
 from hax.utils import bcolors
 
 
@@ -173,3 +177,103 @@ def validate_dataset_split_fraction(fractions):
             f"The sum of {bcolors.ITALIC}training_fraction{bcolors.ENDC} and "
             f"{bcolors.ITALIC}validation_fraction{bcolors.ENDC} is not equal one. Please, update the values "
             f"to fulfill this requirement.")
+
+
+# --------------------------------------------------------------------------- #
+# Config-file support (Phase 3)
+#
+# A program can replace ``args = parser.parse_args()`` with
+# ``args = common_args.parse_with_config(parser)`` to gain:
+#   * a ``--config <file.yaml|.json>`` argument whose values are layered UNDER
+#     the command line (explicit CLI args always win), and
+#   * an automatic dump of the fully-resolved parameters to
+#     ``<output_path>/run_config.json`` for reproducibility.
+# --------------------------------------------------------------------------- #
+
+CONFIG_HELP = (
+    "Path to a YAML/JSON file with parameter values (keys are the argument names without the leading '--'). "
+    f"Values from the file act as defaults; any argument also given on the command line overrides them. "
+    f"{bcolors.WARNING}NOTE{bcolors.ENDC}: the fully-resolved parameters (file + command line) are written to "
+    f"{bcolors.UNDERLINE}<output_path>/run_config.json{bcolors.ENDC} on every run, and that file can be reused "
+    f"as a {bcolors.ITALIC}--config{bcolors.ENDC} to reproduce the run.")
+
+
+def add_config(parser, help=CONFIG_HELP):
+    return parser.add_argument("--config", required=False, type=str, help=help)
+
+
+def _peek_config(argv):
+    """Find a ``--config`` value in argv without invoking argparse.
+
+    We must not call any ``ArgumentParser.parse_*`` here: the GUI introspector
+    monkeypatches those to capture the parser, so a parse call for the peek would
+    capture the wrong (or a throwaway) parser. A manual scan keeps the real
+    ``parser.parse_args()`` below as the first/only parse call.
+    """
+    for i, tok in enumerate(argv):
+        if tok == "--config" and i + 1 < len(argv):
+            return argv[i + 1]
+        if tok.startswith("--config="):
+            return tok.split("=", 1)[1]
+    return None
+
+
+def _load_config_file(path):
+    ext = os.path.splitext(path)[1].lower()
+    with open(path) as fh:
+        if ext in (".yaml", ".yml"):
+            try:
+                import yaml
+            except ImportError:
+                raise SystemExit("PyYAML is required to read YAML config files; install pyyaml or use a .json config.")
+            data = yaml.safe_load(fh)
+        elif ext == ".json":
+            data = json.load(fh)
+        else:
+            raise SystemExit(f"Unsupported config extension '{ext}'. Use .yaml, .yml or .json.")
+    if not isinstance(data, dict):
+        raise SystemExit("Config file must contain a top-level mapping of argument names to values.")
+    return data
+
+
+def save_run_config(args, filename="run_config.json"):
+    """Best-effort dump of the resolved parameters into ``output_path``."""
+    output_path = getattr(args, "output_path", None)
+    if not output_path:
+        return
+    try:
+        os.makedirs(output_path, exist_ok=True)
+        resolved = {k: v for k, v in vars(args).items() if k != "config"}
+        with open(os.path.join(output_path, filename), "w") as fh:
+            json.dump(resolved, fh, indent=2, sort_keys=True, default=str)
+    except OSError:
+        # Provenance is a nice-to-have; never fail a run because it couldn't be written.
+        pass
+
+
+def parse_with_config(parser, argv=None):
+    """``parser.parse_args()`` with optional ``--config`` layering + run dump.
+
+    Precedence: command-line args > config-file values > argparse defaults.
+    Config values can also satisfy ``required=True`` arguments (their
+    requiredness is relaxed when the key is present in the file).
+    """
+    if not any("--config" in a.option_strings for a in parser._actions):
+        add_config(parser)
+
+    argv = sys.argv[1:] if argv is None else argv
+    config_path = _peek_config(argv)
+    if config_path:
+        data = _load_config_file(config_path)
+        known = {a.dest for a in parser._actions}
+        unknown = sorted(set(data) - known)
+        if unknown:
+            raise SystemExit(f"Unknown keys in config file '{config_path}': {unknown}")
+        for action in parser._actions:
+            if action.dest in data:
+                action.required = False
+        parser.set_defaults(**data)
+
+    args = parser.parse_args()
+    save_run_config(args)
+    return args

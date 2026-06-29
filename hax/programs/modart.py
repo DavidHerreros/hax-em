@@ -366,7 +366,7 @@ def main():
                              f"{bcolors.ENDC} or {bcolors.UNDERLINE} Zernike3Deep {bcolors.ENDC} neural network.")
     ca.add_output_path(parser)
     ca.add_ssd_scratch_folder(parser)
-    args = parser.parse_args()
+    args = ca.parse_with_config(parser)
 
     # Prepare metadata
     generator = MetaDataGenerator(args.md)

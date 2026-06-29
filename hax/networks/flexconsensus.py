@@ -295,7 +295,7 @@ def main():
     ca.add_learning_rate(parser, default=1e-5)
     ca.add_output_path(parser, help="Path to save the results (trained neural network, consensus spaces...)")
     ca.add_reload(parser, help=ca.RELOAD_HELP_BASIC)
-    args = parser.parse_args()
+    args = ca.parse_with_config(parser)
 
     # If NAME:path convention, split both
     if ":" in args.input_space[0]:
