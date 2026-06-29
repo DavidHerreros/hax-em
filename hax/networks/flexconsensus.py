@@ -308,7 +308,7 @@ def main():
                         help="Path to save the results (trained neural network, consensus spaces...)")
     parser.add_argument("--reload", required=False, type=str,
                         help=f"Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data)")
-    args, _ = parser.parse_known_args()
+    args = parser.parse_args()
 
     # If NAME:path convention, split both
     if ":" in args.input_space[0]:

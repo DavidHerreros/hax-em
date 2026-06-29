@@ -1070,7 +1070,7 @@ def main():
     parser.add_argument("--ssd_scratch_folder", required=False, type=str,
                         help=f"When the parameter {bcolors.UNDERLINE}load_images_to_ram{bcolors.ENDC} is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from "
                              f"the default disk.")
-    args, _ = parser.parse_known_args()
+    args = parser.parse_args()
 
     # Check that training and validation fractions add up to one
     if sum(args.dataset_split_fraction) != 1:

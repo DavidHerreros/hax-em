@@ -150,7 +150,7 @@ def main():
         "--logdir", type=str, required=True,
         help="Path to the TensorBoard log directory"
     )
-    args, _ = parser.parse_known_args()
+    args = parser.parse_args()
 
     # Launch TensorBoard programmatically
     tb = program.TensorBoard()

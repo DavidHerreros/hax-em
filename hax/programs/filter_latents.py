@@ -22,7 +22,7 @@ def main():
                              f"to monitor and/or measure memory usage and adjust this value")
     parser.add_argument("--output_path", required=True, type=str,
                         help="Path to save the filtered latent space")
-    args, _ = parser.parse_known_args()
+    args = parser.parse_args()
 
     # Load latents
     latents = np.load(args.latents)

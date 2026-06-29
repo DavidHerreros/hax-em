@@ -1,9 +1,34 @@
 import os
 import sys
 import argparse
-import subprocess
+import difflib
 import importlib
-from hax.utils import bcolors
+from importlib.metadata import version, PackageNotFoundError
+
+
+# NOTE: the dispatcher sets CUDA_VISIBLE_DEVICES / XLA flags / the multiprocessing
+# start method in main() *before the selected program is imported*. JAX reads
+# those at backend initialization (first device use), not at ``import jax``, so
+# this ordering is what matters in practice.
+#
+# We keep a local copy of the ANSI codes instead of ``from hax.utils import
+# bcolors`` to avoid coupling the dispatcher to the heavy package for trivial
+# constants. (Note: importing the program module below still runs
+# ``hax/__init__.py`` -> ``from .networks import *``, which imports JAX. Making
+# the entry point fully JAX-free would require a lazy ``hax/__init__.py`` and is
+# tracked as a separate refactor.)
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKCYAN = '\033[96m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[93m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    ITALIC = '\033[3m'
+
 
 MODULES_DICT = {
     "hetsiren": ("hax.networks.hetsiren", "Heterogeneous volume reconstruction with HetSIREN neural network"),
@@ -20,6 +45,13 @@ MODULES_DICT = {
     "reconsiren": ("hax.networks.reconsiren", "Ab initio estimation of particle pose, shifts and initial volume with neural networks"),
     "modart": ("hax.programs.modart", "ART based volume reconstruction with motion correction to motion blurr artifacts")
 }
+
+
+def _get_version():
+    try:
+        return version("hax-em")
+    except PackageNotFoundError:
+        return "unknown"
 
 
 class PrintSummary(argparse.Action):
@@ -43,8 +75,60 @@ class PrintSummary(argparse.Action):
         print(f"{bcolors.HEADER}Additional help on how to execute each is available through:{bcolors.ENDC}\n")
         print(f"     hax_project_manager {bcolors.ITALIC}{bcolors.BOLD}program{bcolors.ENDC} {{-h or --help}}\n")
         print(f"{bcolors.WARNING}If you experience any issue or have suggestions, you are welcome to write an issue in our GitHub!: {bcolors.UNDERLINE}https://github.com/DavidHerreros/hax-em/issues\n{bcolors.ENDC}\n")
-        print(f"{bcolors.OKBLUE}We also provide tutorials on how to use the software with Scipion in the following link: {bcolors.UNDERLINE}VERY SOON!\n{bcolors.ENDC}\n")
+        print(f"{bcolors.OKBLUE}Documentation and tutorials on how to use the software (also with Scipion) are available at: {bcolors.UNDERLINE}https://davidherreros.github.io/hax-em-docs/\n{bcolors.ENDC}\n")
         parser.exit(0)
+
+
+def _configure_environment(gpu):
+    """Set environment variables that JAX/XLA read at backend initialization.
+
+    Must run before the selected program (and therefore JAX) is imported.
+    """
+    # 1) set the GPU visibility before any JAX import
+    if gpu is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu
+    os.environ.pop("LD_LIBRARY_PATH", None)
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    os.environ["XLA_FLAGS"] = (
+        "--xla_gpu_triton_gemm_any=true "
+        "--xla_gpu_enable_latency_hiding_scheduler=true "
+        "--xla_gpu_enable_highest_priority_async_stream=true "
+    )
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+
+def _configure_multiprocessing():
+    """Set the default multiprocessing start method to ``forkserver``.
+
+    Plain ``fork`` (the Linux default) is unsafe once CUDA/JAX has been
+    initialized in the parent process, so we prefer ``forkserver``: workers are
+    forked from a clean server process instead of the CUDA-loaded main process.
+    This is set here (before the program and JAX are imported) rather than inside
+    an ``if __name__ == "__main__"`` block, because the installed entry point is
+    ``hax.cli:main`` and that block never runs under the console script.
+    ``force=True`` makes the call idempotent; we guard against platforms where
+    ``forkserver`` is unavailable.
+    """
+    import multiprocessing as mp
+    try:
+        mp.set_start_method("forkserver", force=True)
+    except (ValueError, RuntimeError):
+        # forkserver not available on this platform; keep the default method.
+        pass
+
+
+def _resolve_program(parser, program):
+    """Map a CLI program name to its module path, or fail with a helpful hint."""
+    if program not in MODULES_DICT:
+        suggestions = difflib.get_close_matches(program, list(MODULES_DICT), n=3)
+        message = f"{bcolors.FAIL}Unknown program '{program}'.{bcolors.ENDC}\n"
+        if suggestions:
+            message += f"Did you mean: {bcolors.BOLD}{', '.join(suggestions)}{bcolors.ENDC}?\n"
+        message += (f"Run {bcolors.BOLD}hax_project_manager -h{bcolors.ENDC} "
+                    f"to see the list of available programs.\n")
+        parser.exit(2, message)
+    return MODULES_DICT[program][0]
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -60,6 +144,10 @@ def main():
         help="Shows a summary of available commands"
     )
     parser.add_argument(
+        "--version", action="version", version=f"hax-em {_get_version()}",
+        help="Show the installed hax-em version and exit"
+    )
+    parser.add_argument(
         "program",
         help="The program to be executed"
     )
@@ -70,28 +158,22 @@ def main():
 
     ns, _ = parser.parse_known_args()
 
-    # 1) set the env var before any JAX import
-    if ns.gpu is not None:
-        os.environ["CUDA_VISIBLE_DEVICES"] = ns.gpu
-    os.environ.pop("LD_LIBRARY_PATH", None)
-    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-    os.environ["XLA_FLAGS"] = (
-        "--xla_gpu_triton_gemm_any=true "
-        "--xla_gpu_enable_latency_hiding_scheduler=true "
-        "--xla_gpu_enable_highest_priority_async_stream=true "
-    )
-    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+    # 1) configure the environment and multiprocessing before importing JAX
+    _configure_environment(ns.gpu)
+    _configure_multiprocessing()
 
-    # 2) Prepare command
-    module = importlib.import_module(MODULES_DICT[ns.program][0])
+    # 2) resolve the program (friendly error on a bad name)
+    module_path = _resolve_program(parser, ns.program)
+
+    # 3) hand a clean argv to the program so it can parse its own arguments
+    #    strictly (without seeing the dispatcher's --gpu/program prefix).
+    sys.argv = [f"hax_project_manager {ns.program}"] + ns.args
+
+    # 4) import the program module (this is what pulls in JAX) and run it
+    module = importlib.import_module(module_path)
     main_fn = getattr(module, "main")
-
-    # 3) Run function
     main_fn()
 
-if __name__ == "__main__":
-    import multiprocessing
-    # multiprocessing.set_start_method("spawn", force=True)
-    multiprocessing.set_start_method('forkserver', force=True)
 
+if __name__ == "__main__":
     main()

@@ -22,7 +22,7 @@ def main():
                              f"Only networks saved in Pickled format can be supplied here.")
     parser.add_argument("--output_path", required=True, type=str,
                         help=f"Path were the decoded volumes will be saved.")
-    args, _ = parser.parse_known_args()
+    args = parser.parse_args()
 
     # Read latent vectors
     if args.latents_file.endswith(".txt"):
