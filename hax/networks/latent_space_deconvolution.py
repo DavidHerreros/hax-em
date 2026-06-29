@@ -155,41 +155,32 @@ def main():
     from hax.generators import MetaDataGenerator, NumpyGenerator
     from hax.networks import train_deconv_step
 
+    from hax.cli import common_args as ca
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--md", required=True, type=str,
-                        help="Xmipp metadata file with the images (+ alignments / CTF) whose latent vectors will be "
-                             "recovered on the fly from the provided network and then deconvolved")
+    ca.add_md(parser,
+              help="Xmipp metadata file with the images (+ alignments / CTF) whose latent vectors will be "
+                   "recovered on the fly from the provided network and then deconvolved")
     parser.add_argument("--nn_path", required=True, type=str,
                     help=f"Path to folder containing a saved neural network (HetSIREN, Zernike3Deep...). Its encoder is "
                          f"used to recover the latent vectors of the images in {bcolors.UNDERLINE}md{bcolors.ENDC} on the fly")
     parser.add_argument("--covariances", required=True, type=str,
                         help=f"Path to the .npy file with the covariances needed to estimate the deconvolution (output of {bcolors.UNDERLINE}estimate_latent_covariances{bcolors.ENDC} program)")
-    parser.add_argument("--lat_dim", required=False, type=int, default=3,
-                        help="Dimensionality of the latent space of the deconvolution network")
-    parser.add_argument("--mode", required=True, type=str, choices=["train", "predict"],
-                        help=f"{bcolors.BOLD}train{bcolors.ENDC}: train a neural network from scratch or from a previous execution if reload is provided\n"
-                             f"{bcolors.BOLD}predict{bcolors.ENDC}: predict the deconvolved latents from the input latents ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case)")
+    ca.add_lat_dim(parser, default=3, help="Dimensionality of the latent space of the deconvolution network")
+    ca.add_mode(parser, choices=["train", "predict"],
+                help=f"{bcolors.BOLD}train{bcolors.ENDC}: train a neural network from scratch or from a previous execution if reload is provided\n"
+                     f"{bcolors.BOLD}predict{bcolors.ENDC}: predict the deconvolved latents from the input latents ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case)")
     parser.add_argument("--deconvolution_strength", required=False, type=float, default=1.0,
                         help="Determines the deconvolution strength (set to 1.0 by default, meaning that the landscape will be deconvolved as expected from the computed covariances - larger values "
                              "will yield a stronger deconvolution compared to the default value, while smaller values will be more conservative")
-    parser.add_argument("--epochs", required=False, type=int, default=100,
-                        help="Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 100 - "
-                             "as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it")
-    parser.add_argument("--batch_size", required=False, type=int, default=1024,
-                        help = "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - "
-                               f"you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like {bcolors.UNDERLINE}nvidia-smi{bcolors.ENDC} "
-                               f"to monitor and/or measure memory usage and adjust this value")
-    parser.add_argument("--output_path", required=True, type=str,
-                        help="Path to save the results (trained neural network, deconvolved latents...)")
-    parser.add_argument("--reload", required=False, type=str,
-                        help="Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data)")
-    parser.add_argument("--load_images_to_ram", action='store_true',
-                        help=f"If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, "
-                             f"images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance "
-                             f"will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.")
-    parser.add_argument("--ssd_scratch_folder", required=False, type=str,
-                        help=f"When the parameter {bcolors.UNDERLINE}load_images_to_ram{bcolors.ENDC} is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from "
-                             f"the default disk.")
+    ca.add_epochs(parser, default=100,
+                  help="Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 100 - "
+                       "as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it")
+    ca.add_batch_size(parser, default=1024, help=ca.BATCH_SIZE_HELP_ADJUST)
+    ca.add_output_path(parser, help="Path to save the results (trained neural network, deconvolved latents...)")
+    ca.add_reload(parser, help=ca.RELOAD_HELP_BASIC)
+    ca.add_load_images_to_ram(parser)
+    ca.add_ssd_scratch_folder(parser)
     args = parser.parse_args()
 
     # Ensure the output path exists (the deconvolved latents / model are written into it)

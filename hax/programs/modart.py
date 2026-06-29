@@ -345,41 +345,27 @@ def main():
     from hax.schedulers import CosineAnnealingScheduler
     from hax.checkpointer import NeuralNetworkCheckpointer
 
+    from hax.cli import common_args as ca
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--md", required=True, type=str,
-                        help="Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed")
-    parser.add_argument("--vol", required=False, type=str,
-                        help="If provided, MoDART will perform a refinement of this volume")
-    parser.add_argument("--mask", required=False, type=str,
-                        help=f"Determines the initial position of the mass available to MoDART to reconstruct a volume. This mask can be tight to the input volume (if provided). "
-                             f"{bcolors.WARNING}WARNING{bcolors.ENDC}: The mask provided here MUST be BINARY.")
-    parser.add_argument("--load_images_to_ram", action='store_true',
-                        help=f"If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, "
-                             f"images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance "
-                             f"will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.")
-    parser.add_argument("--sr", required=True, type=float,
-                        help="Sampling rate of the images/volume")
-    parser.add_argument("--symmetry_group", type=str, default="c1",
-                        help=f"If your protein has any kind of symmetry, you may pass it here so that it is considered while learning the angular assignment and the volume ({bcolors.WARNING}NOTE{bcolors.ENDC}: "
-                             f"only {bcolors.ITALIC}c*{bcolors.ENDC} and {bcolors.ITALIC}d*{bcolors.ENDC} symmetry groups are currently supported - the parameter is lower case sensitive - even if symmetry is provided, "
-                             f"the network will learn a {bcolors.ITALIC}symmetry broken{bcolors.ENDC} set of angles in c1. Therefore, the angles can be directly used in a reconstruction/refinement.)")
-    parser.add_argument("--ctf_type", required=True, type=str, choices=["None", "apply", "wiener", "precorrect"],
-                        help="Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)")
-    parser.add_argument("--batch_size", required=False, type=int, default=8,
-                        help="Determines how many images will be load in the GPU at any moment during training (set by default to 8 - "
-                             f"you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like {bcolors.UNDERLINE}nvidia-smi{bcolors.ENDC} "
-                             f"to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions")
+    ca.add_md(parser)
+    ca.add_vol(parser, help="If provided, MoDART will perform a refinement of this volume")
+    ca.add_mask(parser,
+                help=f"Determines the initial position of the mass available to MoDART to reconstruct a volume. This mask can be tight to the input volume (if provided). "
+                     f"{bcolors.WARNING}WARNING{bcolors.ENDC}: The mask provided here MUST be BINARY.")
+    ca.add_load_images_to_ram(parser)
+    ca.add_sr(parser)
+    ca.add_symmetry_group(parser)
+    ca.add_ctf_type(parser)
+    ca.add_batch_size(parser)
     parser.add_argument("--reconstruct_halves", action="store_true",
                         help="If not provided, MoDART will reconstruct a single volume. Otherwise, MoDART will reconstruct two half maps by splitting the dataset into even/odd parts.")
     parser.add_argument("--motion_correction", type=str,
                         help=f"If provided, MoDART will perform a motion correction while reconstructing the volume to reduce motion blurring. Otherwise, a standard reconstruction is performed. "
                              f"{bcolors.WARNING} NOTE {bcolors.ENDC}: When providing this parameter, you MUST give the path to a trained {bcolors.UNDERLINE} HetSIREN (with transport of mass) "
                              f"{bcolors.ENDC} or {bcolors.UNDERLINE} Zernike3Deep {bcolors.ENDC} neural network.")
-    parser.add_argument("--output_path", required=True, type=str,
-                        help="Path to save the results (trained neural network, new metadata...)")
-    parser.add_argument("--ssd_scratch_folder", required=False, type=str,
-                        help=f"When the parameter {bcolors.UNDERLINE}load_images_to_ram{bcolors.ENDC} is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from "
-                             f"the default disk.")
+    ca.add_output_path(parser)
+    ca.add_ssd_scratch_folder(parser)
     args = parser.parse_args()
 
     # Prepare metadata

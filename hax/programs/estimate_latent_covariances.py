@@ -77,24 +77,16 @@ def main():
     from hax.generators import MetaDataGenerator, extract_columns
     from hax.programs import estimate_latent_covariances
 
+    from hax.cli import common_args as ca
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--md", required=True, type=str,
-                        help="Xmipp metadata file with the images (+ alignments / CTF) needed to predict the covariances")
+    ca.add_md(parser, help="Xmipp metadata file with the images (+ alignments / CTF) needed to predict the covariances")
     parser.add_argument("--nn_path", required=False, type=str,
                         help=f"Path to folder containing a saved neural network (HetSIREN, Zernike3Deep...)")
-    parser.add_argument("--batch_size", required=False, type=int, default=64,
-                        help="Determines how many images will be load in the GPU at any moment during training (set by default to 8 - "
-                             f"you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like {bcolors.UNDERLINE}nvidia-smi{bcolors.ENDC} "
-                             f"to monitor and/or measure memory usage and adjust this value")
-    parser.add_argument("--output_path", required=True, type=str,
-                        help="Path to save the estimated covariances")
-    parser.add_argument("--load_images_to_ram", action='store_true',
-                        help=f"If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, "
-                             f"images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance "
-                             f"will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.")
-    parser.add_argument("--ssd_scratch_folder", required=False, type=str,
-                        help=f"When the parameter {bcolors.UNDERLINE}load_images_to_ram{bcolors.ENDC} is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from "
-                             f"the default disk.")
+    ca.add_batch_size(parser, default=64, help=ca.BATCH_SIZE_HELP_ADJUST)
+    ca.add_output_path(parser, help="Path to save the estimated covariances")
+    ca.add_load_images_to_ram(parser)
+    ca.add_ssd_scratch_folder(parser)
     args = parser.parse_args()
 
     # Load neural network (note it MUST be saved in pickle mode to make this script general)

@@ -283,56 +283,28 @@ def main():
     from hax.generators import MetaDataGenerator, extract_columns
     from hax.networks import train_step_image_adjustment
     from hax.metrics import JaxSummaryWriter
-    def list_of_floats(arg):
-        return list(map(float, arg.split(',')))
+    from hax.cli import common_args as ca
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--md", required=True, type=str,
-                        help="Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed")
-    parser.add_argument("--vol", required=True, type=str,
-                        help="Volume needed to generate the projections to be adjusted")
-    parser.add_argument("--mask", required=False, type=str,
-                        help="This helps focusing the adjustment on a region of interest (if not provided, a inscribed spherical mask will be used)")
-    parser.add_argument("--load_images_to_ram", action='store_true',
-                        help=f"If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, "
-                             f"images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance "
-                             f"will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.")
-    parser.add_argument("--sr", required=True, type=float,
-                        help="Sampling rate of the images/volume")
-    parser.add_argument("--ctf_type", required=True, type=str, choices=["None", "apply", "wiener", "precorrect"],
-                        help="Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)")
+    ca.add_md(parser)
+    ca.add_vol(parser, required=True, help="Volume needed to generate the projections to be adjusted")
+    ca.add_mask(parser, help="This helps focusing the adjustment on a region of interest (if not provided, a inscribed spherical mask will be used)")
+    ca.add_load_images_to_ram(parser)
+    ca.add_sr(parser)
+    ca.add_ctf_type(parser)
     parser.add_argument("--predict_value", action='store_true',
                         help="If not provided, the adjustment will be estimated per pixel - otherwise, adjustment will be estimated per projection")
-    parser.add_argument("--lat_dim", required=False, type=int, default=3,
-                        help="Dimensionality of the latent space of the network (set by default to 3)")
-    parser.add_argument("--mode", required=True, type=str, choices=["train", "predict"],
-                        help=f"{bcolors.BOLD}train{bcolors.ENDC}: train a neural network from scratch or from a previous execution if reload is provided\n"
-                             f"{bcolors.BOLD}predict{bcolors.ENDC}: predict the adjustment for the input images/volume ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case)")
-    parser.add_argument("--epochs", required=False, type=int, default=50,
-                        help="Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - "
-                             "as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it")
-    parser.add_argument("--batch_size", required=False, type=int, default=64,
-                        help="Determines how many images will be load in the GPU at any moment during training (set by default to 8 - "
-                             f"you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like {bcolors.UNDERLINE}nvidia-smi{bcolors.ENDC} "
-                             f"to monitor and/or measure memory usage and adjust this value")
-    parser.add_argument("--learning_rate", required=False, type=float, default=1e-5,
-                        help=f"The learning rate ({bcolors.ITALIC}lr{bcolors.ENDC}) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the {bcolors.ITALIC}lr{bcolors.ENDC} "
-                             f"is the size of the step it takes on each attempt. A large {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}0.01{bcolors.ENDC}) is like taking huge leaps — it's fast but can be unstable, "
-                             f"overshoot the lowest point, or cause {bcolors.ITALIC}NAN{bcolors.ENDC} errors. A small {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}1e-6{bcolors.ENDC}) is like taking tiny "
-                             f"shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often {bcolors.ITALIC}0.0001{bcolors.ENDC}. If training fails or errors explode, "
-                             f"try making the {bcolors.ITALIC}lr{bcolors.ENDC} 10 times smaller (e.g., {bcolors.ITALIC}0.001{bcolors.ENDC} --> {bcolors.ITALIC}0.0001{bcolors.ENDC}).")
-    parser.add_argument("--dataset_split_fraction", required=False, type=list_of_floats, default=[0.8, 0.2],
-                        help=f"Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: {bcolors.ITALIC}training_fraction{bcolors.ENDC},"
-                             f"{bcolors.ITALIC}validation_fraction{bcolors.ENDC}. While the training subset will be used to train/update the network parameters, the validation subset will only be used to evaluate the "
-                             f"accuracy of the network when faced with new data. Therefore, the validation subset will never be used to update the networks parameters. {bcolors.WARNING}NOTE{bcolors.ENDC}: the sum of "
-                             f"{bcolors.ITALIC}training_fraction{bcolors.ENDC} and {bcolors.ITALIC}validation_fraction{bcolors.ENDC} must be equal to one.")
-    parser.add_argument("--output_path", required=True, type=str,
-                        help="Path to save the results (trained neural network, new metadata...)")
-    parser.add_argument("--reload", required=False, type=str,
-                        help="Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data)")
-    parser.add_argument("--ssd_scratch_folder", required=False, type=str,
-                        help=f"When the parameter {bcolors.UNDERLINE}load_images_to_ram{bcolors.ENDC} is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from "
-                             f"the default disk.")
+    ca.add_lat_dim(parser, default=3, help="Dimensionality of the latent space of the network (set by default to 3)")
+    ca.add_mode(parser, choices=["train", "predict"],
+                help=f"{bcolors.BOLD}train{bcolors.ENDC}: train a neural network from scratch or from a previous execution if reload is provided\n"
+                     f"{bcolors.BOLD}predict{bcolors.ENDC}: predict the adjustment for the input images/volume ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case)")
+    ca.add_epochs(parser)
+    ca.add_batch_size(parser, default=64, help=ca.BATCH_SIZE_HELP_ADJUST)
+    ca.add_learning_rate(parser, default=1e-5)
+    ca.add_dataset_split_fraction(parser)
+    ca.add_output_path(parser)
+    ca.add_reload(parser, help=ca.RELOAD_HELP_BASIC)
+    ca.add_ssd_scratch_folder(parser)
     args = parser.parse_args()
 
     # Check that training and validation fractions add up to one

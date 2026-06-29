@@ -1008,74 +1008,41 @@ def main():
     from hax.programs import fit_volume, adjust_weights_to_images
     # from hax.schedulers import CosineAnnealingScheduler
 
-    def list_of_floats(arg):
-        return list(map(float, arg.split(',')))
+    from hax.cli import common_args as ca
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--md", required=True, type=str,
-                        help="Xmipp/Relion metadata file with the images (+ alignments / CTF) to be analyzed")
-    parser.add_argument("--vol", required=True, type=str,
-                        help="Volume to be warped toward the images")
-    parser.add_argument("--mask", required=False, type=str,
-                        help="Binary mask computed from volume enclosing all the mass to be moved. If not provided, the volume will be automatically masked for you")
-    parser.add_argument("--load_images_to_ram", action='store_true',
-                        help=f"If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, "
-                             f"images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance "
-                             f"will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.")
-    parser.add_argument("--sr", required=True, type=float,
-                        help="Sampling rate of the images/volume")
-    parser.add_argument("--ctf_type", required=True, type=str, choices=["None", "apply", "wiener", "precorrect"],
-                        help="Determines whether to consider the CTF and, in case it is considered, whether it will be applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)")
-    parser.add_argument("--lat_dim", required=False, type=int, default=8,
-                        help="Dimensionality of the latent space of the network (set by default to 8)")
+    ca.add_md(parser)
+    ca.add_vol(parser, required=True, help="Volume to be warped toward the images")
+    ca.add_mask(parser, help="Binary mask computed from volume enclosing all the mass to be moved. If not provided, the volume will be automatically masked for you")
+    ca.add_load_images_to_ram(parser)
+    ca.add_sr(parser)
+    ca.add_ctf_type(parser)
+    ca.add_lat_dim(parser)
     parser.add_argument("--L1", required=False, type=int, default=7,
                         help="Degree of Zernike3D radial component (increasing this value might help finding more localized motions at the expense of higher memory consumption)")
     parser.add_argument("--L2", required=False, type=int, default=7,
                         help="Degree of Zernike3D angular component (increasing this value might help finding more localized motions at the expense of higher memory consumption)")
-    parser.add_argument("--mode", required=True, type=str, choices=["train", "predict", "send_to_pickle"],
-                        help=f"{bcolors.BOLD}train{bcolors.ENDC}: train a neural network from scratch or from a previous execution if reload is provided\n"
-                             f"{bcolors.BOLD}predict{bcolors.ENDC}: predict the latent vectors from the input images ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case)\n"
-                             f"{bcolors.BOLD}send_to_pickle{bcolors.ENDC}: save the network in pickle format. ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case - "
-                             f"needed by program {bcolors.UNDERLINE}estimate_latent_covariances{bcolors.ENDC})")
+    ca.add_mode(parser, help=ca.MODE_HELP_WITH_PICKLE)
     parser.add_argument("--num_gaussians", required=False, type=int,
                         help="Before training the network, Zernike3Deep will try to fit a set of Gaussians in the reference volume to recreate it. "
                              "The default criterium is to automatically determine the number of Gaussians neede to reproduce the reference volume "
                              "with high-fidelity. However, if you prefer to fix the number of Gaussians in advance based on your own criterium (e.g., "
                              "the number of residues in your protein), you can set this parameter. When set, the Zernike3Deep will fit this fixed number of Gaussians "
                              "so that the reproduce the reference volume as well as possible.")
-    parser.add_argument("--epochs", required=False, type=int, default=50,
-                        help="Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - "
-                             "as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it")
-    parser.add_argument("--batch_size", required=False, type=int, default=8,
-                        help="Determines how many images will be load in the GPU at any moment during training (set by default to 8 - "
-                             f"you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like {bcolors.UNDERLINE}nvidia-smi{bcolors.ENDC} "
-                             f"to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions")
-    parser.add_argument("--learning_rate", required=False, type=float, default=1e-4,
-                        help=f"The learning rate ({bcolors.ITALIC}lr{bcolors.ENDC}) sets the speed of learning. Think of the model as trying to find the lowest point in a valley; the {bcolors.ITALIC}lr{bcolors.ENDC} "
-                             f"is the size of the step it takes on each attempt. A large {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}0.01{bcolors.ENDC}) is like taking huge leaps — it's fast but can be unstable, "
-                             f"overshoot the lowest point, or cause {bcolors.ITALIC}NAN{bcolors.ENDC} errors. A small {bcolors.ITALIC}lr{bcolors.ENDC} (e.g., {bcolors.ITALIC}1e-6{bcolors.ENDC}) is like taking tiny "
-                             f"shuffles — it's stable but very slow and might get stuck before reaching the bottom. A good default is often {bcolors.ITALIC}0.0001{bcolors.ENDC}. If training fails or errors explode, "
-                             f"try making the {bcolors.ITALIC}lr{bcolors.ENDC} 10 times smaller (e.g., {bcolors.ITALIC}0.001{bcolors.ENDC} --> {bcolors.ITALIC}0.0001{bcolors.ENDC}).")
-    parser.add_argument("--dataset_split_fraction", required=False, type=list_of_floats, default=[0.8, 0.2],
-                        help=f"Here you can provide the fractions to split your data automatically into a training and a validation subset following the format: {bcolors.ITALIC}training_fraction{bcolors.ENDC},"
-                             f"{bcolors.ITALIC}validation_fraction{bcolors.ENDC}. While the training subset will be used to train/update the network parameters, the validation subset will only be used to evaluate the "
-                             f"accuracy of the network when faced with new data. Therefore, the validation subset will never be used to update the networks parameters. {bcolors.WARNING}NOTE{bcolors.ENDC}: the sum of "
-                             f"{bcolors.ITALIC}training_fraction{bcolors.ENDC} and {bcolors.ITALIC}validation_fraction{bcolors.ENDC} must be equal to one.")
-    parser.add_argument("--output_path", required=True, type=str,
-                        help="Path to save the results (trained neural network, new metadata...)")
-    parser.add_argument("--reload", required=False, type=str,
-                        help=f"Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data - "
-                             f"{bcolors.WARNING}NOTE{bcolors.ENDC}: Since Zernike3Deep also learns a gray level adjustment, reload must be the path to a folder containing two additional "
-                             f"folders called: {bcolors.UNDERLINE}Zernike3Deep{bcolors.ENDC} and {bcolors.UNDERLINE}Gaussian_volume_fitting{bcolors.ENDC})")
-    parser.add_argument("--ssd_scratch_folder", required=False, type=str,
-                        help=f"When the parameter {bcolors.UNDERLINE}load_images_to_ram{bcolors.ENDC} is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from "
-                             f"the default disk.")
+    ca.add_epochs(parser)
+    ca.add_batch_size(parser)
+    ca.add_learning_rate(parser)
+    ca.add_dataset_split_fraction(parser)
+    ca.add_output_path(parser)
+    ca.add_reload(parser,
+                  help=f"Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data - "
+                       f"{bcolors.WARNING}NOTE{bcolors.ENDC}: Since Zernike3Deep also learns a gray level adjustment, reload must be the path to a folder containing two additional "
+                       f"folders called: {bcolors.UNDERLINE}Zernike3Deep{bcolors.ENDC} and {bcolors.UNDERLINE}Gaussian_volume_fitting{bcolors.ENDC})")
+    ca.add_ssd_scratch_folder(parser)
     args = parser.parse_args()
 
     # Check that training and validation fractions add up to one
-    if sum(args.dataset_split_fraction) != 1:
-        raise ValueError(f"The sum of {bcolors.ITALIC}training_fraction{bcolors.ENDC} and {bcolors.ITALIC}validation_fraction{bcolors.ENDC} is not equal one. Please, update the values "
-                         f"to fulfill this requirement.")
+    ca.validate_dataset_split_fraction(args.dataset_split_fraction)
 
     # Ensure the output path exists for every mode
     os.makedirs(args.output_path, exist_ok=True)
