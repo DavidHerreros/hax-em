@@ -171,12 +171,18 @@ def add_reload(parser, required=False, help=None):
 
 
 def validate_dataset_split_fraction(fractions):
-    """Raise if the train/validation split does not sum to one (shared check)."""
+    """Exit cleanly (no traceback) if the train/validation split does not sum to one.
+
+    Shared check used by the training programs. Emits a one-line message on
+    stderr and exits with code 2 (the argparse convention for a usage error),
+    instead of raising a ValueError that would surface as a Python traceback.
+    """
     if sum(fractions) != 1:
-        raise ValueError(
-            f"The sum of {bcolors.ITALIC}training_fraction{bcolors.ENDC} and "
-            f"{bcolors.ITALIC}validation_fraction{bcolors.ENDC} is not equal one. Please, update the values "
-            f"to fulfill this requirement.")
+        print(
+            f"error: --dataset_split_fraction: the sum of {bcolors.ITALIC}training_fraction{bcolors.ENDC} and "
+            f"{bcolors.ITALIC}validation_fraction{bcolors.ENDC} must equal 1 (got {fractions}).",
+            file=sys.stderr)
+        raise SystemExit(2)
 
 
 # --------------------------------------------------------------------------- #
