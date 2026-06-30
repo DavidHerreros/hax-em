@@ -13,7 +13,6 @@ from functools import partial
 import numpy as np
 from sklearn.neighbors import KDTree
 
-from hax.generators import NumpyGenerator
 from hax.utils.loggers import bcolors
 
 
@@ -137,6 +136,11 @@ def estimate_noise_stddev(images, radius_fraction=0.5):
     return means, stds
 
 def filter_latent_space(space, thr=1.0, k=10, return_ids=False, batch_size=64):
+    # Imported lazily to avoid a circular import: hax.generators imports
+    # hax.utils.loggers, so hax.utils must not import hax.generators at module
+    # load time (the cycle is otherwise only masked by import order).
+    from hax.generators import NumpyGenerator
+
     # Prepare data loader
     data_loader = NumpyGenerator(space).return_grain_dataset(batch_size=batch_size, preShuffle=False, shuffle=False,
                                                              num_epochs=1, num_workers=0)
