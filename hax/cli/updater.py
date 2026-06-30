@@ -21,6 +21,8 @@ import os
 import sys
 import json
 import shlex
+import shutil
+import tempfile
 import argparse
 import subprocess
 from importlib import metadata, util
@@ -251,6 +253,43 @@ def _handle_git(repo, check, assume_yes):
     return 0
 
 
+def _remote_pyproject_changed(url, ref, installed_commit, remote_commit):
+    """Best-effort: did pyproject.toml change between installed_commit and remote_commit?
+
+    Returns True / False, or None if undeterminable (remote unreachable, ref not a
+    branch/tag, or the installed commit not reachable). Uses a blobless, no-checkout
+    clone so only the two pyproject.toml blobs are fetched, not the whole history.
+    """
+    if not installed_commit or not ref or ref == "HEAD":
+        return None
+    tmp = tempfile.mkdtemp(prefix="hax_update_")
+    try:
+        clone = subprocess.run(
+            ["git", "clone", "--quiet", "--filter=blob:none", "--no-checkout",
+             "--single-branch", "--branch", ref, url, tmp],
+            capture_output=True, text=True)
+        if clone.returncode != 0:
+            return None
+
+        def _present(commit):
+            return subprocess.run(["git", "-C", tmp, "cat-file", "-e", f"{commit}^{{commit}}"],
+                                  capture_output=True).returncode == 0
+
+        if not _present(installed_commit):
+            subprocess.run(["git", "-C", tmp, "fetch", "--quiet", "origin", installed_commit],
+                           capture_output=True)
+        if not _present(installed_commit):
+            return None
+        diff = subprocess.run(
+            ["git", "-C", tmp, "diff", "--name-only", installed_commit, remote_commit, "--", "pyproject.toml"],
+            capture_output=True, text=True)
+        if diff.returncode != 0:
+            return None
+        return bool(diff.stdout.strip())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _handle_vcs(direct_url, check, assume_yes):
     info = direct_url.get("vcs_info", {})
     url = direct_url.get("url", "")
@@ -266,24 +305,47 @@ def _handle_vcs(direct_url, check, assume_yes):
         return 1
     remote_commit = ls.stdout.split()[0]
 
-    extra = _detect_cuda_extra()
-    spec = f"git+{url}@{branch}" if branch else f"git+{url}"
-    target = f"{spec}#egg={DIST}[{extra}]" if extra else spec
-    cmd = _pip("install", "--upgrade", "--force-reinstall", target)
-
     if installed_commit and remote_commit.startswith(installed_commit[:12]):
         print(_green(f"hax-em is up to date with {ref} ({remote_commit[:12]})."))
         return 0
 
     print(_yellow(f"A newer commit is available on '{ref}': "
                   f"{installed_commit[:12] or '?'} -> {_bold(remote_commit[:12])}"))
+
+    # Mirror the editable flow: code-only reinstall when dependencies are
+    # unchanged, full (dependency-resolving) reinstall when pyproject.toml changed.
+    deps_changed = _remote_pyproject_changed(url, ref, installed_commit, remote_commit)
+    extra = _detect_cuda_extra()
+    spec = f"git+{url}@{branch}" if branch else f"git+{url}"
+    # PEP 508 direct reference so the CUDA extra is applied reliably.
+    full_target = f"{DIST}[{extra}] @ {spec}" if extra else spec
+    full_cmd = _pip("install", "--upgrade", "--force-reinstall", full_target)
+    code_cmd = _pip("install", "--upgrade", "--force-reinstall", "--no-deps", spec)
+
     if check:
-        print(f"To update, run:\n    {_bold(_show(cmd))}")
+        if deps_changed is False:
+            print("Dependencies are unchanged — code-only update. To update, run:\n"
+                  f"    {_bold(_show(code_cmd))}")
+        else:
+            note = "" if deps_changed else " (could not verify dependency changes)"
+            print(f"This update may change dependencies{note}. To update, run:\n"
+                  f"    {_bold(_show(full_cmd))}")
         return 0
-    if not _confirm("Reinstall from git now (pip re-resolves dependencies)?", assume_yes):
-        print(f"Skipped. To update yourself, run:\n    {_bold(_show(cmd))}")
-        return 0
-    return _run_live(cmd)
+
+    if deps_changed is False:
+        # Safe, analogous to an editable `git pull`: refresh the code, leave deps.
+        print("Dependencies unchanged; updating code only (--no-deps).")
+        return _run_live(code_cmd)
+
+    if deps_changed is None:
+        print(_yellow("Could not determine whether dependencies changed; a full reinstall "
+                      "(with dependency resolution) will be used."))
+    else:
+        print(_yellow("This update modifies pyproject.toml — dependencies will be updated/added."))
+    if _confirm("Proceed with the full reinstall (updates packages too)?", assume_yes):
+        return _run_live(full_cmd)
+    print(f"Skipped. To finish it yourself, run:\n    {_bold(_show(full_cmd))}")
+    return 0
 
 
 def main():
