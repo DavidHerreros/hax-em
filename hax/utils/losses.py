@@ -229,7 +229,7 @@ def correlation_coefficient_loss(x, y):
     y_square_sum = jnp.sum(ym * ym, axis=[1, 2])
     r_den = jnp.sqrt(x_square_sum * y_square_sum)
     r = r_num / (r_den + epsilon)
-    return jnp.mean(1. - r)
+    return jnp.mean(1. - r, axis=-1)
 
 def simae(
     a: chex.Array,
@@ -417,3 +417,185 @@ def sliced_wasserstein_loss(x: jnp.ndarray, x_true: jnp.ndarray, key: jax.random
     loss = jnp.mean((x_proj_sorted - x_true_proj_sorted) ** 2)
 
     return loss
+
+
+def build_fourier_rings(box_size: int) -> tuple[jax.Array, int]:
+    """Build a one-hot ring membership tensor for an rFFT.
+
+    Parameters
+    ----------
+    box_size
+        Image side length in pixels.
+
+    Returns
+    -------
+    rings
+        ``(H, W//2+1, n_rings)`` float32 tensor.  ``rings[y, x, r]`` is
+        1.0 if Fourier coefficient ``(y, x)`` belongs to ring ``r``,
+        else 0.0.
+    n_rings
+        Number of rings = ``box_size // 2 + 1`` (DC through Nyquist).
+
+    The radius assignment matches the original ``build_fourier_rings``
+    exactly: integer-rounded Euclidean radius from DC, with coefficients
+    beyond Nyquist excluded.
+    """
+    H = box_size
+    W = box_size // 2 + 1
+    nyquist = box_size // 2
+    n_rings = nyquist + 1
+
+    fx = np.arange(W)
+    fy = np.where(np.arange(H) <= H // 2,
+                  np.arange(H),
+                  np.arange(H) - H)
+
+    r = np.sqrt(fx[None, :] ** 2 + fy[:, None] ** 2)
+    ring_idx = np.round(r).astype(np.int32)
+
+    # Build one-hot: rings[y, x, r] = 1 iff ring_idx[y, x] == r AND r <= nyquist.
+    # Indices > nyquist are automatically excluded because we only allocate
+    # n_rings slots and use np.where to clip.
+    rings_np = np.zeros((H, W, n_rings), dtype=np.float32)
+    valid = ring_idx <= nyquist
+    yy, xx = np.where(valid)
+    rings_np[yy, xx, ring_idx[yy, xx]] = 1.0
+
+    return jnp.asarray(rings_np), n_rings
+
+
+def preprocess_particles(
+        images: jax.Array,
+        apply_mean_subtract: bool = True,
+) -> jax.Array:
+    """Convert real particle images to their rFFT for FRC computation."""
+    if apply_mean_subtract:
+        images = images - images.mean(axis=(-2, -1), keepdims=True)
+    return jnp.fft.rfft2(images, norm="ortho")
+
+
+def frc_loss(
+        pred_ft: jax.Array,
+        obs_ft: jax.Array,
+        rings: jax.Array,
+        band_mask: jax.Array,
+        eps: float = 1e-8,
+) -> jax.Array:
+    """Compute the negative mean FRC over the precomputed band.
+
+    Parameters
+    ----------
+    pred_ft, obs_ft
+        Complex (B, H, W//2+1) rFFT tensors.
+    rings
+        One-hot ring tensor (H, W//2+1, n_rings) from
+        ``build_fourier_rings``.
+    band_mask
+        Precomputed (n_rings,) float mask: 1.0 inside the band, 0.0
+        outside.  Built once at ``FRCLoss`` construction time.
+    eps
+        Numerical safety for the denominator.
+
+    Returns
+    -------
+    scalar loss = -mean over batch of (mean over band of FRC).
+    """
+    # |pred_ft|^2 and |obs_ft|^2 via real/imag parts — direct, no complex mul.
+    pred_r, pred_i = pred_ft.real, pred_ft.imag
+    obs_r, obs_i = obs_ft.real, obs_ft.imag
+
+    pred_sq = pred_r * pred_r + pred_i * pred_i  # (B, H, W//2+1)
+    obs_sq = obs_r * obs_r + obs_i * obs_i  # (B, H, W//2+1)
+    cross = pred_r * obs_r + pred_i * obs_i  # (B, H, W//2+1) — Re(pred · conj(obs))
+
+    # Stack the three reductions, do one tensordot.
+    # stacked: (3, B, H, W//2+1) → contract axes (2,3) with rings axes (0,1).
+    stacked = jnp.stack([cross, pred_sq, obs_sq], axis=0)
+    # Result: (3, B, n_rings)
+    reduced = jnp.tensordot(stacked, rings, axes=[[2, 3], [0, 1]])
+
+    cross_r = reduced[0]
+    pred_sq_r = reduced[1]
+    obs_sq_r = reduced[2]
+
+    # Per-ring FRC
+    denom = jnp.sqrt(pred_sq_r * obs_sq_r + eps)
+    frc = cross_r / denom  # (B, n_rings)
+
+    # Mean over band, then mean over batch
+    band_count = jnp.maximum(band_mask.sum(), 1.0)
+    per_batch_frc = (frc * band_mask[None, :]).sum(axis=1) / band_count
+    return -jnp.mean(per_batch_frc)
+
+
+class FRCLoss:
+    """FRC loss wrapper to simplify its call.
+
+    Internally, computed the optimal bands and stores them so they don't need to be passed during the call
+    """
+
+    def __init__(
+            self,
+            box_size: int,
+            apix: float,
+            min_resolution_A: float = 30.0,
+            max_resolution_A: float = 8.0,
+            apply_mean_subtract: bool = True,
+    ):
+        minpx, maxpx = recommended_band(
+            box_size=box_size, apix=apix,
+            min_resolution_A=min_resolution_A,
+            max_resolution_A=max_resolution_A,
+        )
+
+        self.box_size = box_size
+        self.minpx = minpx
+        self.maxpx = maxpx
+        self.apply_mean_subtract = apply_mean_subtract
+        self.rings, self.n_rings = build_fourier_rings(box_size)
+
+        assert 0 <= minpx < maxpx < self.n_rings, (
+            f"minpx={minpx}, maxpx={maxpx} must satisfy "
+            f"0 <= minpx < maxpx < {self.n_rings}"
+        )
+
+        # Precompute the band mask once — same closed-closed semantics
+        # [minpx, maxpx] as the original (using <= on both ends).
+        ring_ids = np.arange(self.n_rings)
+        band_mask_np = ((ring_ids >= minpx) & (ring_ids <= maxpx)).astype(np.float32)
+        self.band_mask = jnp.asarray(band_mask_np)
+
+    def __call__(self, pred_real: jax.Array, obs_real: jax.Array) -> jax.Array:
+        pred_ft = preprocess_particles(pred_real,
+                                       apply_mean_subtract=self.apply_mean_subtract)
+        obs_ft = preprocess_particles(obs_real,
+                                      apply_mean_subtract=self.apply_mean_subtract)
+        return self.call_complex(pred_ft, obs_ft)
+
+    def call_complex(self, pred_ft: jax.Array, obs_ft: jax.Array) -> jax.Array:
+        return frc_loss(pred_ft, obs_ft, self.rings, self.band_mask)
+
+
+def recommended_band(
+        box_size: int,
+        apix: float,
+        min_resolution_A: float = 30.0,
+        max_resolution_A: float = 8.0,
+) -> tuple[int, int]:
+    minpx = int(round(box_size * apix / min_resolution_A))
+    maxpx = int(round(box_size * apix / max_resolution_A))
+    minpx = max(1, minpx)
+    maxpx = min(box_size // 2 - 1, maxpx)
+    assert minpx < maxpx, (
+        f"computed minpx={minpx} >= maxpx={maxpx}; check inputs"
+    )
+    return minpx, maxpx
+
+
+def chamfer_distance(x, y):
+    # x: (N, D), y: (M, D) — N and M can differ
+    diff = x[:, None, :] - y[None, :, :]      # (N, M, D)
+    d2 = jnp.sum(diff ** 2, axis=-1)          # (N, M) squared distances
+    x_to_y = jnp.min(d2, axis=1)              # (N,) nearest y for each x
+    y_to_x = jnp.min(d2, axis=0)              # (M,) nearest x for each y
+    return jnp.mean(x_to_y) + jnp.mean(y_to_x)

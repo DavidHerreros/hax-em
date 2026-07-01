@@ -72,19 +72,22 @@ def calculate_spectral_centroid_3d(data_grid):
 
 
 class Siren2Linear(nnx.Module):
-    def __init__(self, in_features, out_features, rngs, is_first=False, custom_init=False, is_residual=False, w0=30.0, s=0.0, dtype=jnp.float32, use_bias=True):
+    def __init__(self, in_features, out_features, rngs, is_first=False, custom_init=False, is_residual=False, w0=30.0, s=0.0, c=None, dtype=jnp.float32, use_bias=True):
         self.w0 = w0
         self.is_first = is_first
         self.is_residual = is_residual
 
+        if c is None:
+            c = 1.0 if is_first else 6.0
+
         # Standard SIREN Initialization
         if is_first:
-            kernel_init = siren_init_first(c=1.0)
+            kernel_init = siren_init_first(c=c)
         else:
             if custom_init:
-                kernel_init = siren_init(c=6.0, omega=1.0)
+                kernel_init = siren_init(c=c, omega=1.0)
             else:
-                kernel_init = siren_init_original(c=6.0, omega=1.0)
+                kernel_init = siren_init_original(c=c, omega=1.0)
 
         # Create the base linear layer
         self.linear = nnx.Linear(
