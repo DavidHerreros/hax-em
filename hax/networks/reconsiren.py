@@ -74,6 +74,46 @@ def generate_cylinder_points(n, radius=1.0, height=1.0):
     return np.stack([x, y, z], axis=-1)
 
 
+def generate_spherical_rotations(n: int) -> np.ndarray:
+    """
+    Generates N (3, 3) rotation matrices that distribute evenly over a sphere.
+    When applied to the Z-axis vector [0, 0, 1]^T, the resulting vectors
+    form a Fibonacci lattice on the unit sphere.
+    """
+    # 1. Generate Fibonacci sphere points
+    indices = np.arange(0, n, dtype=float)
+    phi = (1.0 + np.sqrt(5.0)) / 2.0  # Golden ratio
+
+    # Using the standard offset formulation avoids placing points exactly on the poles
+    # (z = 1 or z = -1), which neatly prevents division-by-zero errors later.
+    z = 1.0 - (2.0 * indices + 1.0) / n
+    radius = np.sqrt(1.0 - z ** 2)
+    theta = 2.0 * np.pi * indices / phi
+
+    x = radius * np.cos(theta)
+    y = radius * np.sin(theta)
+
+    # 2. Build the rotation matrices analytically
+    # We construct the matrix that aligns [0,0,1] to [x,y,z] with zero twist.
+    denom = 1.0 + z
+
+    R = np.zeros((n, 3, 3))
+
+    R[:, 0, 0] = 1.0 - (x ** 2) / denom
+    R[:, 0, 1] = -(x * y) / denom
+    R[:, 0, 2] = x
+
+    R[:, 1, 0] = -(x * y) / denom
+    R[:, 1, 1] = 1.0 - (y ** 2) / denom
+    R[:, 1, 2] = y
+
+    R[:, 2, 0] = -x
+    R[:, 2, 1] = -y
+    R[:, 2, 2] = z
+
+    return R
+
+
 def sliced_wasserstein_sphere(
     directions: jax.Array,      # (N, 3) unit vectors from R[:,:,2]
     rng: jax.Array,
@@ -180,7 +220,7 @@ class PoseHeadEnsemble(nnx.Module):
 
 
 class EncoderPose(nnx.Module):
-    def __init__(self, input_dim, pyramid_levels=4, num_components=18, refine_current_assignment=False, *, rngs: nnx.Rngs):
+    def __init__(self, input_dim, pyramid_levels=4, num_components=64, refine_current_assignment=False, *, rngs: nnx.Rngs):
         self.input_dim = input_dim
         self.input_conv_dim = 64  # Original was 64
         self.out_conv_dim = int(self.input_conv_dim / (2 ** 3))
@@ -210,8 +250,11 @@ class EncoderPose(nnx.Module):
         # self.hidden_layers_linear.append(Linear(1024, 8, rngs=rngs))
         self.hidden_layers_linear = nnx.List(hidden_layers_linear)
 
+        # Anchor rotations
+        self.anchor_rotations = jnp.array(generate_spherical_rotations(num_components))
+
         # Layers to 9D rotation
-        self.ensemble_6d_heads = PoseHeadEnsemble(num_members=num_components, is_refine=refine_current_assignment, rngs=rngs)
+        self.ensemble_6d_heads = PoseHeadEnsemble(num_members=num_components, is_refine=False, rngs=rngs)
 
         # Layers to shifts
         hidden_shifts = [Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
@@ -272,6 +315,8 @@ class EncoderPose(nnx.Module):
         b3 = jnp.cross(b1, b2, axis=-1)
         rotations = jnp.stack([b1, b2, b3], axis=-1)
         rotations = rotations.reshape(x.shape[0], self.num_components, 3, 3)
+        if not self.refine_current_assignment:
+            rotations = jnp.einsum('bnhk,nkw->bnhw', rotations, self.anchor_rotations)
 
         # Third output: in plane shifts
         in_plane_shifts = nnx.gelu(self.hidden_shifts[0](x))
@@ -690,7 +735,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
         coords, values = model.delta_volume_decoder()
 
         # Decode het volume
-        coords_het, values_het = model.delta_het_decoder(sample)
+        coords_het, values_het = model.delta_het_decoder(latent)
 
         # Refine current assignment (if provided)
         # rotations = jnp.matmul(rotations, current_rotations[:, None, :, :])
@@ -790,7 +835,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
         loss_repulsion = repulsion_loss(directions, s=2.)
         loss_uniform = lambda_uniform * loss_swd + 0.0 * loss_repulsion
 
-        loss = (recon_loss_all + 0.0 * l1_loss + 0.00000 * kl_loss + 1.0 * loss_uniform)
+        loss = (recon_loss_all + 1.0 * loss_uniform)
         return loss, (recon_loss, loss_uniform, directions)
 
     # Optimizer parameters
