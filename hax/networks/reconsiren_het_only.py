@@ -16,7 +16,7 @@ from sklearn.cluster import KMeans
 
 from hax.utils import *
 from hax.layers import *
-from hax.programs import splat_weights_trilinear, FastVariableBlur3D
+# from hax.pretrained_models import CryoUni, CryoUniNNX, CryoUniHead
 
 
 def wrap_zyz_angles(angles):
@@ -98,6 +98,26 @@ def generate_spherical_rotations(n: int) -> np.ndarray:
     return R
 
 
+def expmap(omega):
+    angle = jnp.linalg.norm(omega)
+    wx, wy, wz = omega
+    W = jnp.array([[ 0,  -wz,  wy],
+                   [ wz,   0, -wx],
+                   [-wy,  wx,   0]])
+    return (jnp.eye(3)
+            + jnp.sinc(angle / jnp.pi) * jnp.pi * W
+            + (1 - jnp.cos(angle)) / (angle**2 + 1e-8) * (W @ W))
+
+
+def matrix_fisher_kl_uniform(log_conc):
+    """
+    log_conc: (B, L, 3)
+    returns:  (B, L)
+    """
+    conc = jnp.exp(log_conc)
+    return 0.5 * jnp.sum(conc - 1.0 - log_conc, axis=-1)
+
+
 def generate_sphere_points(n):
     """
     Generates N points uniformly distributed within a unit sphere.
@@ -124,6 +144,111 @@ def generate_sphere_points(n):
     return np.stack([x, y, z], axis=-1)
 
 
+def sliced_wasserstein_sphere(
+    directions: jax.Array,      # (N, 3) unit vectors from R[:,:,2]
+    rng: jax.Array,
+    n_projections: int = 64,
+) -> jax.Array:
+    """
+    Sliced Wasserstein distance between direction samples and
+    a uniform distribution over S².
+    """
+    n = directions.shape[0]
+    rng_proj, rng_prior = jax.random.split(rng)
+
+    # Sample reference uniform directions on S²
+    raw = jax.random.normal(rng_prior, shape=(n, 3))
+    uniform_sphere = raw / jnp.linalg.norm(raw, axis=-1, keepdims=True)
+
+    # Random projection directions (also on S²)
+    raw_proj = jax.random.normal(rng_proj, shape=(n_projections, 3))
+    proj_dirs = raw_proj / jnp.linalg.norm(raw_proj, axis=-1, keepdims=True)
+
+    # Project both sets onto each direction: (n_projections, N)
+    d_proj = jnp.einsum("pd,nd->pn", proj_dirs, directions)
+    u_proj = jnp.einsum("pd,nd->pn", proj_dirs, uniform_sphere)
+
+    # Sort and compute L2 distance between sorted projections
+    d_sorted = jnp.sort(d_proj, axis=-1)
+    u_sorted = jnp.sort(u_proj, axis=-1)
+
+    return jnp.mean((d_sorted - u_sorted) ** 2)
+
+
+def repulsion_loss(
+        directions: jax.Array,  # (N, 3) unit vectors
+        s: float = 2.0,  # Riesz exponent: higher = more local repulsion
+        eps: float = 1e-6,  # numerical safety
+) -> jax.Array:
+    """
+    Riesz s-energy: penalizes pairs of directions that are too close on S².
+
+    E = (1/N²) * sum_{i≠j} 1 / ||d_i - d_j||^s
+
+    s=1  → Coulomb potential (long range, global)
+    s=2  → stronger local repulsion
+    s→∞  → only nearest neighbor matters (purely local)
+
+    Minimizing this energy = maximizing the spread of points on S²,
+    which is the classical Tammes/Thomson problem.
+    """
+    # Pairwise Euclidean distances on S²
+    diff = directions[:, None, :] - directions[None, :, :]  # (N, N, 3)
+    sq_dist = jnp.sum(diff ** 2, axis=-1)  # (N, N)
+
+    # Mask diagonal to avoid self-repulsion
+    mask = 1.0 - jnp.eye(directions.shape[0])
+    energy = mask / (sq_dist + eps) ** (s / 2.0)
+
+    return jnp.mean(energy)
+
+
+class PoseHead(nnx.Module):
+    def __init__(self, is_refine=False, *, rngs: nnx.Rngs):
+        if is_refine:
+            kernel_init = nnx.initializers.zeros_init()
+            bias_init = nnx.initializers.zeros_init()
+        else:
+            kernel_init=nnx.initializers.normal(1e-2)
+            bias_init=rot6d_perturbation_init(N=1, sigma=5.0, mode="bias")
+            # kernel_init=nnx.initializers.normal(1e-4)
+            # bias_init=rot6d_perturbation_init(N=1, sigma=1.0, mode="bias")
+            # kernel_init=rot6d_perturbation_init(N=1, sigma=1.0, mode="weight")
+            # bias_init=nnx.initializers.zeros_init()
+            # kernel_init = jax.nn.initializers.normal(stddev=1e-4)
+            # bias_init = nnx.initializers.zeros_init()
+
+        hidden_layers = []
+        for _ in range(3):
+            hidden_layers.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers = nnx.List(hidden_layers)
+        self.pose_layer = Linear(1024, 6, rngs=rngs, kernel_init=kernel_init, bias_init=bias_init)
+
+    def __call__(self, x):
+        for layer in self.hidden_layers:
+            # x = nnx.gelu(x + layer(x))
+            x = nnx.gelu(layer(x))
+        return self.pose_layer(x)
+
+
+class PoseHeadEnsemble(nnx.Module):
+    def __init__(self, num_members, is_refine=False, *, rngs: nnx.Rngs):
+        key = rngs.params()
+        member_keys = jax.random.split(key, num_members)
+
+        @nnx.vmap(in_axes=(0), out_axes=0)
+        def make_member(key):
+            return PoseHead(is_refine=is_refine, rngs=nnx.Rngs(key))
+
+        self.ensemble = make_member(member_keys)
+
+    def __call__(self, x):
+        @nnx.vmap(in_axes=(0, None), out_axes=1)
+        def forward(model, x):
+            return model(x)
+        return forward(self.ensemble, x)
+
+
 class EncoderPose(nnx.Module):
     def __init__(self, input_dim, pyramid_levels=4, num_components=18, refine_current_assignment=False, *, rngs: nnx.Rngs):
         self.input_dim = input_dim
@@ -138,26 +263,15 @@ class EncoderPose(nnx.Module):
 
         # Hidden layers
         hidden_layers = [Linear(self.input_conv_dim * self.input_conv_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
-        for _ in range(3):
+        # hidden_layers = [Linear(self.cryouni_head.out_shape, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        for _ in range(2):
             hidden_layers.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         self.hidden_layers = nnx.List(hidden_layers)
 
-        # Layers to 9D rotation
-        hidden_6d_rotation = [Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
-        hidden_6d_rotation.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        hidden_6d_rotation.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        if refine_current_assignment:
-            hidden_6d_rotation.append(Linear(1024, self.num_components * 6, kernel_init=nnx.initializers.zeros_init(), rngs=rngs))
-        else:
-            # identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...]
-            # identity_6d = jnp.tile(identity_6d, (1, self.num_components))
-            kernel_init = jax.nn.initializers.normal(stddev=1e-4)
-            # bias_init = lambda key, shape, dtype: identity_6d
-            # kernel_init = nnx.initializers.zeros_init()
-            # bias_init = nnx.initializers.normal(stddev=1.0)
-            bias_init = nnx.initializers.zeros_init()
-            hidden_6d_rotation.append(Linear(1024, self.num_components * 6, kernel_init=kernel_init, bias_init=bias_init, rngs=rngs))
-        self.hidden_6d_rotation = nnx.List(hidden_6d_rotation)
+        # Layers to 6D rotation
+        self.ensemble_6d_heads = PoseHeadEnsemble(num_members=num_components, is_refine=refine_current_assignment, rngs=rngs)
+        self.logstd_6d_rotation = Linear(1024, self.num_components * 3, rngs=rngs)
+        self.layer_normalization = nnx.LayerNorm(1024, rngs=rngs)
 
         # Layers to shifts
         hidden_shifts = [Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
@@ -166,24 +280,51 @@ class EncoderPose(nnx.Module):
         if refine_current_assignment:
             hidden_shifts.append(Linear(1024, 2, rngs=rngs, kernel_init=nnx.initializers.zeros_init()))
         else:
-            hidden_shifts.append(Linear(1024, 2, rngs=rngs, kernel_init=nnx.initializers.zeros_init()))
+            hidden_shifts.append(Linear(1024, 2, rngs=rngs))
         self.hidden_shifts = nnx.List(hidden_shifts)
 
         # Probability head
         self.prob_head = nnx.Linear(in_features=1024, out_features=num_components, kernel_init=nnx.initializers.zeros_init(),
                                     bias_init=nnx.initializers.constant(1. / num_components), rngs=rngs)
 
-    def __call__(self, x, return_diversity_loss=False, is_training=False, key=None):
+    def matrix_fisher_sample(self, key, R_mean, log_conc, num_samples=1):
+        """
+        R_mean:   (B, L, 3, 3)
+        log_conc: (B, L, 3)
+        returns:  (num_samples, B, L, 3, 3)
+        """
+        B, L = R_mean.shape[:2]
+
+        keys = jax.random.split(key, B * L).reshape(B, L, 2)  # (B, L, 2)
+
+        def sample_one(key_i, R_i, log_conc_i):
+            std = 1.0 / jnp.sqrt(jnp.exp(log_conc_i) + 1e-8)  # (3,)
+            omega = jax.random.normal(key_i, (num_samples, 3)) * std  # (S, 3)
+            delta_Rs = jax.vmap(expmap)(omega)  # (S, 3, 3)
+            return jax.vmap(lambda dR: R_i @ dR)(delta_Rs)  # (S, 3, 3)
+
+        # vmap over B and L
+        samples = jax.vmap(jax.vmap(sample_one))(
+            keys, R_mean, log_conc
+        )  # (B, L, S, 3, 3)
+
+        return samples.transpose(2, 0, 1, 3, 4)  # (S, B, L, 3, 3)
+
+    def __call__(self, x, key=None):
         # Resize images
         x = jax.image.resize(x, (x.shape[0], self.input_conv_dim, self.input_conv_dim, 1), method="bilinear")
+
+        # x = self.cryouni(x)
+        # x = self.cryouni_head(x["clstokens"], x["patchtokens"])
 
         # Hidden layers
         x = rearrange(x, 'b h w c -> b (h w c)')
         for layer in self.hidden_layers:
-            if layer.in_features == layer.out_features:
-                x = nnx.gelu(x + layer(x))
-            else:
-                x = nnx.gelu(layer(x))
+            # if layer.in_features == layer.out_features:
+            #     x = nnx.gelu(x + layer(x))
+            # else:
+            #     x = nnx.gelu(layer(x))
+            x = nnx.gelu(layer(x))
 
         # First output: rotation matrices
         rotations_6d = nnx.gelu(self.hidden_6d_rotation[0](x))
@@ -194,14 +335,8 @@ class EncoderPose(nnx.Module):
 
         rotations_6d = rotations_6d.reshape(x.shape[0] * self.num_components, 6)
         if self.refine_current_assignment:
-            identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...].repeat(rotations_6d.shape[0], axis=0)
+            identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, None, ...]
             rotations_6d = identity_6d + rotations_6d
-
-        # Add continuous exploration noise ONLY during training
-        # if is_training:
-        #     # stddev controls the exploration radius around the anchors
-        #     noise = jax.random.normal(key, rotations_6d.shape) * 0.0001
-        #     rotations_6d = rotations_6d + noise
 
         a1, a2 = jnp.split(rotations_6d, 2, axis=-1)
         b1 = a1 / jnp.clip(jnp.linalg.norm(a1, axis=-1, keepdims=True), a_min=1e-6)
@@ -211,15 +346,14 @@ class EncoderPose(nnx.Module):
         rotations = jnp.stack([b1, b2, b3], axis=-1)
         rotations = rotations.reshape(x.shape[0], self.num_components, 3, 3)
         rotations = jnp.einsum('bnhk,nkw->bnhw', rotations, self.anchor_rotations)
+        # if key is not None:
+        #     rotations = self.matrix_fisher_sample(key, rotations, logstd_rotations).squeeze(axis=0)
 
         # Third output: in plane shifts
         in_plane_shifts = nnx.gelu(self.hidden_shifts[0](x))
         for layer in self.hidden_shifts[1:-1]:
             in_plane_shifts = nnx.gelu(in_plane_shifts + layer(in_plane_shifts))
-        # in_plane_shifts = 0.5 * self.input_dim * self.hidden_shifts[-1](in_plane_shifts)
         in_plane_shifts = self.hidden_shifts[-1](in_plane_shifts)
-        # if self.refine_current_assignment:
-        #     in_plane_shifts = self.alpha_shifts * in_plane_shifts
 
         # Broadcast shifts to euler angles shape
         in_plane_shifts = jnp.broadcast_to(in_plane_shifts[:, None, :], (in_plane_shifts.shape[0], self.num_components, 2))
@@ -227,14 +361,7 @@ class EncoderPose(nnx.Module):
         # Probability
         logits = nnx.sigmoid(self.prob_head(x))
 
-        if return_diversity_loss:
-            directions = rotations @ jnp.array([0, 0, 1])
-            pairwise_dots = directions @ directions.transpose(0, 2, 1)
-            off_diagonal_dots = pairwise_dots * (1.0 - jnp.eye(rotations.shape[1], dtype=pairwise_dots.dtype))
-            diversity_loss = jnp.mean(jnp.sum(jnp.square(off_diagonal_dots), axis=(-2, -1)))
-            return rotations, in_plane_shifts, logits, diversity_loss
-        else:
-            return rotations, in_plane_shifts, logits
+        return rotations, in_plane_shifts, logits, 0.0
 
 class EncoderHet(nnx.Module):
     def __init__(self, input_dim, lat_dim=8, *, rngs: nnx.Rngs):
@@ -242,41 +369,38 @@ class EncoderHet(nnx.Module):
         self.input_conv_dim = 64  # Original was 64
         self.out_conv_dim = int(self.input_conv_dim / (2 ** 3))
 
+        # self.cryouni_head = CryoUniHead(image_size=self.input_conv_dim, rngs=rngs)
+
         # # Hidden layers
-        # hidden_layers_conv = [Conv(1, 128, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16)]
+        # hidden_layers_conv = [Conv(1, 64, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16)]
+        # hidden_layers_conv.append(Conv(64, 64, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+        #
+        # hidden_layers_conv.append(Conv(64, 128, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
         # hidden_layers_conv.append(Conv(128, 128, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-        # hidden_layers_conv.append(nnx.BatchNorm(num_features=128, momentum=0.9, epsilon=1e-5, dtype=jnp.bfloat16, rngs=rngs))
         #
         # hidden_layers_conv.append(Conv(128, 256, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+        # hidden_layers_conv.append(Conv(256, 256, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
         # hidden_layers_conv.append(Conv(256, 256, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-        # hidden_layers_conv.append(nnx.BatchNorm(num_features=256, momentum=0.9, epsilon=1e-5, dtype=jnp.bfloat16, rngs=rngs))
         #
         # hidden_layers_conv.append(Conv(256, 512, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
         # hidden_layers_conv.append(Conv(512, 512, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-        # hidden_layers_conv.append(Conv(512, 512, kernel_size=(3, 3), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-        # hidden_layers_conv.append(nnx.BatchNorm(num_features=512, momentum=0.9, epsilon=1e-5, dtype=jnp.bfloat16, rngs=rngs))
-        #
-        # hidden_layers_conv.append(Conv(512, 1024, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-        # hidden_layers_conv.append(Conv(1024, 1024, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-        # hidden_layers_conv.append(Conv(1024, 1024, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-        # hidden_layers_conv.append(nnx.BatchNorm(num_features=1024, momentum=0.9, epsilon=1e-5, dtype=jnp.bfloat16, rngs=rngs))
+        # hidden_layers_conv.append(Conv(512, 512, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
         # self.hidden_layers_conv = nnx.List(hidden_layers_conv)
         #
-        # hidden_layers_linear = [Linear(self.out_conv_dim * self.out_conv_dim * 1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        # hidden_layers_linear = [Linear(self.out_conv_dim * self.out_conv_dim * 512, 1024, rngs=rngs, dtype=jnp.bfloat16)]
         # hidden_layers_linear.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         # hidden_layers_linear.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-        # hidden_layers_linear.append(nnx.BatchNorm(num_features=1024, momentum=0.9, epsilon=1e-5, dtype=jnp.bfloat16, rngs=rngs))
         # # self.hidden_layers_linear.append(Linear(1024, 8, rngs=rngs))
         # self.hidden_layers_linear = nnx.List(hidden_layers_linear)
         #
         # # Layers to latent
-        # hidden_latent = [Linear(1024, 256, rngs=rngs, dtype=jnp.bfloat16)]
-        # hidden_latent.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
-        # hidden_latent.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
-        # hidden_latent.append(nnx.BatchNorm(num_features=256, momentum=0.9, epsilon=1e-5, dtype=jnp.bfloat16, rngs=rngs))
+        # hidden_latent = [Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        # hidden_latent.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        # hidden_latent.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         # self.hidden_latent = nnx.List(hidden_latent)
-        # self.mean_x = Linear(256, lat_dim, rngs=rngs)
-        # self.logstd_x = Linear(256, lat_dim, rngs=rngs)
+        # self.mean_x = Linear(1024, lat_dim, rngs=rngs)
+        # self.logstd_x = Linear(1024, lat_dim, rngs=rngs)
+        # self.layer_normalization = nnx.LayerNorm(1024, rngs=rngs)
 
         # self.input_conv_dim = 32  # Original was 64
         # self.out_conv_dim = int(self.input_conv_dim / (2 ** 4))
@@ -302,205 +426,249 @@ class EncoderHet(nnx.Module):
         #
         # self.hidden_layers_linear = nnx.List(hidden_layers_linear)
 
-        # hidden_layers = [Linear(self.input_dim * self.input_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
-        # for _ in range(3):
+        hidden_layers = [Linear(self.input_dim * self.input_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        # hidden_layers = [Linear(self.cryouni_head.out_shape, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        # hidden_layers = [Linear(768, 256, rngs=rngs, dtype=jnp.bfloat16)]
+        for _ in range(2):
+            hidden_layers.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        # for _ in range(12):
         #     hidden_layers.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         # hidden_layers.append(Linear(1024, 256, rngs=rngs, dtype=jnp.bfloat16))
-        # for _ in range(2):
+        # for _ in range(4):
         #     hidden_layers.append(Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
-        # self.hidden_layers = nnx.List(hidden_layers)
-        #
-        # self.mean_x = Linear(256, lat_dim, rngs=rngs)
-        # self.logstd_x = Linear(256, lat_dim, rngs=rngs)
+        self.hidden_layers = nnx.List(hidden_layers)
 
-        # Mamba vision style encoder
-        self.patch_embed = nnx.Conv(1, 1024,
-                                    kernel_size=(4, 4),
-                                    strides=(4, 4),
-                                    rngs=rngs)
-        self.layers = nnx.List([MambaBlock(1024, rngs=rngs) for _ in range(6)])
-        self.final_norm = nnx.LayerNorm(1024, rngs=rngs)
         self.mean_x = Linear(1024, lat_dim, rngs=rngs)
         self.logstd_x = Linear(1024, lat_dim, rngs=rngs)
+        self.layer_normalization = nnx.LayerNorm(1024, rngs=rngs)
 
-    def sample_gaussian(self, mean, logstd, *, rngs):
-        return logstd * jnr.normal(rngs, shape=mean.shape) + mean
+    def sample_gaussian(self, mean, logstd, *, key):
+        return logstd * jnr.normal(key, shape=mean.shape) + mean
 
-    def __call__(self, x, *, rngs=None):
+    def __call__(self, x, *, key=None):
         # # Resize images
         # x = jax.image.resize(x, (x.shape[0], self.input_conv_dim, self.input_conv_dim, 1), method="bilinear")
         #
         # # Convolutional hidden layers
         # for layer in self.hidden_layers_conv:
-        #     if not isinstance(layer, nnx.BatchNorm):
-        #         if layer.in_features == layer.out_features and 1 in layer.strides:
-        #             x = nnx.gelu(x + layer(x))
-        #         else:
-        #             x = nnx.gelu(layer(x))
+        #     if layer.in_features == layer.out_features and 1 in layer.strides:
+        #         x = nnx.relu(x + layer(x))
         #     else:
-        #         x = layer(x)
+        #         x = nnx.relu(layer(x))
         #
         # # Linear hidden layers
         # x = rearrange(x, 'b h w c -> b (h w c)')
         # for layer in self.hidden_layers_linear[:-1]:
-        #     if not isinstance(layer, nnx.BatchNorm):
-        #         if layer.in_features == layer.out_features:
-        #             x = nnx.gelu(x + layer(x))
-        #         else:
-        #             x = nnx.gelu(layer(x))
+        #     if layer.in_features == layer.out_features:
+        #         x = nnx.relu(x + layer(x))
         #     else:
-        #         x = layer(x)
+        #         x = nnx.relu(layer(x))
         # x = self.hidden_layers_linear[-1](x)
         #
         # # Latent space (heterogeneity)
-        # latent = nnx.gelu(self.hidden_latent[0](x))
+        # latent = nnx.relu(self.hidden_latent[0](x))
         # for layer in self.hidden_latent[1:]:
-        #     if not isinstance(layer, nnx.BatchNorm):
-        #         latent = nnx.gelu(latent + layer(latent))
-        #     else:
-        #         latent = layer(latent)
+        #     latent = nnx.relu(latent + layer(latent))
+        # latent = self.layer_normalization(latent)
         # mean = self.mean_x(latent)
         # logstd = self.logstd_x(latent)
-        # sample = self.sample_gaussian(mean, logstd, rngs=rngs) if rngs is not None else mean
+        # logstd = jnp.clip(logstd, -4.0, 4.0)
+        # sample = self.sample_gaussian(mean, logstd, key=key) if key is not None else mean
         #
         # return sample, mean, logstd
 
         # x = rearrange(x, 'b h w c -> b (h w c)')
         #
-        # x = nnx.leaky_relu(self.hidden_layers_conv[0](x))  # or nnx.relu
+        # x = nnx.relu(self.hidden_layers_conv[0](x))  # or nnx.relu
         #
         # x = rearrange(x, 'b (h w c) -> b h w c', h=self.input_conv_dim, w=self.input_conv_dim, c=1)
         #
         # for layer in self.hidden_layers_conv[1:]:
         #     if layer.in_features != layer.out_features:
-        #         x = nnx.leaky_relu(layer(x))  # or nnx.relu
+        #         x = nnx.relu(layer(x))  # or nnx.relu
         #     else:
         #         aux = layer(x)
         #         if aux.shape[1] == x.shape[1]:
         #             x = nnx.leaky_relu(x + aux)  # or nnx.relu
         #         else:
-        #             x = nnx.leaky_relu(aux)  # or nnx.relu
-        #
-        # x = rearrange(x, 'b h w c -> b (h w c)')
-        #
-        # for layer in self.hidden_layers_linear:
-        #     if layer.in_features != layer.out_features:
-        #         x = nnx.leaky_relu(layer(x))  # or nnx.relu
-        #     else:
-        #         x = nnx.leaky_relu(x + layer(x))  # or nnx.relu
-        #
+        #             x = nnx.relu(aux)  # or nnx.relu
+
+        # x = self.cryouni_head(x["clstokens"], x["patchtokens"])
+
+        x = rearrange(x, 'b h w c -> b (h w c)')
+
+        for layer in self.hidden_layers:
+            # if layer.in_features != layer.out_features:
+            #     x = nnx.relu(layer(x))  # or nnx.relu
+            # else:
+            #     x = nnx.relu(x + layer(x))  # or nnx.relu
+            x = nnx.relu(layer(x))  # or nnx.relu
+
         # x = rearrange(x, 'b h w c -> b (h w c)')
         #
         # for layer in self.hidden_layers:
-        #     x = nnx.leaky_relu(layer(x))  # or nnx.relu
-        #
-        # mean = self.mean_x(x)
-        # logstd = self.logstd_x(x)
-        # sample = self.sample_gaussian(mean, logstd, rngs=rngs) if rngs is not None else mean
-        #
-        # return sample, mean, logstd
+        #     x = nnx.relu(layer(x))  # or nnx.relu
 
-        # Resize images
-        x = jax.image.resize(x, (x.shape[0], self.input_conv_dim, self.input_conv_dim, 1), method="bilinear")
-
-        x = self.patch_embed(x)
-
-        x = rearrange(x, "b h w c -> b (h w) c")
-        for layer in self.layers:
-            x = layer(x)
-        x = self.final_norm(x)
-        x = jnp.mean(x, axis=1)
-
+        x = self.layer_normalization(x)
         mean = self.mean_x(x)
         logstd = self.logstd_x(x)
-        sample = self.sample_gaussian(mean, logstd, rngs=rngs) if rngs is not None else mean
+        logstd = jnp.clip(logstd, -4.0, 4.0)
+        sample = self.sample_gaussian(mean, logstd, key=key) if key is not None else mean
 
         return sample, mean, logstd
 
 class HetVolumeDecoder(nnx.Module):
-    def __init__(self, total_voxels, lat_dim, volume_size, *, rngs: nnx.Rngs):
+    def __init__(self, total_voxels, lat_dim, volume_size, is_implicit=False, hybrid_pe=True, *, rngs: nnx.Rngs):
         self.volume_size = volume_size
         self.total_voxels = total_voxels
-
-        # Gaussian std
-        # self.std = nnx.Param(1.0)
-        self.std = 1.0
+        self.is_implicit = is_implicit
+        self.hybrid_pe = hybrid_pe
 
         # Indices to (normalized) coords
-        self.factor = 0.5 * volume_size
+        self.scale = 0.5 * volume_size
+
+        # Gaussian std
+        self.std = nnx.Param(1.0)
+        # self.std = 1.0
 
         # Initial Gaussian values
         # Noise scale 0.5 or 0.1
         self.coords = 0.25 * jnp.array(generate_sphere_points(total_voxels) + np.random.normal(0, 0.1, (total_voxels, 3)))
-        self.values = jnp.zeros((total_voxels,))
+        # self.values = jnp.zeros((total_voxels,))
+        # self.coords = np.random.uniform(size=(total_voxels, 3), low=-0.3, high=0.3)
+        # self.values = jnp.full((total_voxels, ), jnp.log(jnp.exp(0.0)))
+        self.values = jnp.full((total_voxels,), 0.01)
 
-        # kernel_init = nnx.initializers.variance_scaling(scale=1. / 3., mode="fan_out", distribution="uniform")
-        # kernel_init = nnx.initializers.glorot_uniform()
-        # hidden_coords = [Linear(in_features=lat_dim // 2, out_features=256, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init_first(c=1.))]
-        # for _ in range(4):
-        #     hidden_coords.append(Linear(in_features=256, out_features=256, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=6.)))
-        # hidden_coords.append(Linear(in_features=256, out_features=3 * total_voxels, rngs=rngs, kernel_init=kernel_init))
-        #
-        # hidden_values = [Linear(in_features=lat_dim // 2, out_features=256, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init_first(c=6.))]
-        # for _ in range(4):
-        #     hidden_values.append(Linear(in_features=256, out_features=256, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=1.)))
-        # hidden_values.append(Linear(in_features=256, out_features=total_voxels, rngs=rngs, kernel_init=kernel_init))
+        # kernel_init_coords = nnx.initializers.normal(stddev=1e-3)
+        # kernel_init_values = nnx.initializers.normal(stddev=1e-3)
+        if self.is_implicit:
+            if not self.hybrid_pe:
+                # Implicit version
+                hidden_coords = [Siren2Linear(in_features=lat_dim // 2 + 3, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=True, w0=1.0, s=0.0, use_bias=False)]
+                hidden_coords.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=False, w0=1.0, s=0.0, use_bias=False))
+                for _ in range(7):
+                    hidden_coords.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=False, w0=1.0, s=0.0, use_bias=False))
+                hidden_coords.append(nnx.Linear(in_features=32, out_features=3, rngs=rngs, use_bias=False, kernel_init=nnx.initializers.glorot_uniform()))
 
-        # self.hidden_coords = nnx.List(hidden_coords)
-        # self.hidden_values = nnx.List(hidden_values)
+                hidden_values = [Siren2Linear(in_features=lat_dim // 2 + 3, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=True, w0=1.0, s=0.0, use_bias=False)]
+                hidden_values.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=False, w0=1.0, s=0.0, use_bias=False))
+                for _ in range(7):
+                    hidden_values.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=False, w0=1.0, s=0.0, use_bias=False))
+                hidden_values.append(nnx.Linear(in_features=32, out_features=1, rngs=rngs, use_bias=False, kernel_init=nnx.initializers.glorot_uniform()))
 
-        kernel_init = nnx.initializers.variance_scaling(scale=1. / 3., mode="fan_out", distribution="uniform")
-        hidden_layers = [Linear(in_features=lat_dim, out_features=256, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init_first(c=1.))]
-        for _ in range(4):
-            hidden_layers.append(Linear(in_features=256, out_features=256, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=6.)))
-        self.hidden_layers = nnx.List(hidden_layers)
-        self.hidden_coords = Linear(in_features=256, out_features=3 * total_voxels, rngs=rngs, kernel_init=kernel_init)
-        self.hidden_values = Linear(in_features=256, out_features=total_voxels, rngs=rngs, kernel_init=kernel_init)
+            else:
+                # Implicit version
+                kernel_init = nnx.initializers.variance_scaling(scale=1. / 3., mode="fan_in", distribution="uniform")
+                hidden_coords = [nnx.Linear(in_features=lat_dim // 2 + 3 * 10 * 2, out_features=32, rngs=rngs, dtype=jnp.float32, use_bias=False, kernel_init=kernel_init)]
+                for _ in range(7):
+                    hidden_coords.append( nnx.Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.float32, use_bias=False, kernel_init=kernel_init))
+                hidden_coords.append(nnx.Linear(in_features=32, out_features=3, rngs=rngs, use_bias=False, kernel_init=kernel_init))
+
+                hidden_values = [nnx.Linear(in_features=lat_dim // 2 + 3 * 10 * 2, out_features=32, rngs=rngs, dtype=jnp.float32, use_bias=False, kernel_init=kernel_init)]
+                for _ in range(7):
+                    hidden_values.append(nnx.Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.float32, use_bias=False, kernel_init=kernel_init))
+                hidden_values.append( nnx.Linear(in_features=32, out_features=1, rngs=rngs, use_bias=False, kernel_init=kernel_init))
+
+        else:
+            # Standard version
+            hidden_coords = [Siren2Linear(in_features=lat_dim // 2, out_features=1024, rngs=rngs, dtype=jnp.bfloat16, is_first=True, w0=1.0, s=0.0, c=1.0)]
+            for _ in range(4):
+                hidden_coords.append(Siren2Linear(in_features=1024, out_features=1024, rngs=rngs, dtype=jnp.bfloat16, is_first=False, custom_init=True, is_residual=False, w0=1.0, s=0.0, c=1.0))
+            hidden_coords.append(Linear(in_features=1024, out_features=3 * total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform()))
+
+            hidden_values = [Siren2Linear(in_features=lat_dim // 2, out_features=1024, rngs=rngs, dtype=jnp.bfloat16, is_first=True, w0=1.0, s=0.0, c=1.0)]
+            for _ in range(4):
+                hidden_values.append(Siren2Linear(in_features=1024, out_features=1024, rngs=rngs, dtype=jnp.bfloat16, is_first=False, custom_init=True, is_residual=False, w0=1.0, s=0.0, c=1.0))
+            hidden_values.append(Linear(in_features=1024, out_features=total_voxels, rngs=rngs, kernel_init=nnx.initializers.glorot_uniform()))
+
+        self.hidden_values = nnx.List(hidden_values)
+        self.hidden_coords = nnx.List(hidden_coords)
 
     def __call__(self, x):
-        # x_coords, x_map = jnp.split(x, indices_or_sections=2, axis=1)
+        if self.is_implicit:
+            # Positional encoding of coords
+            c = self.coords
+            c = jnp.tile(c[None, ...], (x.shape[0], 1, 1))
 
-        # # Decode values
-        # x_map = jnp.sin(30.0 * self.hidden_values[0](x_map))
-        # for layer in self.hidden_values[1:-1]:
-        #     x_map = jnp.sin(x_map + 1.0 * layer(x_map))
-        # x_map = self.hidden_values[-1](x_map)
-        #
-        # # Decode coords
-        # x_coords = jnp.sin(30.0 * self.hidden_coords[0](x_coords))
-        # for layer in self.hidden_coords[1:-1]:
-        #     x_coords = jnp.sin(x_coords + 1.0 * layer(x_coords))
-        # x_coords = self.hidden_coords[-1](x_coords)
-        #
-        # # Extract delta_coords and values
-        # x_coords = jnp.reshape(x_coords, (x.shape[0], self.total_voxels, 3))
-        # delta_coords, delta_values = x_coords, x_map
+            # Adjust latents
+            x = jnp.tile(x[:, None, ...], (1, c.shape[1], 1))
 
-        # Common encoder
-        x = jnp.sin(30. * self.hidden_layers[0](x))
-        for layer in self.hidden_layers[1:-1]:
-            x = jnp.sin(1. * (x + layer(x)))
-        x = self.hidden_layers[-1](x)
+            x_coords, x_map = jnp.split(x, indices_or_sections=2, axis=-1)
 
-        delta_coords = self.hidden_coords(x)
-        delta_values = self.hidden_values(x)
+            # Join coords and latents
+            if self.hybrid_pe:
+                c_pe = positional_encoding(c[0], 10, self.scale)
+                c_pe = jnp.tile(c_pe[None, ...], (x.shape[0], 1, 1))
+                x_coords = jnp.concatenate([c_pe, x_coords], axis=-1)
+                x_map = jnp.concatenate([c_pe, x_map], axis=-1)
+            else:
+                x_coords = jnp.concatenate([c, x_coords], axis=-1)
+                x_map = jnp.concatenate([c, x_map], axis=-1)
 
-        delta_coords = jnp.reshape(delta_coords, (x.shape[0], self.total_voxels, 3))
+            # Decode coords
+            if self.hybrid_pe:
+                x_coords = nnx.elu(self.hidden_coords[0](x_coords))
+                for layer in self.hidden_coords[1:-1]:
+                    x_coords = nnx.elu(layer(x_coords))
+                x_coords = self.hidden_coords[-1](x_coords)
+
+                x_map = nnx.elu(self.hidden_values[0](x_map))
+                for layer in self.hidden_values[1:-1]:
+                    x_map = nnx.elu(layer(x_map))
+                x_map = self.hidden_values[-1](x_map)[..., 0]
+            else:
+                x_coords = self.hidden_coords[0](x_coords)
+                for layer in self.hidden_coords[1:-1]:
+                    x_coords = layer(x_coords)
+                x_coords = self.hidden_coords[-1](x_coords)
+
+                # Decode values
+                x_map = self.hidden_values[0](x_map)
+                for layer in self.hidden_values[1:-1]:
+                    x_map = layer(x_map)
+                x_map = self.hidden_values[-1](x_map)[..., 0]
+
+        else:
+            x_coords, x_map = jnp.split(x, indices_or_sections=2, axis=1)
+
+            # Decode values
+            x_map = self.hidden_values[0](x_map)
+            for layer in self.hidden_values[1:-1]:
+                x_map = layer(x_map)
+            x_map = self.hidden_values[-1](x_map)
+
+            # Decode coords
+            x_coords = self.hidden_coords[0](x_coords)
+            for layer in self.hidden_coords[1:-1]:
+                x_coords = layer(x_coords)
+            x_coords = self.hidden_coords[-1](x_coords)
+
+            x_coords = jnp.reshape(x_coords, (x.shape[0], self.total_voxels, 3))
+
+        delta_coords, delta_values = x_coords, x_map
+
+        # Recover volume values
+        values = nnx.relu(self.values[None, ...] + delta_values)
 
         # Recover coords (non-normalized)
-        delta_coords = self.factor * (self.coords[None, ...] + delta_coords)
+        coords = self.scale * (self.coords[None, ...] + delta_coords)
 
-        return delta_coords, nnx.relu(self.values[None, ...] + delta_values)
+        return coords, values
 
-    def decode_volume(self, x, filter=True):
-        # Decode volume values
-        coords, values = self.__call__(x)
+    def decode_volume(self, x=None, coords_values=None, filter=True, sigma=1.0):
+        if x is not None:
+            # Decode volume values
+            coords, values = self.__call__(x)
+        elif coords_values is not None:
+            coords, values = coords_values
+        else:
+            raise ValueError("Please provide either x or coords_value parameter")
 
         # Displace coordinates
-        coords = coords + self.factor
+        coords = coords + self.scale
 
         # Place values on grid
-        grids = jnp.zeros((x.shape[0], self.volume_size, self.volume_size, self.volume_size))
+        grids = jnp.zeros((values.shape[0], self.volume_size, self.volume_size, self.volume_size))
 
         # Scatter volume
         bposf = jnp.floor(coords)
@@ -527,8 +695,7 @@ class HetVolumeDecoder(nnx.Module):
 
         # Filter volume
         if filter:
-            # grids = jax.vmap(lambda x: low_pass_3d(x, std=self.std.get_value()))(grids)
-            grids = jax.vmap(lambda x: low_pass_3d(x, std=1.0))(grids)
+            grids = jax.vmap(low_pass_3d, in_axes=(0, None))(grids, sigma)
 
         return grids
 
@@ -617,6 +784,8 @@ class ReconSIRENHetOnly(nnx.Module):
         self.learn_delta_volume = learn_delta_volume
         self.transport_mass = transport_mass
         reference_values = reference_volume[self.inds[..., 0], self.inds[..., 1], self.inds[..., 2]][None, ...]
+
+        # Models
         self.encoder_pose = EncoderPose(self.xsize, refine_current_assignment=refine_current_assignment, rngs=rngs)
         self.encoder_het = EncoderHet(self.xsize, lat_dim=lat_dim, rngs=rngs)
         self.delta_het_decoder = HetVolumeDecoder(10000, lat_dim=lat_dim, volume_size=self.xsize, rngs=rngs)
@@ -627,14 +796,11 @@ class ReconSIRENHetOnly(nnx.Module):
 
         #### Memory bank for latent spaces ####
         self.bank_size = bank_size
-        self.subset_size = min(2048, bank_size)
 
-        self.memory_bank = nnx.Variable(
-            jnp.zeros((self.bank_size, 2))
-        )
-        self.memory_bank_ptr = nnx.Variable(
-            jnp.zeros((1,), dtype=jnp.int32)
-        )
+        raw = jax.random.normal(rngs.params(), (bank_size, 3))
+        array_init = raw / jnp.linalg.norm(raw, axis=-1, keepdims=True)
+        self.memory_bank = MemoryBank(array_init=array_init)
+        # self.memory_bank = MemoryBank(buffer_size=bank_size, n_dim=3)
 
     def __call__(self, x, rngs: nnx.Rngs = None, **kwargs):
         # TODO: Return only best angles
@@ -642,29 +808,6 @@ class ReconSIRENHetOnly(nnx.Module):
 
     def get_alpha_uniform_lamda(self):
         return nnx.relu(self.alpha_uniform.get_value())
-
-    # --- Method for enqueuing to the memory bank ---
-    def enqueue(self, keys_to_add):
-        """Updates the memory bank and pointer using JIT-compatible operations."""
-        ptr = self.memory_bank_ptr.get_value()[0]
-
-        # Define the starting position for the update.
-        # It must be a tuple with one index per dimension of the array.
-        # Our memory_bank is 2D, so we need (start_row, start_column).
-        start_indices = (ptr, 0)
-
-        # Use `lax.dynamic_update_slice` instead of `.at[...].set(...)`
-        self.memory_bank.value = jax.lax.dynamic_update_slice(
-            self.memory_bank.get_value(), # 1. The original large array to be updated
-            keys_to_add,                  # 2. The smaller array containing the new data
-            start_indices                 # 3. The dynamic starting position
-        )
-
-        # The pointer update logic remains the same, as it's just arithmetic
-        current_batch_size = keys_to_add.shape[0]
-        self.memory_bank_ptr.value = jnp.array(
-            [(ptr + current_batch_size) % self.bank_size]
-        )
 
     def decode_image(self, x, labels, md, ctf_type=None):
         # Precompute batch CTFs
@@ -680,12 +823,12 @@ class ReconSIRENHetOnly(nnx.Module):
         else:
             ctf = jnp.ones([x.shape[0], 2 * self.xsize, int(2.0 * 0.5 * self.xsize + 1)], dtype=x.dtype)
 
-        if self.ctf_type == "precorrect":
+        if self.ctf_type in ["apply", "precorrect"]:
             # Wiener filter
             x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
         # Encode images
-        rotations, shifts, logits = self.encoder_pose(x, return_diversity_loss=False, is_training=False)
+        rotations, shifts, logits, _ = self.encoder_pose(x)
         x = self.encoder_het(x)
 
         # Get best poses/shifts
@@ -697,7 +840,7 @@ class ReconSIRENHetOnly(nnx.Module):
         coords, values = self.delta_het_decoder.decode_volume(x, filter=True)
 
         # Generate projections
-        images_corrected = self.phys_decoder(x, values, coords, self.xsize, rotations, shifts, ctf, ctf_type, self.delta_het_decoder.std)
+        images_corrected = self.phys_decoder(x, values, coords, self.xsize, rotations, shifts, ctf, ctf_type, self.delta_het_decoder.std.get_value())
 
         return images_corrected
 
@@ -711,23 +854,24 @@ class ReconSIRENHetOnly(nnx.Module):
         return vol
 
 
-@partial(jax.jit, static_argnames=("is_train_step",))
-def step_reconsiren_het_only(graphdef, state, x, labels, md, key, lambda_uniform=0.0005, is_train_step=False):
-    model, optimizer_pose, optimizer_het = nnx.merge(graphdef, state)
+@partial(jax.jit, static_argnames=("is_train_step", "is_warmup", "use_tau"))
+def step_reconsiren_het_only(graphdef, state, x, labels, md, key, tau=0.0001, is_train_step=False, is_warmup=False, use_tau=False):
+    model, optimizer_pose, optimizer_het, optimizer_warmup = nnx.merge(graphdef, state)
 
     # Random keys
     key, swd_key, uniform_key, choice_key, distributions_key = jax.random.split(key, 5)
 
     def loss_fn(model, x):
         # Correct CTF in images for encoder if needed
-        if model.ctf_type == "apply":
-            x_ctf_corrected = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
-        else:
-            x_ctf_corrected = x
+        # if model.ctf_type == "apply":
+        #     x_ctf_corrected = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
+        # else:
+        #     x_ctf_corrected = x
+        x_ctf_corrected = prepare_image_cryocrab(x, ctf)
 
         # Get euler angles and shifts
-        rotations, shifts, logits, diversity_loss = model.encoder_pose(x_ctf_corrected, return_diversity_loss=True, is_training=is_train_step, key=distributions_key)
-        sample, latent, logstd = model.encoder_het(x_ctf_corrected, rngs=distributions_key)
+        rotations, shifts, logits, kl_loss_pose = model.encoder_pose(x_ctf_corrected, key=distributions_key)
+        sample, latent, logstd = model.encoder_het(x_ctf_corrected, key=distributions_key)
 
         # Decode het volume
         coords_het, values_het = model.delta_het_decoder(sample)
@@ -741,8 +885,7 @@ def step_reconsiren_het_only(graphdef, state, x, labels, md, key, lambda_uniform
         rotations = jnp.matmul(jnp.transpose(model.symmetry_matrices[random_indices], (0, 2, 1))[:, None, :, :], rotations)
 
         # Generate projections
-        # images_corrected = model.phys_decoder(x, jax.lax.stop_gradient(values_het), jax.lax.stop_gradient(coords_het), model.xsize, rotations, shifts, ctf, model.ctf_type)
-        images_corrected = model.phys_decoder(x, values_het, coords_het, model.xsize, rotations, shifts, ctf, model.ctf_type, model.delta_het_decoder.std)
+        images_corrected = model.phys_decoder(x, values_het, coords_het, model.xsize, rotations, shifts, ctf, model.ctf_type, model.delta_het_decoder.std.get_value())
 
         # Losses
         images_corrected_loss = images_corrected[..., 0] if images_corrected.shape[-1] == 1 else images_corrected
@@ -774,7 +917,7 @@ def step_reconsiren_het_only(graphdef, state, x, labels, md, key, lambda_uniform
         # Project "mask"
         if not model.transport_mass:
             projected_mask = model.phys_decoder(x, jnp.ones_like(values_het), jax.lax.stop_gradient(coords_het),
-                                                model.xsize, rotations, shifts, ctf, None, jax.lax.stop_gradient(model.delta_het_decoder.std), False)
+                                                model.xsize, rotations, shifts, ctf, None, jax.lax.stop_gradient(model.delta_het_decoder.std.get_value()), False)
             projected_mask = jnp.where(projected_mask > 1, 1.0, projected_mask)
         else:
             projected_mask = jnp.ones_like(images_corrected)
@@ -790,48 +933,28 @@ def step_reconsiren_het_only(graphdef, state, x, labels, md, key, lambda_uniform
         recon_loss = rearrange(recon_loss, "(b n) -> b n", b=images_corrected_loss.shape[0], n=images_corrected_loss.shape[1])
 
         # Get minimum indices
-        min_indices = jnp.argmin(recon_loss, axis=1)
+        if is_warmup or use_tau:
+            selection_logits = -recon_loss / tau
+            min_indices = jax.random.categorical(key, selection_logits, axis=-1)
+        else:
+            min_indices = jnp.argmin(recon_loss, axis=1)
+            # selection_logits = -recon_loss / tau
+            # min_indices = jax.random.categorical(key, selection_logits, axis=-1)
 
         # Index losses and rotations based on extracted indices
         recon_loss = recon_loss[jnp.arange(images_corrected.shape[0]), min_indices].mean()
         recon_loss_all = recon_loss.mean()
-        # rotations = rotations[jnp.arange(images_corrected.shape[0]), min_indices, :]
         rotations = rearrange(rotations, "b n w h -> (b n) w h")
-
-        # Rotation repulsion loss
-        # margin = 0.5
-        # flat_poses = rotations.reshape(rotations.shape[0], rotations.shape[1], 9)
-        # sim_matrix = jnp.einsum('bni,bmi->bnm', flat_poses, flat_poses)
-        # mask = 1.0 - jnp.eye(sim_matrix.shape[1])
-        # loss_rot_repulsion = jnp.maximum(0.0, sim_matrix - margin) * mask
-        # loss_rot_repulsion = jnp.mean(loss_rot_repulsion)
-
-        # Reconstruction loss (Soft-WTA)
-        # log_pi = jax.nn.log_softmax(logits, axis=-1)
-        # tau = 10.
-        # combined_terms = log_pi - recon_loss / tau
-        # recon_loss_all = -jax.nn.logsumexp(combined_terms, axis=-1).mean()
-
-        # Reconstruction loss (best WTA)
-        # best_index = jnp.argmax(logits, axis=-1)
-        # rotations = jax.lax.stop_gradient(jnp.take_along_axis(rotations, best_index[..., None, None, None], axis=1))
-        # shifts = jax.lax.stop_gradient(jnp.take_along_axis(shifts, best_index[..., None, None], axis=1))
-        # images_corrected = model.phys_decoder(x, values_het, coords_het, model.xsize, rotations, shifts, ctf, model.ctf_type, model.delta_het_decoder.std).squeeze(axis=1)
-        # recon_loss = dm_pix.mse(images_corrected[..., None], x).mean()
-        # recon_loss_all += recon_loss
-
-        # Logits entropy loss
-        # probs = jax.nn.softmax(logits, axis=-1)
-        # log_probs = jax.nn.log_softmax(logits, axis=-1)
-        # entropy = -jnp.sum(probs * log_probs, axis=-1)
-        # loss_logits = -jnp.mean(entropy)
 
         # Probability loss to get the heads
         prob_loss = optax.softmax_cross_entropy_with_integer_labels(logits=logits, labels=min_indices)
         prob_loss = jnp.mean(prob_loss)
 
         # Rotations to Euler angles (ZYZ)
-        euler_angles = wrap_zyz_angles(-euler_from_matrix_batch(rotations))[..., :2]
+        # euler_angles = wrap_zyz_angles(-euler_from_matrix_batch(rotations))[..., :2]
+
+        # Viewing directions from rotations
+        directions = rotations[:, :, 2]
 
         # L1 based denoising
         if not model.transport_mass:
@@ -850,18 +973,18 @@ def step_reconsiren_het_only(graphdef, state, x, labels, md, key, lambda_uniform
         # Decoupling (TODO: In the future this will be for missing angles like TF implementation)
 
         # Uniform angular distribution loss
-        random_indices = jnr.choice(choice_key, a=jnp.arange(model.bank_size), shape=(model.subset_size,), replace=False)
-        memory_bank_subset = model.memory_bank[random_indices]
-        memory_bank_subset = jnp.concat([euler_angles, memory_bank_subset], axis=0)
-        uniform_distributed_samples = sample_uniform_zyz(uniform_key, memory_bank_subset.shape[0])[..., :2]
-        uniform_angular_distribution_loss = sliced_wasserstein_loss(memory_bank_subset, uniform_distributed_samples, key)
-        loss_uniform = uniform_angular_distribution_loss + diversity_loss
+        loss_uniform = sliced_wasserstein_sphere(directions, rng=key, n_projections=64)
+        loss_repulsion = repulsion_loss(directions, s=2.)
 
         # loss = (recon_loss_all + 0.001 * l1_loss + 0.001 * (l1_grad_loss + l2_grad_loss) + 0.000001 * kl_loss +
-        #         lambda_uniform * loss_uniform)
-        loss = recon_loss_all + 0.000001 * kl_loss + lambda_uniform * loss_uniform + 0.0001 * prob_loss
+        #         lambda_uniform * loss_uniform)00
+        if is_warmup:
+            loss = recon_loss_all
+        else:
+            loss = recon_loss_all + 0.000001 * kl_loss + 0.1 * (loss_uniform + 0.0 * loss_repulsion) #+ 0.00001 * prob_loss
+        # loss = recon_loss_all + 0.000001 * kl_loss + 0.00000001 * kl_loss_pose.mean()  # + 0.00001 * prob_loss
         # loss = recon_loss_all
-        return loss, (recon_loss.mean(), loss_uniform, euler_angles)
+        return loss, (recon_loss.mean(), loss_uniform, directions)
 
     if model.refine_current_assignment:
         # Precompute batch aligments
@@ -892,22 +1015,34 @@ def step_reconsiren_het_only(graphdef, state, x, labels, md, key, lambda_uniform
         x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
     if is_train_step:
-        # Optimizer parameters
-        params_pose = nnx.All(nnx.Param, nnx.PathContains('encoder_pose'))
-        params_het = nnx.All(nnx.Param, (nnx.PathContains("encoder_het"), nnx.PathContains('delta_het_decoder')))
+        if is_warmup:
+            # Optimizer parameters
+            params_warmup = nnx.All(nnx.Param, nnx.PathContains('hidden_values'))
 
-        grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, (params_pose, params_het)), has_aux=True)
-        (loss, (recon_loss, loss_uniform, euler_angles)), grads_combined = grad_fn(model, x)
+            grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, params_warmup), has_aux=True)
+            (loss, (recon_loss, loss_uniform, directions)), grads_combined = grad_fn(model, x)
 
-        grads_pose, grads_het = grads_combined.split(params_pose, params_het)
+            grads_warmup, _ = grads_combined.split(params_warmup, ...)
+
+            optimizer_warmup.update(model, grads_warmup)
+
+        else:
+            # Optimizer parameters
+            params_pose = nnx.All(nnx.Param, nnx.PathContains('encoder_pose'))
+            params_het = nnx.All(nnx.Param, (nnx.PathContains("encoder_het"), nnx.PathContains('delta_het_decoder')))
+
+            grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, (params_pose, params_het)), has_aux=True)
+            (loss, (recon_loss, loss_uniform, directions)), grads_combined = grad_fn(model, x)
+
+            grads_pose, grads_het = grads_combined.split(params_pose, params_het)
 
         optimizer_pose.update(model, grads_pose)
         optimizer_het.update(model, grads_het)
 
-        # Update memory bank
-        model.enqueue(euler_angles)
+            # Update memory bank
+            model.memory_bank.enqueue(directions)
 
-        state = nnx.state((model, optimizer_pose, optimizer_het))
+        state = nnx.state((model, optimizer_pose, optimizer_het, optimizer_warmup))
 
         return loss, recon_loss, state, key
     else:
@@ -952,14 +1087,15 @@ def predict_angular_assignment_step_reconsiren_het_only(graphdef, state, x, labe
         x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
     # Correct CTF in images for encoder if needed
-    if model.ctf_type == "apply":
-        x_ctf_corrected = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
-    else:
-        x_ctf_corrected = x
+    # if model.ctf_type == "apply":
+    #     x_ctf_corrected = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
+    # else:
+    #     x_ctf_corrected = x
+    x_ctf_corrected = prepare_image_cryocrab(x, ctf)
 
     # Get euler angles and shifts
-    rotations, shifts, logits = model.encoder_pose(x_ctf_corrected, return_diversity_loss=False, is_training=False)
-    _, latent, _ = model.encoder_het(x_ctf_corrected, rngs=distributions_key)
+    rotations, shifts, logits, _ = model.encoder_pose(x_ctf_corrected)
+    _, latent, _ = model.encoder_het(x_ctf_corrected)
 
     # Get best poses/shifts
     best_index = jnp.argmax(logits, axis=-1)
@@ -989,14 +1125,13 @@ def main():
     import argparse
     import matplotlib.pyplot as plt
     from xmipp_metadata.image_handler import ImageHandler
-    import optax
     from contextlib import closing
     from hax.checkpointer import NeuralNetworkCheckpointer
     from hax.generators import MetaDataGenerator, extract_columns
     from hax.metrics import JaxSummaryWriter
     from hax.networks import VolumeAdjustment, train_step_volume_adjustment
-    from hax.schedulers import CosineAnnealingScheduler
-    from hax.programs.gaussian_volume_fitting import get_cosine_reg_strength
+    # from hax.schedulers import CosineAnnealingScheduler
+    # from hax.programs.gaussian_volume_fitting import get_cosine_reg_strength
 
     def list_of_floats(arg):
         return list(map(float, arg.split(',')))
@@ -1108,7 +1243,7 @@ def main():
     # Prepare network (ReconSIREN)
     reconsiren = ReconSIRENHetOnly(vol, mask, xsize, args.sr, ctf_type=args.ctf_type, symmetry_group=args.symmetry_group,
                                    transport_mass=True, refine_current_assignment=args.refine_current_assignment, lat_dim=8,
-                                   bank_size=2048, learn_delta_volume=not args.do_not_learn_volume, rngs=nnx.Rngs(model_key))
+                                   bank_size=10000, learn_delta_volume=not args.do_not_learn_volume, rngs=nnx.Rngs(model_key))
 
     # Reload network
     if args.reload is not None:
@@ -1224,37 +1359,24 @@ def main():
         # lr_schedule_volume = CosineAnnealingScheduler.getScheduler(peak_value=4. * 1e-3, total_steps=total_steps, warmup_frac=0.1, init_value=1e-3, end_value=0.0)
         # lr_schedule_het = CosineAnnealingScheduler.getScheduler(peak_value=4. * 1e-3, total_steps=total_steps, warmup_frac=0.1, init_value=1e-3, end_value=0.0)
 
-        # Define optimizers
-        volume_lr_schedule = optax.warmup_cosine_decay_schedule(
-            init_value=0.0,
-            peak_value=1e-3,
-            warmup_steps=1000,  # Delay volume learning
-            decay_steps=50000,
-            end_value=1e-4
-        )
-        volume_tx = optax.adamw(learning_rate=volume_lr_schedule, weight_decay=1e-4)
-
-        pose_lr_schedule = optax.cosine_decay_schedule(
-            init_value=3e-4,  # Start active immediately
-            decay_steps=50000,
-            alpha=0.1
-        )
-        pose_tx = optax.chain(
-            optax.clip_by_global_norm(1.0),  # Prevent explosive pose updates
-            optax.radam(learning_rate=pose_lr_schedule)
+        tx = optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adamw(learning_rate=1e-4),  # 1e-3 for implicit
         )
 
         # Optimizers (ReconSIREN)
         params_pose = nnx.All(nnx.Param, nnx.PathContains('encoder_pose'))
         params_het = nnx.All(nnx.Param, (nnx.PathContains('encoder_het'), nnx.PathContains('delta_het_decoder')))
-        optimizer_pose = nnx.Optimizer(reconsiren, optax.adam(1e-4), wrt=params_pose)  # Or rmsprop with 1e-3
-        optimizer_het = nnx.Optimizer(reconsiren, optax.adam(1e-4), wrt=params_het)
-        graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_het))
+        params_warmup = nnx.All(nnx.Param, nnx.PathContains('hidden_values'))
+        optimizer_pose = nnx.Optimizer(reconsiren, optax.adamw(1e-4), wrt=params_pose)  # Or rmsprop with 1e-3
+        optimizer_het = nnx.Optimizer(reconsiren, tx, wrt=params_het)
+        optimizer_warmup = nnx.Optimizer(reconsiren, optax.adamw(1e-4), wrt=params_warmup)
+        graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_het, optimizer_warmup))
 
         # Resume if checkpoint exists
         if os.path.isdir(os.path.join(args.output_path, "ReconSIREN_CHECKPOINT")):
             graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "ReconSIREN_CHECKPOINT"),
-                                                                                        optimizer_pose, optimizer_het)
+                                                                                        optimizer_pose, optimizer_het, optimizer_warmup)
             print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
         else:
             resume_epoch = 0
@@ -1287,10 +1409,14 @@ def main():
                         pbar.set_postfix_str(f"{bcolors.WARNING}Generating intermediate results...{bcolors.ENDC}")
 
                         # Example of predicted data for Tensorboard
-                        reconsiren, optimizer_pose, optimizer_het = nnx.merge(graphdef, state)
+                        reconsiren, optimizer_pose, optimizer_het, optimizer_warmup = nnx.merge(graphdef, state)
 
                         # Plot angular distribution
-                        euler_angles = np.array(reconsiren.memory_bank.get_value())
+                        directions = np.array(reconsiren.memory_bank.get())
+                        x, y, z = directions[:, 0], directions[:, 1], directions[:, 2]
+                        beta = jnp.arccos(jnp.clip(z, -1.0, 1.0))
+                        alpha = jnp.arctan2(y, x)
+                        euler_angles = jnp.stack([alpha, beta], axis=-1)
                         fig, _ = plot_angular_distribution(euler_angles)
                         writer.add_figure("Angular distribution density", fig, global_step=i)
 
@@ -1318,12 +1444,14 @@ def main():
 
                     i += 1
 
-                # if i < 3:
-                #     loss, state, rng = warmup_het_reconsiren(graphdef, state, x, labels, md_columns, rng, is_train_step=True)
-                #     recon_loss = loss
-                # else:
-                # lambda_uniform = get_cosine_reg_strength(total_steps, 10 * steps_per_epoch, 0.001, 1e-4)
-                loss, recon_loss, state, rng = step_reconsiren_het_only(graphdef, state, x, labels, md_columns, rng, lambda_uniform=0.0005, is_train_step=True)
+                if total_steps <= 1500:
+                    tau = 1e-3
+                    use_tau = True
+                else:
+                    tau = 0.0
+                    use_tau = False
+                loss, recon_loss, state, rng = step_reconsiren_het_only(graphdef, state, x, labels, md_columns, rng,
+                                                                        tau=tau, is_train_step=True, is_warmup=False, use_tau=use_tau)
                 total_loss += loss
                 total_recon_loss += recon_loss
 
@@ -1358,7 +1486,7 @@ def main():
 
                 step += 1
 
-        reconsiren, optimizer_pose, optimizer_het = nnx.merge(graphdef, state)
+        reconsiren, optimizer_pose, optimizer_het, optimizer_warmup = nnx.merge(graphdef, state)
 
         # Save model
         NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "ReconSIREN"))
