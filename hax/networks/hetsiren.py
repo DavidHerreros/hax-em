@@ -760,6 +760,7 @@ class HetSIREN(nnx.Module):
         # Consider alignments if needed
         if x.ndim == 4:
             # Consider refinement and rigid registration alignments
+            # rotations = jnp.matmul(rotations_rigid, rotations)
             rotations = jnp.matmul(rotations, rotations_rigid)
             shifts = shifts + shifts_rigid
 
@@ -1310,6 +1311,7 @@ def gradient_for_recon_graph_losses(graphdef, state, x, labels, md, key):
             rotations = euler_angles
 
         rotations_refined = jnp.matmul(rotations, rotations_rigid)
+        # rotations_refined = jnp.matmul(rotations_rigid, rotations)
         shifts_refined = shifts + shifts_rigid
 
         # Reference values
@@ -1484,6 +1486,7 @@ def validation_step_hetsiren(graphdef, state, x, labels, md, key):
 
         # Consider refinement and rigid registration alignments (for delta_volume_decoder_rigid output)
         rotations_refined = jnp.matmul(rotations, rotations_rigid)
+        # rotations_refined = jnp.matmul(rotations_rigid, rotations)
         shifts_refined = shifts + shifts_rigid
 
         # Centering
@@ -1852,7 +1855,7 @@ def main():
         graphdef, state = nnx.split((hetsiren, optimizer))
 
         # Resume if checkpoint exists
-        if os.path.isdir(os.path.join(args.output_path, "HetSIREN_CHECKPOINT")):
+        if os.path.isdir(os.path.join(args.output_path, "HetSIREN_CHECKPOINT")) and not os.path.isdir(os.path.join(args.output_path, "HetSIREN_No_Inv")):
             graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "HetSIREN_CHECKPOINT"), optimizer)
             print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
         else:
@@ -2047,7 +2050,7 @@ def main():
         if hetsiren.train_inverse:
             print(f"{bcolors.OKCYAN}\n###### Training decoder inverse... ######")
             i = 0
-            pbar = tqdm(range(int(2 * args.epochs * steps_per_epoch)), file=sys.stdout, ascii=" >=", colour="green",
+            pbar = tqdm(range(int(args.epochs * steps_per_epoch)), file=sys.stdout, ascii=" >=", colour="green",
                         bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
             for total_steps in pbar:
