@@ -208,7 +208,7 @@ class MultiEncoder(nnx.Module):
         return logstd * jnr.normal(rngs, shape=mean.shape) + mean
 
     def __call__(self, x, encoder_id="encoder_exp", return_last=False, return_alignment_refinement=False, *,
-                 rngs=None):
+                 rngs=None, warmup_alpha=1.0):
         x = self.encoders[encoder_id](x, return_last=True)
 
         if return_alignment_refinement:
@@ -216,15 +216,17 @@ class MultiEncoder(nnx.Module):
             for layer in self.hidden_layers_refinement[1:]:
                 x_ref = nnx.leaky_relu(layer(x_ref + x_ref))  # or nnx.relu
 
-            # Estimate rotations for volume registration
+            # Estimate rotations for volume registration. warmup_alpha (in [0, 1])
+            # ramps the refinement in from the identity so early training keeps the
+            # input poses untouched and only gradually starts refining them.
             rotations_6d = self.rigid_6d_rotation(x_ref)
             identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...].repeat(rotations_6d.shape[0], axis=0)
-            rotations_6d = identity_6d + rotations_6d
+            rotations_6d = identity_6d + warmup_alpha * rotations_6d
             rotations_rigid = PoseDistMatrix.mode_rotmat(rotations_6d)
             rotations_logscale = self.rotations_logsig(x_ref)
 
-            # Estimate shifts for volume registration
-            shifts_rigid = self.rigid_shifts(x_ref)
+            # Estimate shifts for volume registration (ramped in the same way)
+            shifts_rigid = warmup_alpha * self.rigid_shifts(x_ref)
 
         for layer in self.hidden_layers_latent:
             x = nnx.leaky_relu(x + layer(x))  # or nnx.relu
@@ -660,7 +662,7 @@ class HetSIREN(nnx.Module):
     @save_config
     def __init__(self, lat_dim, reference_volume, reconstruction_mask, coords, values, xsize, sr, bank_size=1024, ctf_type="apply",
                  sigma=1.0, decoupling=False, isVae=False, transport_mass=False, local_reconstruction=False, architecture="convnn",
-                 is_implicit=True, isTomoSIREN=False, train_inverse=False, *, rngs: nnx.Rngs):
+                 is_implicit=True, isTomoSIREN=False, train_inverse=False, point_transformer=False, *, rngs: nnx.Rngs):
         super(HetSIREN, self).__init__()
         self.xsize = xsize
         self.ctf_type = ctf_type
@@ -677,7 +679,7 @@ class HetSIREN(nnx.Module):
         self.has_reference_volume = not bool(np.all(reference_volume == 0.0))
         self.encoder = MultiEncoder(self.xsize, lat_dim, n_layers=3, isVae=isVae, architecture=architecture, isTomoSIREN=isTomoSIREN, rngs=rngs) \
             if decoupling or isTomoSIREN else Encoder(self.xsize, lat_dim, isVae=isVae, architecture=architecture, rngs=rngs)
-        self.delta_volume_decoder = DeltaVolumeDecoder(self.coords.shape[0], lat_dim, self.xsize, self.coords, values, transport_mass=transport_mass, is_implicit=is_implicit, rngs=rngs)
+        self.delta_volume_decoder = DeltaVolumeDecoder(self.coords.shape[0], lat_dim, self.xsize, self.coords, values, transport_mass=transport_mass, is_implicit=is_implicit, point_transformer=point_transformer, rngs=rngs)
         if self.train_inverse:
             inv_lat_dim = lat_dim if self.delta_volume_decoder.point_transformer else lat_dim // 2
             self.inverse_volume_decoder = PointCloudEncoder(latent_dim=inv_lat_dim, hidden=64, n_blocks=4, dtype=jnp.float32, scale_multiplier=1.0, rngs=rngs)
@@ -809,8 +811,11 @@ class HetSIREN(nnx.Module):
             raise UserWarning("The network was not trained with decoder inversion support.")
 
 
-@partial(jax.jit, static_argnames=("do_update", "l1_lambda", "graph_lambda"))
-def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_lambda=1e-4, graph_lambda=1e-4):
+@partial(jax.jit, static_argnames=("do_update", "l1_lambda", "graph_lambda", "pose_refine_reg",
+                                   "decoupling_lambda", "distance_preservation_lambda", "kl_lambda"))
+def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_lambda=1e-4, graph_lambda=1e-4,
+                        warmup_alpha=1.0, pose_refine_reg=0.1, decoupling_lambda=1e-4, distance_preservation_lambda=1e-4,
+                        kl_lambda=1e-3):
     model, optimizer = nnx.merge(graphdef, state)
     distributions_key, rot_sample_key, choice_key, key = jnr.split(key, 4)
 
@@ -846,20 +851,20 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         # Encode latent E(z)
         if model.isVae:
             if model.decoupling:
-                (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
+                (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key, warmup_alpha=warmup_alpha)
             elif model.isTomoSIREN:
                 (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
-                (_, latent_1, _), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out_random = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
+                (_, latent_1, _), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out_random = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key, warmup_alpha=warmup_alpha)
             else:
-                (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key)
+                (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key, warmup_alpha=warmup_alpha)
         else:
             if model.decoupling:
-                latent, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
+                latent, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key, warmup_alpha=warmup_alpha)
             elif model.isTomoSIREN:
                 latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
-                latent_1, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out_random = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
+                latent_1, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out_random = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key, warmup_alpha=warmup_alpha)
             else:
-                latent, (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key)
+                latent, (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key, warmup_alpha=warmup_alpha)
 
         # Decode volumes
         if model.isVae:
@@ -889,6 +894,10 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
             # rotations_refined = jnp.matmul(rotations_rigid, rotations)
             rotations_refined = jnp.matmul(rotations, rotations_rigid)
         shifts_refined = shifts + shifts_rigid
+
+        # Geodesic anchor: keep the rigid rotation close to the identity so it stays a refinement
+        cos_theta_rigid = jnp.clip((jnp.trace(rotations_rigid, axis1=-2, axis2=-1) - 1.0) / 2.0, -1.0, 1.0)
+        pose_refine_loss = jnp.mean(1.0 - cos_theta_rigid)
 
         # Only rigid part: coords and values
         reference_values = model.delta_volume_decoder.reference_values
@@ -995,13 +1004,13 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         #     l2_grad_field_loss = 0.0
 
         # Centering loss
-        if model.has_reference_volume and model.delta_volume_decoder.transport_mass:
-            factor = 0.5 * model.xsize
-            coords_cm = (coords + centering - factor) / factor
-            cm = jnp.average(coords_cm, weights=jnp.broadcast_to(values[..., None], coords.shape), axis=1)
-            loss_cm = jnp.linalg.norm(cm, axis=1).mean()
-        else:
-            loss_cm = 0.0
+        # if model.has_reference_volume and model.delta_volume_decoder.transport_mass:
+        #     factor = 0.5 * model.xsize
+        #     coords_cm = (coords + centering - factor) / factor
+        #     cm = jnp.average(coords_cm, weights=jnp.broadcast_to(values[..., None], coords.shape), axis=1)
+        #     loss_cm = jnp.linalg.norm(cm, axis=1).mean()
+        # else:
+        #     loss_cm = 0.0
 
         # Local distance preservation
         if model.isVae:
@@ -1024,7 +1033,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         # Variational loss
         if model.isVae:
             # KL divergence loss
-            kl_loss = -0.5 * jnp.sum(1. + 2. * logstd - jnp.square(jnp.exp(logstd)) - jnp.square(latent))
+            kl_loss = -0.5 * jnp.mean(1. + 2. * logstd - jnp.square(jnp.exp(logstd)) - jnp.square(latent))
         else:
             kl_loss = 0.0
 
@@ -1093,8 +1102,9 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         else:
             decoupling_loss = 0.0
 
-        loss = (nll + 0.000001 * kl_loss + 0.000001 * kl_pose + 0.0001 * decoupling_loss
-                + l1_lambda * l1_loss + graph_lambda * loss_graph + 100. * hist_loss + 0.0001 * loss_dp + 0.0001 * loss_cm)
+        loss = (nll + kl_lambda * kl_loss + 0.000001 * kl_pose + decoupling_lambda * decoupling_loss
+                + l1_lambda * l1_loss + graph_lambda * loss_graph + 100. * hist_loss + distance_preservation_lambda * loss_dp
+                + pose_refine_reg * pose_refine_loss)
         return loss, (recon_loss.mean(), latent)
 
     # Check if Tomo mode
@@ -1647,6 +1657,34 @@ def main():
     parser.add_argument("--implicit_network", action='store_true',
                         help=f'When set, HetSIREN will use an implicit neural network approach to recover conformational states. Implicit neural networks are more memory consuming, but they are also more accurate in the detection of very local motions. '
                              f'If this architecture is selected, we strongly recommend to set as well the parameter {bcolors.ITALIC}total_mass{bcolors.ENDC} to limit the memory consumption of the network and increase its performance.')
+    parser.add_argument("--pose_refine_reg", required=False, type=float, default=0.1,
+                        help=f"Strength of the geodesic anchor that keeps the per-image rigid pose refinement close to the input poses (penalizes 1 - cos(theta) of the "
+                             f"refinement rotation). Larger values keep the refinement smaller/more conservative; set to 0 to disable it. "
+                             f"({bcolors.WARNING}NOTE{bcolors.ENDC}: this is the only regularizer acting on the rigid pose refinement in the default M=1 sampling regime)")
+    parser.add_argument("--pose_refine_warmup_epochs", required=False, type=float, default=3.0,
+                        help=f"Number of initial epochs over which the rigid pose refinement is ramped in from the identity. During this warmup the input poses are kept "
+                             f"(almost) untouched so the conformation latent and decoder can settle before poses start being refined. Set to 0 to refine from the first step.")
+    parser.add_argument("--train_inverse", action='store_true',
+                        help=f"When set, HetSIREN will additionally train an inverse decoder that maps the output Gaussian positions (the deformed point cloud produced by the "
+                             f"decoder) back to latent vectors. This provides a direct point-cloud -> latent encoding that complements the image-based encoder. "
+                             f"{bcolors.WARNING}NOTE{bcolors.ENDC}: this is only meaningful when mass transport is enabled ({bcolors.ITALIC}--transport_mass{bcolors.ENDC}), since the "
+                             f"Gaussian positions only move in that mode; if set without mass transport it is ignored.")
+    parser.add_argument("--point_transformer", action='store_true',
+                        help=f"When set, HetSIREN will use a point transformer architecture in the decoder (operating directly on the Gaussian point cloud) instead of the default "
+                             f"decoder. {bcolors.WARNING}NOTE{bcolors.ENDC}: this option and {bcolors.ITALIC}--implicit_network{bcolors.ENDC} are mutually exclusive; if both are "
+                             f"provided, the implicit network takes precedence and this flag is ignored. Like the implicit network, it only takes effect with mass transport "
+                             f"({bcolors.ITALIC}--transport_mass{bcolors.ENDC}).")
+    parser.add_argument("--kl_lambda", required=False, type=float, default=1e-3,
+                        help=f"Weight (beta) of the VAE KL divergence, which regularizes the latent posterior towards a standard normal prior. The KL is now reduced with a "
+                             f"per-element mean, so this weight is invariant to the batch size and latent dimension (unlike the previous summed KL). Increase it for a smoother, "
+                             f"more regularized latent space at the cost of reconstruction detail; decrease it (or set to 0) to let the encoder use the latent more freely. "
+                             f"({bcolors.WARNING}NOTE{bcolors.ENDC}: because the reduction changed, this is not comparable to any previously used constant)")
+    parser.add_argument("--decoupling_lambda", required=False, type=float, default=1e-4,
+                        help=f"Weight of the decoupling regularization (encourages the latent/conformation representation to be invariant to pose and CTF). Increase it to enforce "
+                             f"stronger pose/CTF decoupling, decrease it (or set to 0) to relax it.")
+    parser.add_argument("--distance_preservation_lambda", required=False, type=float, default=1e-4,
+                        help=f"Weight of the local distance preservation regularization (penalizes deviations of the mass-weighted point positions from the consensus/mean state, "
+                             f"keeping local distances consistent). Increase it for stiffer, more locally rigid deformations, decrease it (or set to 0) for more flexibility.")
     ca.add_ssd_scratch_folder(parser)
     args = ca.parse_with_config(parser)
 
@@ -1657,6 +1695,22 @@ def main():
     # Manually handed parameters
     local_reconstruction = args.local_reconstruction
     transport_mass = args.transport_mass if not local_reconstruction else False
+
+    # Decoder architecture: implicit network and point transformer are mutually
+    # exclusive. If both are requested, the implicit network takes precedence.
+    use_implicit = args.implicit_network
+    use_point_transformer = args.point_transformer and not use_implicit
+    if args.point_transformer and use_implicit:
+        print(f"{bcolors.WARNING}Both --implicit_network and --point_transformer were set; "
+              f"using the implicit decoder and ignoring --point_transformer.{bcolors.ENDC}")
+
+    # Inverse decoder (Gaussian positions -> latent) only makes sense when the
+    # Gaussians actually move, i.e. with mass transport enabled.
+    train_inverse = args.train_inverse
+    if train_inverse and not transport_mass:
+        print(f"{bcolors.WARNING}--train_inverse requires mass transport (--transport_mass); "
+              f"disabling the inverse decoder.{bcolors.ENDC}")
+        train_inverse = False
 
     # Check that training and validation fractions add up to one
     ca.validate_dataset_split_fraction(args.dataset_split_fraction)
@@ -1748,7 +1802,7 @@ def main():
 
                         model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr,
                                                             learning_rate=0.0001,
-                                                            num_epochs=5, is_global=True, ctf_type=args.ctf_type)
+                                                            num_epochs=500, is_global=True, ctf_type=args.ctf_type)
 
                         # Save volume
                         vol_splatted = np.array(model())
@@ -1801,13 +1855,14 @@ def main():
                 else:
                     vol = np.array(model.render(grid_shape=vol.shape))
                     values = vol[inds[:, 0], inds[:, 1], inds[:, 2]]
-                    sigma = jax.nn.relu(model.sigma_param.get_value())
+                    sigma = model.get_sigma()
 
             hetsiren = HetSIREN(args.lat_dim, vol, mask, coords, values,
                                 generator.md.getMetaDataImage(0).shape[0], args.sr, sigma=sigma,
                                 ctf_type=args.ctf_type, decoupling=True, isVae=True, transport_mass=transport_mass,
                                 local_reconstruction=local_reconstruction, bank_size=10000,
-                                isTomoSIREN=isTomoSIREN, is_implicit=args.implicit_network,
+                                isTomoSIREN=isTomoSIREN, is_implicit=use_implicit,
+                                point_transformer=use_point_transformer, train_inverse=train_inverse,
                                 architecture="convnn", rngs=nnx.Rngs(model_key))
         hetsiren.train()
 
@@ -1979,9 +2034,18 @@ def main():
 
                     i += 1
 
+                # Ramp the rigid pose refinement in from the identity over the first epochs
+                warmup_steps = max(1, int(args.pose_refine_warmup_epochs * steps_per_epoch))
+                warmup_alpha = float(min(1.0, total_steps / warmup_steps))
+
                 loss, recon_loss, state, rng = train_step_hetsiren(graphdef, state, x, labels, md_columns, rng,
                                                                    l1_lambda=args.denoising_strength,
-                                                                   graph_lambda=graph_lambda)
+                                                                   graph_lambda=graph_lambda,
+                                                                   warmup_alpha=warmup_alpha,
+                                                                   pose_refine_reg=args.pose_refine_reg,
+                                                                   decoupling_lambda=args.decoupling_lambda,
+                                                                   distance_preservation_lambda=args.distance_preservation_lambda,
+                                                                   kl_lambda=args.kl_lambda)
                 total_loss += loss
                 total_recon_loss += recon_loss
 
