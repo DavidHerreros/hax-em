@@ -719,7 +719,7 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
             model, _ = nnx.merge(graphdef, state)
             loss_history.append(loss_val)
             k_history.append(model.means.get_value().shape[0])
-            s = jfloat(nnx.relu(model.sigma_param.get_value())[0])
+            s = float(nnx.relu(model.sigma_param.get_value())[0])
 
             # Progress bar update  (TQDM)
             if len(loss_history) > 1000:
