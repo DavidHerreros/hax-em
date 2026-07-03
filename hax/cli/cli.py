@@ -107,6 +107,35 @@ def _configure_environment(gpu):
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 
+def _quiet_dependency_logging():
+    """Pin noisy third-party loggers to WARNING so their INFO chatter stays hidden.
+
+    hax itself never configures logging, so historically these programs were
+    quiet: with no handler on the root logger, Python's last-resort handler only
+    shows WARNING and above. Two things break that assumption at runtime:
+
+    * ``absl.logging`` (used internally by ``grain``/``orbax``) auto-attaches a
+      handler to the root logger the first time it logs -- see the
+      ``if not logging.root.handlers: logging.basicConfig()`` fallback in
+      ``absl/logging/__init__.py``. Once a root handler exists, INFO records are
+      no longer swallowed.
+    * A host process (e.g. Scipion, whose ``rich`` handler produces the
+      ``[MM/DD/YY HH:MM:SS] INFO`` lines) may set the root logger to INFO.
+
+    Either way we start leaking dependency INFO lines such as JAX's
+    "Unable to initialize backend 'tpu'" backend probe and grain's
+    "Creating BatchOperation to enable SharedMemoryArray." Setting the level on
+    the *emitting* loggers gates those records at the source, regardless of which
+    handler is attached to the root. Set ``HAX_KEEP_DEP_LOGS`` to keep them.
+    """
+    if os.environ.get("HAX_KEEP_DEP_LOGS"):
+        return
+    import logging
+    for name in ("jax", "absl", "grain", "orbax", "orbax.checkpoint",
+                 "tensorboard", "tensorboardX"):
+        logging.getLogger(name).setLevel(logging.WARNING)
+
+
 def _configure_multiprocessing():
     """Set the default multiprocessing start method to ``forkserver``.
 
@@ -171,6 +200,7 @@ def main():
     # 1) configure the environment and multiprocessing before importing JAX
     _configure_environment(ns.gpu)
     _configure_multiprocessing()
+    _quiet_dependency_logging()
 
     # 2) resolve the program (friendly error on a bad name)
     module_path = _resolve_program(parser, ns.program)
