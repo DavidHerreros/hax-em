@@ -564,6 +564,10 @@ class DeltaVolumeDecoder(nnx.Module):
             bamp = values
             bposi = jnp.floor(coords).astype(jnp.int32)
 
+        # Guard the scatter against NaN/Inf or out-of-range coordinates
+        bposi = jnp.clip(bposi, 0, self.volume_size - 1)
+        bamp = jnp.nan_to_num(bamp)
+
         def scatter_volume(vol, bpos_i, bamp_i):
             return vol.at[bpos_i[..., 2], bpos_i[..., 1], bpos_i[..., 0]].add(bamp_i)
 
@@ -621,6 +625,10 @@ class PhysDecoder:
             sigma = 1.
             bamp = values * jnp.exp(-num / (2. * sigma ** 2.))
 
+        # Guard the scatter against NaN/Inf or out-of-range coordinates
+        bposi = jnp.clip(bposi, 0, xsize - 1)
+        bamp = jnp.nan_to_num(bamp)
+
         def scatter_img(image, bpos_i, bamp_i):
             return image.at[bpos_i[..., 0], bpos_i[..., 1]].add(bamp_i)
 
@@ -662,7 +670,7 @@ class HetSIREN(nnx.Module):
     @save_config
     def __init__(self, lat_dim, reference_volume, reconstruction_mask, coords, values, xsize, sr, bank_size=1024, ctf_type="apply",
                  sigma=1.0, decoupling=False, isVae=False, transport_mass=False, local_reconstruction=False, architecture="convnn",
-                 is_implicit=True, isTomoSIREN=False, train_inverse=False, point_transformer=False, *, rngs: nnx.Rngs):
+                 is_implicit=True, isTomoSIREN=False, train_inverse=False, point_transformer=False, use_frc_loss=False, *, rngs: nnx.Rngs):
         super(HetSIREN, self).__init__()
         self.xsize = xsize
         self.ctf_type = ctf_type
@@ -696,7 +704,7 @@ class HetSIREN(nnx.Module):
         self.sigma = sigma
 
         # Loss function
-        if self.delta_volume_decoder.point_transformer:
+        if self.delta_volume_decoder.point_transformer or use_frc_loss:
             self.representation_loss_fn = FRCLoss(box_size=xsize, apix=sr, min_resolution_A=30., max_resolution_A=2. * sr)
         else:
             self.representation_loss_fn = lambda x,y: mse(x[..., None], y[..., None])
@@ -1675,10 +1683,21 @@ def main():
                              f"provided, the implicit network takes precedence and this flag is ignored. Like the implicit network, it only takes effect with mass transport "
                              f"({bcolors.ITALIC}--transport_mass{bcolors.ENDC}).")
     parser.add_argument("--kl_lambda", required=False, type=float, default=1e-3,
-                        help=f"Weight (beta) of the VAE KL divergence, which regularizes the latent posterior towards a standard normal prior. The KL is now reduced with a "
-                             f"per-element mean, so this weight is invariant to the batch size and latent dimension (unlike the previous summed KL). Increase it for a smoother, "
+                        help=f"Weight (beta) of the VAE KL divergence, which regularizes the latent posterior towards a standard normal prior. Increase it for a smoother, "
                              f"more regularized latent space at the cost of reconstruction detail; decrease it (or set to 0) to let the encoder use the latent more freely. "
                              f"({bcolors.WARNING}NOTE{bcolors.ENDC}: because the reduction changed, this is not comparable to any previously used constant)")
+    parser.add_argument("--grad_clip_norm", required=False, type=float, default=1.0,
+                        help=f"Global-norm gradient clipping threshold for the HetSIREN optimizer. Gradients whose global norm exceeds this value are rescaled down, which "
+                             f"prevents occasional gradient spikes. Set to 0 to disable clipping.")
+    parser.add_argument("--use_frc_loss", action='store_true',
+                        help=f"When set, HetSIREN uses a Fourier Ring Correlation (FRC) reconstruction loss instead of the default image-space MSE. Because the FRC normalizes "
+                             f"the error per resolution shell, it pushes the network to reproduce high-frequency detail and typically yields sharper decoded volumes (MSE is "
+                             f"dominated by low frequencies and tends to blur them). {bcolors.WARNING}NOTE{bcolors.ENDC}: the point transformer decoder always uses the FRC loss "
+                             f"regardless of this flag.")
+    parser.add_argument("--deformation_lambda", required=False, type=float, default=0.9,
+                        help=f"Weight of the graph-based deformation regularization (deformation regularity + repulsion) that keeps the local geometry of the moving Gaussians "
+                             f"consistent during mass transport. Lower it (e.g. 0.3-0.5) to allow sharper/larger motions at the risk of less regular deformations, raise it for "
+                             f"stiffer, more regular motions. Only active with mass transport and a reference volume; ignored otherwise.")
     parser.add_argument("--decoupling_lambda", required=False, type=float, default=1e-4,
                         help=f"Weight of the decoupling regularization (encourages the latent/conformation representation to be invariant to pose and CTF). Increase it to enforce "
                              f"stronger pose/CTF decoupling, decrease it (or set to 0) to relax it.")
@@ -1801,7 +1820,7 @@ def main():
                         model, _, _ = fit_volume(vol * mask_fit, mask=mask_fit, iterations=20000, learning_rate=0.001, n_init=args.num_gaussians, fixed_gaussians=True)
 
                         model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr,
-                                                            learning_rate=0.0001,
+                                                            learning_rate=0.01,
                                                             num_epochs=500, is_global=True, ctf_type=args.ctf_type)
 
                         # Save volume
@@ -1863,6 +1882,7 @@ def main():
                                 local_reconstruction=local_reconstruction, bank_size=10000,
                                 isTomoSIREN=isTomoSIREN, is_implicit=use_implicit,
                                 point_transformer=use_point_transformer, train_inverse=train_inverse,
+                                use_frc_loss=args.use_frc_loss,
                                 architecture="convnn", rngs=nnx.Rngs(model_key))
         hetsiren.train()
 
@@ -1881,7 +1901,10 @@ def main():
         # Optimizers (HetSIREN)
         params = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('delta_volume_decoder')))
         params_inv = nnx.All(nnx.Param, nnx.PathContains('inverse_volume_decoder'))
-        tx = optax.adamw(args.learning_rate)
+        if args.grad_clip_norm and args.grad_clip_norm > 0:
+            tx = optax.chain(optax.clip_by_global_norm(args.grad_clip_norm), optax.adamw(args.learning_rate))
+        else:
+            tx = optax.adamw(args.learning_rate)
         optimizer = nnx.Optimizer(hetsiren, tx, wrt=params)
         optimizer_inv = nnx.Optimizer(hetsiren, optax.adam(1e-4), wrt=params_inv)
         graphdef, state = nnx.split((hetsiren, optimizer))
@@ -1936,7 +1959,7 @@ def main():
 
                     # Compute graph lambda
                     if args.vol is not None and hetsiren.delta_volume_decoder.transport_mass:
-                        graph_lambda = 0.9
+                        graph_lambda = args.deformation_lambda
                     else:
                         graph_lambda = 0.0
                     # num_warmup_epochs = 3
