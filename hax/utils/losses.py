@@ -479,7 +479,7 @@ def frc_loss(
         obs_ft: jax.Array,
         rings: jax.Array,
         band_mask: jax.Array,
-        eps: float = 1e-8,
+        eps: float = 1e-3,
 ) -> jax.Array:
     """Compute the negative mean FRC over the precomputed band.
 
@@ -494,7 +494,10 @@ def frc_loss(
         Precomputed (n_rings,) float mask: 1.0 inside the band, 0.0
         outside.  Built once at ``FRCLoss`` construction time.
     eps
-        Numerical safety for the denominator.
+        Relative floor on the per-ring power (as a fraction of the peak observed
+        ring power) used to stabilize the denominator. Prevents the FRC gradient
+        from exploding when a ring has near-zero predicted power, which would
+        otherwise drive downstream coordinates to NaN. Scale-invariant.
 
     Returns
     -------
@@ -519,8 +522,9 @@ def frc_loss(
     obs_sq_r = reduced[2]
 
     # Per-ring FRC
-    denom = jnp.sqrt(pred_sq_r * obs_sq_r + eps)
-    frc = cross_r / denom  # (B, n_rings)
+    floor = eps * jnp.max(obs_sq_r, axis=-1, keepdims=True)
+    denom = jnp.sqrt(jnp.maximum(pred_sq_r, floor) * jnp.maximum(obs_sq_r, floor)) + 1e-12
+    frc = jnp.clip(cross_r / denom, -1.0, 1.0)  # (B, n_rings)
 
     # Mean over band, then mean over batch
     band_count = jnp.maximum(band_mask.sum(), 1.0)
