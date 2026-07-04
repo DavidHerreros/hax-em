@@ -109,8 +109,14 @@ class Siren2Linear(nnx.Module):
             # Perturb the weights
             self.linear.kernel.value += noise
 
-    def __call__(self, x):
+    def __call__(self, x, freq_alpha=1.0):
+        # ``freq_alpha`` in (0, 1] scales the effective frequency (w0) of this
+        # layer. Used for coarse-to-fine (spectral) annealing: start low so the
+        # network can only represent low-frequency structure, then ramp to 1.0.
+        # Default 1.0 leaves the layer unchanged. Only meaningful on the first
+        # SIREN layer (the one that maps input coordinates to frequencies).
+        w0 = self.w0 * freq_alpha
         if self.is_residual:
-            return jnp.sin(self.w0 * (x + self.linear(x)))
+            return jnp.sin(w0 * (x + self.linear(x)))
         else:
-            return jnp.sin(self.w0 * self.linear(x))
+            return jnp.sin(w0 * self.linear(x))

@@ -1,4 +1,4 @@
-from .losses import simae, correlation_coefficient_loss, ncc_loss, gradient_loss, diceLoss, contrastive_ce_loss, triplet_loss, sliced_wasserstein_loss, FRCLoss, chamfer_distance
+from .losses import simae, correlation_coefficient_loss, ncc_loss, gradient_loss, diceLoss, contrastive_ce_loss, triplet_loss, sliced_wasserstein_loss, FRCLoss, SpectralL2Loss, estimate_ring_weights, dynamic_band_mask, chamfer_distance
 from .geometric_losses import calculate_deformation_regularity_loss, calculate_outlier_loss, calculate_neighbour_loss, calculate_repulsion_loss, calculate_deformation_coherence_loss
 from .ctf import computeCTF
 from .euler import euler_matrix_batch, euler_from_matrix

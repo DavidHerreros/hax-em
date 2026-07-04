@@ -373,7 +373,10 @@ class DeltaVolumeDecoder(nnx.Module):
 
             self.hidden_values = nnx.List(hidden_values)
 
-    def __call__(self, x, c=None):
+    def __call__(self, x, c=None, freq_alpha=1.0):
+        # freq_alpha in (0, 1] anneals the effective frequency (w0) of the first
+        # SIREN layer for coarse-to-fine training; 1.0 = no change. It only
+        # applies to the SIREN-based decoders (not point transformer / hybrid PE).
         if self.transport_mass:
             if self.point_transformer:
                 # x = self.point_transformer_net(x, self.geom)
@@ -420,13 +423,13 @@ class DeltaVolumeDecoder(nnx.Module):
                     x_map = self.hidden_values[-1](x_map)[..., 0]
 
                 else:
-                    x_coords = self.hidden_coords[0](x_coords)
+                    x_coords = self.hidden_coords[0](x_coords, freq_alpha)
                     for layer in self.hidden_coords[1:-1]:
                         x_coords = layer(x_coords)
                     x_coords = self.hidden_coords[-1](x_coords)
 
                     # Decode values
-                    x_map = self.hidden_values[0](x_map)
+                    x_map = self.hidden_values[0](x_map, freq_alpha)
                     for layer in self.hidden_values[1:-1]:
                         x_map = layer(x_map)
                     x_map = self.hidden_values[-1](x_map)[..., 0]
@@ -435,13 +438,13 @@ class DeltaVolumeDecoder(nnx.Module):
                 x_coords, x_map = jnp.split(x, indices_or_sections=2, axis=1)
 
                 # Decode values
-                x_map = self.hidden_values[0](x_map)
+                x_map = self.hidden_values[0](x_map, freq_alpha)
                 for layer in self.hidden_values[1:-1]:
                     x_map = layer(x_map)
                 x_map = self.hidden_values[-1](x_map)
 
                 # Decode coords
-                x_coords = self.hidden_coords[0](x_coords)
+                x_coords = self.hidden_coords[0](x_coords, freq_alpha)
                 for layer in self.hidden_coords[1:-1]:
                     x_coords = layer(x_coords)
                 x_coords = self.hidden_coords[-1](x_coords)
@@ -457,7 +460,7 @@ class DeltaVolumeDecoder(nnx.Module):
             coords = self.scale * (self.coords + delta_coords)
         else:
             # Decode voxel values
-            x_map = self.hidden_values[0](x)
+            x_map = self.hidden_values[0](x, freq_alpha)
             for layer in self.hidden_values[1:-1]:
                 x_map = layer(x_map)
             x_map = self.hidden_values[-1](x_map)
@@ -670,7 +673,8 @@ class HetSIREN(nnx.Module):
     @save_config
     def __init__(self, lat_dim, reference_volume, reconstruction_mask, coords, values, xsize, sr, bank_size=1024, ctf_type="apply",
                  sigma=1.0, decoupling=False, isVae=False, transport_mass=False, local_reconstruction=False, architecture="convnn",
-                 is_implicit=True, isTomoSIREN=False, train_inverse=False, point_transformer=False, use_frc_loss=False, *, rngs: nnx.Rngs):
+                 is_implicit=True, isTomoSIREN=False, train_inverse=False, point_transformer=False, use_frc_loss=False,
+                 loss_type=None, spectral_ring_weight=None, *, rngs: nnx.Rngs):
         super(HetSIREN, self).__init__()
         self.xsize = xsize
         self.ctf_type = ctf_type
@@ -703,11 +707,25 @@ class HetSIREN(nnx.Module):
         # self.sigma = nnx.Param(sigma)
         self.sigma = sigma
 
-        # Loss function
-        if self.delta_volume_decoder.point_transformer or use_frc_loss:
+        # Loss function.
+        #   loss_type: one of {"mse", "frc", "spectral"} to select the
+        #   reconstruction loss explicitly. If None, defaults to "mse" (or "frc"
+        #   for the point transformer decoder, which needs a Fourier-space loss).
+        if loss_type is None:
+            loss_type = "frc" if use_frc_loss else "mse"
+        if self.delta_volume_decoder.point_transformer and loss_type == "mse":
+            loss_type = "frc"
+        self.loss_type = loss_type
+
+        if loss_type == "frc":
             self.representation_loss_fn = FRCLoss(box_size=xsize, apix=sr, min_resolution_A=30., max_resolution_A=2. * sr)
+        elif loss_type == "spectral":
+            # SSNR/Wiener-weighted spectral L2 (noise model in the data term).
+            # Band runs to Nyquist; the per-ring weight down-weights noisy shells.
+            self.representation_loss_fn = SpectralL2Loss(box_size=xsize, apix=sr, ring_weight=spectral_ring_weight,
+                                                         min_resolution_A=30., max_resolution_A=2. * sr)
         else:
-            self.representation_loss_fn = lambda x,y: mse(x[..., None], y[..., None])
+            self.representation_loss_fn = lambda x, y, freq_alpha=1.0: mse(x[..., None], y[..., None])
 
     def __call__(self, x, rngs=None, **kwargs):
         if self.isVae:
@@ -823,7 +841,7 @@ class HetSIREN(nnx.Module):
                                    "decoupling_lambda", "distance_preservation_lambda", "kl_lambda"))
 def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_lambda=1e-4, graph_lambda=1e-4,
                         warmup_alpha=1.0, pose_refine_reg=0.1, decoupling_lambda=1e-4, distance_preservation_lambda=1e-4,
-                        kl_lambda=1e-3):
+                        kl_lambda=1e-3, freq_alpha=1.0):
     model, optimizer = nnx.merge(graphdef, state)
     distributions_key, rot_sample_key, choice_key, key = jnr.split(key, 4)
 
@@ -874,11 +892,11 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
             else:
                 latent, (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key, warmup_alpha=warmup_alpha)
 
-        # Decode volumes
+        # Decode volumes (freq_alpha anneals the decoder's first-SIREN-layer w0)
         if model.isVae:
-            coords, values = model.delta_volume_decoder(sample)
+            coords, values = model.delta_volume_decoder(sample, freq_alpha=freq_alpha)
         else:
-            coords, values = model.delta_volume_decoder(latent)
+            coords, values = model.delta_volume_decoder(latent, freq_alpha=freq_alpha)
 
         # Get rotation matrices
         if euler_angles.ndim == 2:
@@ -976,7 +994,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         # if not model.delta_volume_decoder.transport_mass:
         #     images_consensus_loss = images_consensus_loss * projected_mask
 
-        recon_loss = 0.1 * model.representation_loss_fn(images_corrected_loss, x_loss) + 0.9 * model.representation_loss_fn(images_corrected_field_loss, x_loss)
+        recon_loss = 0.1 * model.representation_loss_fn(images_corrected_loss, x_loss, freq_alpha) + 0.9 * model.representation_loss_fn(images_corrected_field_loss, x_loss, freq_alpha)
         # if model.delta_volume_decoder.transport_mass:
         recons_loss_all = recon_loss.mean()
         # else:
@@ -1022,7 +1040,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
 
         # Local distance preservation
         if model.isVae:
-            coords_mean, values_mean = model.delta_volume_decoder(latent)
+            coords_mean, values_mean = model.delta_volume_decoder(latent, freq_alpha=freq_alpha)
             loss_dp = jnp.abs(values[..., None] * coords / model.delta_volume_decoder.scale
                               - values_mean[..., None] * coords_mean / model.delta_volume_decoder.scale).mean()
         else:
@@ -1689,11 +1707,22 @@ def main():
     parser.add_argument("--grad_clip_norm", required=False, type=float, default=1.0,
                         help=f"Global-norm gradient clipping threshold for the HetSIREN optimizer. Gradients whose global norm exceeds this value are rescaled down, which "
                              f"prevents occasional gradient spikes. Set to 0 to disable clipping.")
-    parser.add_argument("--use_frc_loss", action='store_true',
-                        help=f"When set, HetSIREN uses a Fourier Ring Correlation (FRC) reconstruction loss instead of the default image-space MSE. Because the FRC normalizes "
-                             f"the error per resolution shell, it pushes the network to reproduce high-frequency detail and typically yields sharper decoded volumes (MSE is "
-                             f"dominated by low frequencies and tends to blur them). {bcolors.WARNING}NOTE{bcolors.ENDC}: the point transformer decoder always uses the FRC loss "
-                             f"regardless of this flag.")
+    parser.add_argument("--loss_type", required=False, type=str, default="mse", choices=["mse", "frc", "spectral"],
+                        help=f"Reconstruction (representation) loss. {bcolors.ITALIC}mse{bcolors.ENDC} (default): image-space L2 (robust on noise but blurs "
+                             f"high frequencies). {bcolors.ITALIC}frc{bcolors.ENDC}: Fourier Ring Correlation (sharp on clean data, but weights noise-dominated shells equally "
+                             f"and tends to overfit noise on experimental data). {bcolors.ITALIC}spectral{bcolors.ENDC}: a per-shell SSNR/Wiener-weighted spectral L2 that puts "
+                             f"the noise model into the data term - it keeps MSE's robustness but down-weights the noisy high-resolution shells, so it is the recommended choice "
+                             f"for noisy experimental data. {bcolors.WARNING}NOTE{bcolors.ENDC}: the point transformer decoder always uses a Fourier-space loss (frc) regardless "
+                             f"of this setting; {bcolors.ITALIC}spectral{bcolors.ENDC} estimates its per-shell weights once from a representative batch of your data at startup.")
+    parser.add_argument("--freq_anneal_epochs", required=False, type=float, default=0.0,
+                        help=f"Coarse-to-fine (spectral) annealing: number of initial epochs over which the effective resolution is ramped in. During this window the decoder's "
+                             f"first-SIREN-layer frequency (w0) and the upper limit of the FRC/spectral loss band are scaled up from {bcolors.ITALIC}--freq_anneal_start{bcolors.ENDC} "
+                             f"to full resolution. This forces the network to fit low-frequency structure before high-frequency detail, which strongly stabilizes training on noisy "
+                             f"data (it prevents the SIREN from overfitting high-frequency noise early). Set to 0 to disable (train at full resolution from the first step). "
+                             f"{bcolors.WARNING}NOTE{bcolors.ENDC}: does not affect the point transformer decoder's w0 (it has no SIREN first layer), but still anneals its loss band.")
+    parser.add_argument("--freq_anneal_start", required=False, type=float, default=0.2,
+                        help=f"Starting fraction (in (0, 1]) for {bcolors.ITALIC}--freq_anneal_epochs{bcolors.ENDC}: freq_alpha begins at this value and ramps linearly to 1.0. "
+                             f"Smaller values start coarser (lower resolution). Ignored when {bcolors.ITALIC}--freq_anneal_epochs{bcolors.ENDC} is 0.")
     parser.add_argument("--deformation_lambda", required=False, type=float, default=0.9,
                         help=f"Weight of the graph-based deformation regularization (deformation regularity + repulsion) that keeps the local geometry of the moving Gaussians "
                              f"consistent during mass transport. Lower it (e.g. 0.3-0.5) to allow sharper/larger motions at the risk of less regular deformations, raise it for "
@@ -1821,7 +1850,7 @@ def main():
 
                         model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr,
                                                             learning_rate=0.01,
-                                                            num_epochs=5, is_global=True, ctf_type=args.ctf_type)
+                                                            num_epochs=500, is_global=True, ctf_type=args.ctf_type)
 
                         # Save volume
                         vol_splatted = np.array(model())
@@ -1876,13 +1905,34 @@ def main():
                     values = vol[inds[:, 0], inds[:, 1], inds[:, 2]]
                     sigma = model.get_sigma()
 
+            # For the spectral loss, estimate its per-shell SSNR/Wiener weights
+            # once from a representative batch of the actual data.
+            spectral_ring_weight = None
+            if args.loss_type == "spectral":
+                x_rw, _ = next(iter(data_loader_train))
+                if isTomoSIREN:
+                    x_rw = x_rw[0]
+                x_rw = jnp.asarray(x_rw, dtype=jnp.float32)
+                if x_rw.ndim == 4:
+                    x_rw = jnp.squeeze(x_rw, axis=-1)
+                spectral_ring_weight = estimate_ring_weights(x_rw, generator.md.getMetaDataImage(0).shape[0])
+                print(f"\n{bcolors.OKCYAN}Estimated spectral SSNR ring weights from a representative batch "
+                      f"(shape {tuple(np.asarray(spectral_ring_weight).shape)}).{bcolors.ENDC}")
+
+            # A zero KL weight makes the VAE prior term inactive, so drop the
+            # variational machinery entirely and use a plain (deterministic)
+            # autoencoder latent instead.
+            use_vae = args.kl_lambda != 0
+            if not use_vae:
+                print(f"\n{bcolors.WARNING}--kl_lambda is 0: disabling the VAE (using a deterministic latent).{bcolors.ENDC}")
+
             hetsiren = HetSIREN(args.lat_dim, vol, mask, coords, values,
                                 generator.md.getMetaDataImage(0).shape[0], args.sr, sigma=sigma,
-                                ctf_type=args.ctf_type, decoupling=True, isVae=True, transport_mass=transport_mass,
+                                ctf_type=args.ctf_type, decoupling=True, isVae=use_vae, transport_mass=transport_mass,
                                 local_reconstruction=local_reconstruction, bank_size=10000,
                                 isTomoSIREN=isTomoSIREN, is_implicit=use_implicit,
                                 point_transformer=use_point_transformer, train_inverse=train_inverse,
-                                use_frc_loss=args.use_frc_loss,
+                                loss_type=args.loss_type, spectral_ring_weight=spectral_ring_weight,
                                 architecture="convnn", rngs=nnx.Rngs(model_key))
         hetsiren.train()
 
@@ -2061,6 +2111,17 @@ def main():
                 warmup_steps = max(1, int(args.pose_refine_warmup_epochs * steps_per_epoch))
                 warmup_alpha = float(min(1.0, total_steps / warmup_steps))
 
+                # Coarse-to-fine frequency annealing: ramp freq_alpha from
+                # freq_anneal_start up to 1.0 over the first freq_anneal_epochs.
+                # It scales the decoder's first-SIREN-layer w0 and the upper limit
+                # of the (FRC/spectral) loss band. 0 epochs -> disabled (== 1.0).
+                if args.freq_anneal_epochs and args.freq_anneal_epochs > 0:
+                    freq_steps = max(1, int(args.freq_anneal_epochs * steps_per_epoch))
+                    freq_alpha = float(args.freq_anneal_start
+                                       + (1.0 - args.freq_anneal_start) * min(1.0, total_steps / freq_steps))
+                else:
+                    freq_alpha = 1.0
+
                 loss, recon_loss, state, rng = train_step_hetsiren(graphdef, state, x, labels, md_columns, rng,
                                                                    l1_lambda=args.denoising_strength,
                                                                    graph_lambda=graph_lambda,
@@ -2068,7 +2129,8 @@ def main():
                                                                    pose_refine_reg=args.pose_refine_reg,
                                                                    decoupling_lambda=args.decoupling_lambda,
                                                                    distance_preservation_lambda=args.distance_preservation_lambda,
-                                                                   kl_lambda=args.kl_lambda)
+                                                                   kl_lambda=args.kl_lambda,
+                                                                   freq_alpha=freq_alpha)
                 total_loss += loss
                 total_recon_loss += recon_loss
 
