@@ -569,24 +569,25 @@ class FRCLoss:
         band_mask_np = ((np.arange(self.n_rings) >= minpx) & (np.arange(self.n_rings) <= maxpx)).astype(np.float32)
         self.band_mask = jnp.asarray(band_mask_np)
 
-    def _band_mask(self, freq_alpha):
-        """Band mask, optionally with an annealed upper resolution limit.
+    def _band_mask(self, freq_alpha, ceiling_px=None):
+        """Band mask, optionally annealed and FSC-capped.
 
         ``freq_alpha`` in [0, 1] ramps the upper ring from ``minpx`` (coarse) up
-        to ``maxpx`` (full band). ``1.0`` reproduces the static band exactly.
-        Accepts a traced scalar so it works inside ``jit``.
+        to ``maxpx`` (full band). ``ceiling_px`` (if given) additionally caps the
+        upper ring at an FSC-derived resolution. Both accept traced scalars so
+        this works inside ``jit``.
         """
-        return dynamic_band_mask(self.ring_ids, self.minpx, self.maxpx, freq_alpha)
+        return dynamic_band_mask(self.ring_ids, self.minpx, self.maxpx, freq_alpha, ceiling_px)
 
-    def __call__(self, pred_real: jax.Array, obs_real: jax.Array, freq_alpha=1.0) -> jax.Array:
+    def __call__(self, pred_real: jax.Array, obs_real: jax.Array, freq_alpha=1.0, ceiling_px=None) -> jax.Array:
         pred_ft = preprocess_particles(pred_real,
                                        apply_mean_subtract=self.apply_mean_subtract)
         obs_ft = preprocess_particles(obs_real,
                                       apply_mean_subtract=self.apply_mean_subtract)
-        return self.call_complex(pred_ft, obs_ft, freq_alpha)
+        return self.call_complex(pred_ft, obs_ft, freq_alpha, ceiling_px)
 
-    def call_complex(self, pred_ft: jax.Array, obs_ft: jax.Array, freq_alpha=1.0) -> jax.Array:
-        return frc_loss(pred_ft, obs_ft, self.rings, self._band_mask(freq_alpha))
+    def call_complex(self, pred_ft: jax.Array, obs_ft: jax.Array, freq_alpha=1.0, ceiling_px=None) -> jax.Array:
+        return frc_loss(pred_ft, obs_ft, self.rings, self._band_mask(freq_alpha, ceiling_px))
 
 
 def recommended_band(
@@ -605,192 +606,122 @@ def recommended_band(
     return minpx, maxpx
 
 
-def dynamic_band_mask(ring_ids: jax.Array, minpx: int, maxpx: int, freq_alpha=1.0) -> jax.Array:
-    """Soft band mask with an annealed upper resolution limit.
+def dynamic_band_mask(ring_ids: jax.Array, minpx: int, maxpx: int, freq_alpha=1.0, ceiling_px=None) -> jax.Array:
+    """Soft band mask with an annealed and (optionally) FSC-capped upper limit.
 
     Rings below ``minpx`` are always excluded. The upper limit ramps linearly
     from ``minpx`` (``freq_alpha=0``) up to ``maxpx`` (``freq_alpha=1``), with a
     1-ring-wide soft edge so the newly admitted shell fades in smoothly instead
     of switching on abruptly (which would otherwise cause a loss/grad jump).
-    ``freq_alpha`` may be a traced scalar, so this is ``jit``-safe.
 
-    With ``freq_alpha=1.0`` this reproduces the closed-closed ``[minpx, maxpx]``
-    hard mask exactly.
+    ``ceiling_px`` (if given) is an additional hard cap on the upper ring, meant
+    to be driven by a gold-standard half-set FSC resolution so the loss never
+    tries to fit beyond the resolution the data actually supports. The effective
+    upper ring is ``min(freq_alpha-ramp, ceiling_px)``. Both ``freq_alpha`` and
+    ``ceiling_px`` may be traced scalars, so this is ``jit``-safe.
+
+    With ``freq_alpha=1.0`` and ``ceiling_px=None`` (or >= maxpx) this reproduces
+    the closed-closed ``[minpx, maxpx]`` hard mask exactly.
     """
     freq_alpha = jnp.clip(jnp.asarray(freq_alpha, dtype=jnp.float32), 0.0, 1.0)
     cur_max = minpx + freq_alpha * (maxpx - minpx)
+    if ceiling_px is not None:
+        cur_max = jnp.minimum(cur_max, jnp.asarray(ceiling_px, dtype=jnp.float32))
     lower = (ring_ids >= minpx).astype(jnp.float32)
     # Soft upper edge: 1 well inside the band, linearly to 0 one ring past cur_max.
     upper = jnp.clip(cur_max - ring_ids.astype(jnp.float32) + 1.0, 0.0, 1.0)
     return lower * upper
 
 
-def spectral_l2_loss(
-        pred_ft: jax.Array,
-        obs_ft: jax.Array,
-        rings: jax.Array,
-        ring_counts: jax.Array,
-        weight: jax.Array,
-) -> jax.Array:
-    """Per-image, per-ring-weighted L2 in Fourier space.
+def build_fourier_shells_3d(box_size: int) -> tuple[jax.Array, int]:
+    """Integer radial-shell index for a full (unshifted) 3D FFT grid.
 
-    This is a plain squared-error data term (unbiased under zero-mean noise, so
-    its per-particle noise gradient cancels over the dataset), but reweighted per
-    resolution shell by ``weight`` — an (approximate) SSNR / Wiener weighting that
-    down-weights the noise-dominated high-frequency shells. It therefore keeps the
-    robustness of MSE while removing MSE's blunt amplitude bias and, unlike the
-    FRC, without giving noise shells equal say.
-
-    Parameters
-    ----------
-    pred_ft, obs_ft
-        Complex (B, H, W//2+1) rFFT tensors (use ``preprocess_particles``).
-    rings
-        One-hot ring tensor (H, W//2+1, n_rings) from ``build_fourier_rings``.
-    ring_counts
-        (n_rings,) number of coefficients per ring (``rings.sum((0, 1))``).
-    weight
-        (n_rings,) non-negative per-ring weight (band mask times SSNR weighting).
-
-    Returns
-    -------
-    (B,) per-image weighted-mean squared error over the band.
+    Returns ``(shell_index, n_shells)`` where ``shell_index`` is an
+    ``(D, D, D)`` int32 array giving the rounded frequency radius (in pixels,
+    0..Nyquist) of every voxel of ``jnp.fft.fftn`` output, and
+    ``n_shells = box_size // 2 + 1`` (DC..Nyquist). Voxels beyond Nyquist (the
+    corners) are clamped to the last shell; treat that last shell as unreliable.
     """
-    diff = pred_ft - obs_ft
-    diff_sq = diff.real * diff.real + diff.imag * diff.imag  # (B, H, W//2+1)
-
-    # Ring-average |diff|^2 -> (B, n_rings)
-    diff_sq_r = jnp.tensordot(diff_sq, rings, axes=[[1, 2], [0, 1]])
-    diff_sq_r = diff_sq_r / jnp.maximum(ring_counts, 1.0)[None, :]
-
-    w = weight[None, :]
-    denom = jnp.maximum(w.sum(axis=1), 1e-8)
-    return (diff_sq_r * w).sum(axis=1) / denom
+    f = jnp.fft.fftfreq(box_size) * box_size            # -D/2 .. D/2-1, in pixels
+    kz, ky, kx = jnp.meshgrid(f, f, f, indexing="ij")
+    r = jnp.sqrt(kx ** 2 + ky ** 2 + kz ** 2)
+    n_shells = box_size // 2 + 1
+    shell = jnp.clip(jnp.round(r).astype(jnp.int32), 0, n_shells - 1)
+    return shell, n_shells
 
 
-class SpectralL2Loss:
-    """Noise-weighted (SSNR / Wiener) spectral L2 reconstruction loss.
+def fsc_3d(vol1: jax.Array, vol2: jax.Array, shell_index: jax.Array, n_shells: int,
+           mask: jax.Array = None) -> jax.Array:
+    """Fourier Shell Correlation between two 3D volumes.
 
-    Drop-in replacement for ``mse`` / ``FRCLoss`` in the HetSIREN reconstruction
-    term. It computes a per-ring-weighted squared error in Fourier space, where
-    the weights come from an estimate of the per-shell SSNR of the data (see
-    ``estimate_ring_weights``). This is the "put the noise model into the data
-    term" objective: whitened/ML-style weighting of an otherwise unbiased L2.
+    ``FSC(s) = Σ Re(F1·conj(F2)) / sqrt(Σ|F1|²·Σ|F2|²)`` per shell — the 3D
+    analogue of :func:`frc_loss`'s per-ring correlation. Pass ``shell_index`` /
+    ``n_shells`` from :func:`build_fourier_shells_3d`. An optional real-space
+    ``mask`` (e.g. the reconstruction mask) is applied before the FFT so solvent
+    does not inflate the correlation.
 
-    The upper resolution limit of the band can be annealed during training via
-    ``freq_alpha`` (coarse-to-fine), exactly like ``FRCLoss``.
+    Returns an ``(n_shells,)`` array (DC..Nyquist).
     """
-
-    def __init__(
-            self,
-            box_size: int,
-            apix: float,
-            ring_weight: jax.Array = None,
-            min_resolution_A: float = 30.0,
-            max_resolution_A: float = 2.0,
-            apply_mean_subtract: bool = True,
-    ):
-        # Default band upper limit is Nyquist (max_resolution_A = 2*apix would be
-        # passed by the caller); clamp inside recommended_band.
-        minpx, maxpx = recommended_band(
-            box_size=box_size, apix=apix,
-            min_resolution_A=min_resolution_A,
-            max_resolution_A=max_resolution_A,
-        )
-        self.box_size = box_size
-        self.minpx = minpx
-        self.maxpx = maxpx
-        self.apply_mean_subtract = apply_mean_subtract
-        self.rings, self.n_rings = build_fourier_rings(box_size)
-        self.ring_counts = self.rings.sum(axis=(0, 1))
-        self.ring_ids = jnp.arange(self.n_rings)
-
-        # Per-ring SSNR weighting. If not provided, fall back to a flat weighting
-        # (i.e. a plain band-limited spectral L2) so the loss is still usable.
-        if ring_weight is None:
-            ring_weight = jnp.ones((self.n_rings,), dtype=jnp.float32)
-        ring_weight = jnp.asarray(ring_weight, dtype=jnp.float32)
-        assert ring_weight.shape[0] == self.n_rings, (
-            f"ring_weight has length {ring_weight.shape[0]}, expected {self.n_rings}"
-        )
-        self.ring_weight = ring_weight
-
-    def _weight(self, freq_alpha):
-        return self.ring_weight * dynamic_band_mask(self.ring_ids, self.minpx, self.maxpx, freq_alpha)
-
-    def __call__(self, pred_real: jax.Array, obs_real: jax.Array, freq_alpha=1.0) -> jax.Array:
-        pred_ft = preprocess_particles(pred_real, apply_mean_subtract=self.apply_mean_subtract)
-        obs_ft = preprocess_particles(obs_real, apply_mean_subtract=self.apply_mean_subtract)
-        return self.call_complex(pred_ft, obs_ft, freq_alpha)
-
-    def call_complex(self, pred_ft: jax.Array, obs_ft: jax.Array, freq_alpha=1.0) -> jax.Array:
-        return spectral_l2_loss(pred_ft, obs_ft, self.rings, self.ring_counts, self._weight(freq_alpha))
+    if mask is not None:
+        vol1 = vol1 * mask
+        vol2 = vol2 * mask
+    f1 = jnp.fft.fftn(vol1)
+    f2 = jnp.fft.fftn(vol2)
+    cross = (f1.real * f2.real + f1.imag * f2.imag).reshape(-1)
+    p1 = (f1.real ** 2 + f1.imag ** 2).reshape(-1)
+    p2 = (f2.real ** 2 + f2.imag ** 2).reshape(-1)
+    seg = shell_index.reshape(-1)
+    cross_s = jax.ops.segment_sum(cross, seg, num_segments=n_shells)
+    p1_s = jax.ops.segment_sum(p1, seg, num_segments=n_shells)
+    p2_s = jax.ops.segment_sum(p2, seg, num_segments=n_shells)
+    return cross_s / (jnp.sqrt(p1_s * p2_s) + 1e-12)
 
 
-def estimate_ring_weights(
-        images: jax.Array,
-        box_size: int,
-        floor: float = 1e-3,
-) -> jax.Array:
-    """Estimate per-ring SSNR / Wiener weights from a representative image batch.
+def fsc_resolution(fsc: jax.Array, box_size: int, apix: float, threshold: float = 0.5) -> tuple:
+    """Resolution (Å) and shell index where the FSC first drops below ``threshold``.
 
-    The weight for ring ``r`` is ``SSNR(r) / (1 + SSNR(r))`` with
-    ``SSNR(r) = S(r) / N``, where:
+    Uses ``threshold=0.5`` by default (the conservative "half-bit"-style
+    criterion), which is deliberately stricter than the 0.143 gold-standard
+    criterion so a decoded-map FSC — which is known to be optimistic — does not
+    drive the loss band too far. Shell 0 (DC) is skipped. If the FSC never falls
+    below the threshold, returns the Nyquist shell.
 
-    * ``P(r)`` is the observed radial power spectrum (signal + noise), measured
-      as the ring-averaged ``|rFFT|^2`` over the batch (ortho-normalised, so the
-      per-coefficient noise power is the real-space noise variance);
-    * ``N`` is a white noise floor estimated from the solvent corners of the
-      images (pixels outside the inscribed circle), which are essentially pure
-      noise in single-particle Cryo-EM;
-    * ``S(r) = max(P(r) - N, 0)`` is the estimated signal power per shell.
-
-    This yields weights near 1 at the signal-rich low-resolution shells and near
-    0 at the noise-dominated high-resolution shells, which is exactly the
-    weighting a colored-noise likelihood would apply. Returned length is
-    ``box_size // 2 + 1`` (DC..Nyquist), matching ``build_fourier_rings``.
-
-    Parameters
-    ----------
-    images
-        (B, H, W) or (B, H, W, 1) real images from the dataset.
-    box_size
-        Image side length (must equal H = W).
-    floor
-        Relative floor (fraction of the peak weight) added so no in-band shell is
-        weighted exactly zero, preventing a completely dead resolution range.
+    Returns ``(resolution_A, shell)`` as host ints/floats.
     """
-    images = jnp.asarray(images)
-    if images.ndim == 4:
-        images = jnp.squeeze(images, axis=-1)
+    fsc = np.asarray(fsc)
+    n = fsc.shape[0]
+    below = fsc[1:] < threshold
+    if np.any(below):
+        shell = int(np.argmax(below)) + 1
+    else:
+        shell = n - 1
+    resolution_A = box_size * apix / max(shell, 1)
+    return float(resolution_A), int(shell)
 
-    rings, n_rings = build_fourier_rings(box_size)
-    ring_counts = rings.sum(axis=(0, 1))
 
-    # Observed radial power spectrum P(r) = S(r) + N.
-    ft = preprocess_particles(images, apply_mean_subtract=True)  # (B, H, W//2+1)
-    power = ft.real * ft.real + ft.imag * ft.imag
-    power_r = jnp.tensordot(power, rings, axes=[[1, 2], [0, 1]])  # (B, n_rings)
-    power_r = power_r.mean(axis=0) / jnp.maximum(ring_counts, 1.0)
+def conservative_band_ceiling(resolution_A: float, box_size: int, apix: float,
+                              minpx: int, maxpx: int, margin: float = 1.15,
+                              prev_ceiling_px: int = None, max_step: int = 2) -> int:
+    """Turn an FSC resolution into a conservative upper-band ring for the loss.
 
-    # White noise floor N from the solvent corners (outside the inscribed circle).
-    cy, cx = box_size // 2, box_size // 2
-    yy, xx = jnp.indices((box_size, box_size))
-    radius = jnp.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-    solvent = radius > min(cy, cx)
-    bg_mean = (images * solvent).sum(axis=(1, 2)) / jnp.maximum(solvent.sum(), 1)
-    bg = (images - bg_mean[:, None, None]) * solvent
-    noise_var = (bg ** 2).sum(axis=(1, 2)) / jnp.maximum(solvent.sum(), 1)
-    # Under ortho-normalised FFT (Parseval), the per-coefficient noise power
-    # equals the real-space noise variance.
-    noise_floor = jnp.mean(noise_var)
+    Three guards against an over-optimistic decoded-map FSC:
+      * ``margin`` (>1) coarsens the resolution before converting to a ring, so
+        the band stays a shell or two inside the measured FSC limit;
+      * the result is clamped to ``[minpx+1, maxpx]`` (never below the low-res
+        floor, never past the target band);
+      * ``max_step`` + ``prev_ceiling_px`` add hysteresis: the ceiling may only
+        rise a few rings per update, so a single optimistic FSC spike cannot
+        immediately open the band.
 
-    ssnr = jnp.maximum(power_r - noise_floor, 0.0) / jnp.maximum(noise_floor, 1e-12)
-    weight = ssnr / (1.0 + ssnr)
-
-    # Small relative floor so no in-band shell is exactly dead.
-    weight = weight + floor * jnp.max(weight)
-    return weight.astype(jnp.float32)
+    Returns an int ring index to pass as ``ceiling_px`` to the loss.
+    """
+    res = resolution_A * margin
+    ceil_px = int(round(box_size * apix / max(res, 1e-6)))
+    ceil_px = int(np.clip(ceil_px, minpx + 1, maxpx))
+    if prev_ceiling_px is not None:
+        ceil_px = min(ceil_px, int(prev_ceiling_px) + max_step)
+        ceil_px = int(np.clip(ceil_px, minpx + 1, maxpx))
+    return ceil_px
 
 
 def chamfer_distance(x, y):

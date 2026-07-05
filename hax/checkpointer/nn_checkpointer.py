@@ -54,7 +54,7 @@ class NeuralNetworkCheckpointer:
         return model
 
     @classmethod
-    def save_intermediate(cls, graphdef, state, checkpoint_path, epoch=None):
+    def save_intermediate(cls, graphdef, state, checkpoint_path, epoch=None, ema_params=None):
         os.makedirs(checkpoint_path, exist_ok=True)
 
         checkpoint_path = ocp.test_utils.erase_and_create_empty(os.path.abspath(os.path.join(checkpoint_path, 'checkpoints')))
@@ -71,7 +71,28 @@ class NeuralNetworkCheckpointer:
         # Save model state
         checkpointer = ocp.StandardCheckpointer()
         checkpointer.save(checkpoint_path / 'state', state)
+        # Optionally persist the EMA/Polyak weight buffer alongside the state so a
+        # resume restores it exactly. Written into the same (freshly-created)
+        # 'checkpoints' folder; absent for non-EMA runs, which stay fully legacy.
+        if ema_params is not None:
+            checkpointer.save(checkpoint_path / 'ema', ema_params)
         checkpointer.wait_until_finished()
+
+    @classmethod
+    def load_ema(cls, checkpoint_path, template):
+        """Restore the EMA weight buffer saved next to an intermediate checkpoint.
+
+        ``template`` is a pytree with the same structure as the saved buffer
+        (e.g. ``nnx.state(model, params)`` of the just-restored model). Returns the
+        restored buffer, or ``None`` when this checkpoint has no EMA saved (legacy
+        checkpoints, or runs trained without ``--ema_decay``), so callers can fall
+        back to re-initialising the EMA from the resumed weights.
+        """
+        ema_path = epath.Path(os.path.abspath(os.path.join(checkpoint_path, 'checkpoints', 'ema')))
+        if not ema_path.exists():
+            return None
+        checkpointer = ocp.StandardCheckpointer()
+        return checkpointer.restore(ema_path, template)
 
     @classmethod
     def load_intermediate(cls, checkpoint_path, *optimizers: nnx.Optimizer, return_as_model=False, load_model_only=False):

@@ -32,6 +32,63 @@ def calculate_deformation_regularity_loss(positions, radius_graph, consensus_dis
     loss = (distances - consensus_distances) ** 2.
     return jnp.mean(edge_weights * loss)
 
+def calculate_arap_loss(positions, consensus_positions, radius_graph, edge_weights, num_points, eps=1e-6):
+    """As-rigid-as-possible (ARAP) energy.
+
+    For every node the best-fit local *rotation* is factored out before the
+    deformation is penalised, so a locally rigid motion (rotation of a domain)
+    costs nothing and only the genuinely non-rigid distortion is penalised. This
+    is a stronger, more physical prior than distance preservation alone
+    (:func:`calculate_deformation_regularity_loss`), which also penalises rigid
+    local rotations and therefore over-stiffens hinge/domain motions while being
+    weaker against noise-driven shear.
+
+    ``E = Σ_i Σ_{j∈N(i)} w_ij || (p'_i - p'_j) - R_i (p_i - p_j) ||²`` where the
+    optimal ``R_i`` is recovered per node from the local covariance
+    ``S_i = Σ_j w_ij (p_i - p_j)(p'_i - p'_j)^T`` via SVD (Sorkine & Alexa 2007).
+
+    Parameters
+    ----------
+    positions
+        ``(N, 3)`` deformed point positions (``p'``).
+    consensus_positions
+        ``(N, 3)`` rest/consensus positions (``p``).
+    radius_graph
+        ``(2, E)`` edge index ``(i, j)`` (same graph as the other graph losses).
+    edge_weights
+        ``(E,)`` per-edge weights.
+    num_points
+        ``N`` (static).
+    """
+    i, j = radius_graph
+    e0 = consensus_positions[i] - consensus_positions[j]        # rest edge   (E, 3)
+    e = positions[i] - positions[j]                             # deformed    (E, 3)
+    w = edge_weights
+
+    # Per-node covariance S_i = Σ_j w_ij e0 e^T, accumulated at node i.
+    outer = w[:, None, None] * (e0[:, :, None] * e[:, None, :])  # (E, 3, 3)
+    S = jax.ops.segment_sum(outer, i, num_segments=num_points)   # (N, 3, 3)
+    # Regularise so degenerate (collinear / few-neighbour) nodes give R ~ I.
+    S = S + eps * jnp.eye(3)[None]
+
+    U, _, Vt = jnp.linalg.svd(S)
+    V = jnp.swapaxes(Vt, -1, -2)
+    Ut = jnp.swapaxes(U, -1, -2)
+    R = jnp.einsum('nij,njk->nik', V, Ut)                        # V U^T
+    # Reflection correction -> proper rotation (det = +1).
+    det = jnp.linalg.det(R)
+    D = jnp.ones((num_points, 3)).at[:, -1].set(jnp.sign(det))
+    R = jnp.einsum('nij,nj,njk->nik', V, D, Ut)                  # V diag(1,1,sign) U^T
+
+    # Optimal rotation is a target (ARAP local step): detach so we do not
+    # backprop through the SVD (whose gradient is unstable at degenerate spectra)
+    # and so the energy is a clean quadratic in the positions.
+    R = jax.lax.stop_gradient(R)
+
+    resid = e - jnp.einsum('eij,ej->ei', R[i], e0)              # (E, 3)
+    return jnp.mean(w * jnp.sum(resid ** 2., axis=-1))
+
+
 def calculate_deformation_coherence_loss(displacements, radius_graph, edge_weights, eps=1e-8):
     """Enforces smooth motion (Nearby points move together)."""
     i, j = radius_graph

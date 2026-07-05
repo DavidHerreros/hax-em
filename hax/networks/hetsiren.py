@@ -674,7 +674,7 @@ class HetSIREN(nnx.Module):
     def __init__(self, lat_dim, reference_volume, reconstruction_mask, coords, values, xsize, sr, bank_size=1024, ctf_type="apply",
                  sigma=1.0, decoupling=False, isVae=False, transport_mass=False, local_reconstruction=False, architecture="convnn",
                  is_implicit=True, isTomoSIREN=False, train_inverse=False, point_transformer=False, use_frc_loss=False,
-                 loss_type=None, spectral_ring_weight=None, *, rngs: nnx.Rngs):
+                 loss_type=None, *, rngs: nnx.Rngs):
         super(HetSIREN, self).__init__()
         self.xsize = xsize
         self.ctf_type = ctf_type
@@ -708,9 +708,9 @@ class HetSIREN(nnx.Module):
         self.sigma = sigma
 
         # Loss function.
-        #   loss_type: one of {"mse", "frc", "spectral"} to select the
-        #   reconstruction loss explicitly. If None, defaults to "mse" (or "frc"
-        #   for the point transformer decoder, which needs a Fourier-space loss).
+        #   loss_type: one of {"mse", "frc"} to select the reconstruction loss
+        #   explicitly. If None, defaults to "mse" (or "frc" for the point
+        #   transformer decoder, which needs a Fourier-space loss).
         if loss_type is None:
             loss_type = "frc" if use_frc_loss else "mse"
         if self.delta_volume_decoder.point_transformer and loss_type == "mse":
@@ -719,13 +719,8 @@ class HetSIREN(nnx.Module):
 
         if loss_type == "frc":
             self.representation_loss_fn = FRCLoss(box_size=xsize, apix=sr, min_resolution_A=30., max_resolution_A=2. * sr)
-        elif loss_type == "spectral":
-            # SSNR/Wiener-weighted spectral L2 (noise model in the data term).
-            # Band runs to Nyquist; the per-ring weight down-weights noisy shells.
-            self.representation_loss_fn = SpectralL2Loss(box_size=xsize, apix=sr, ring_weight=spectral_ring_weight,
-                                                         min_resolution_A=30., max_resolution_A=2. * sr)
         else:
-            self.representation_loss_fn = lambda x, y, freq_alpha=1.0: mse(x[..., None], y[..., None])
+            self.representation_loss_fn = lambda x, y, freq_alpha=1.0, ceiling_px=None: mse(x[..., None], y[..., None])
 
     def __call__(self, x, rngs=None, **kwargs):
         if self.isVae:
@@ -838,10 +833,10 @@ class HetSIREN(nnx.Module):
 
 
 @partial(jax.jit, static_argnames=("do_update", "l1_lambda", "graph_lambda", "pose_refine_reg",
-                                   "decoupling_lambda", "distance_preservation_lambda", "kl_lambda"))
+                                   "decoupling_lambda", "distance_preservation_lambda", "kl_lambda", "arap_lambda"))
 def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_lambda=1e-4, graph_lambda=1e-4,
                         warmup_alpha=1.0, pose_refine_reg=0.1, decoupling_lambda=1e-4, distance_preservation_lambda=1e-4,
-                        kl_lambda=1e-3, freq_alpha=1.0):
+                        kl_lambda=1e-3, freq_alpha=1.0, ceiling_px=None, arap_lambda=0.0, render_sigma=None):
     model, optimizer = nnx.merge(graphdef, state)
     distributions_key, rot_sample_key, choice_key, key = jnr.split(key, 4)
 
@@ -861,6 +856,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
     # sparse_finite_3D_differences_field = jax.vmap(sparse_finite_3D_differences, in_axes=(-1, None, None), out_axes=-1)
     calculate_deformation_regularity_loss_batch = jax.vmap(calculate_deformation_regularity_loss, in_axes=(0, None, None, None))
     calculate_repulsion_loss_batch = jax.vmap(calculate_repulsion_loss, in_axes=(0, None, None))
+    calculate_arap_loss_batch = jax.vmap(calculate_arap_loss, in_axes=(0, None, None, None, None))
 
     def loss_fn(model, x):
         # Check if Tomo mode
@@ -931,15 +927,20 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         # Centering
         centering = model.delta_volume_decoder.centering
 
+        # Render width: the model's fixed base sigma, or an annealed (broader)
+        # width for the band-limited representation when the caller schedules 
+        # it (render_sigma, coupled to the freq annealing).
+        render_sigma_eff = model.sigma if render_sigma is None else render_sigma
+
         # Generate projections
         if model.has_reference_volume:
             images_corrected, _ = phys_decoder(x, values, jax.lax.stop_gradient(coords), model.xsize, rotations_refined, shifts_refined,
-                                               centering, ctf, model.ctf_type, model.sigma, 0.0)
+                                               centering, ctf, model.ctf_type, render_sigma_eff, 0.0)
             images_corrected_field, _ = phys_decoder(x, reference_values, coords, model.xsize, rotations_refined, shifts_refined,
-                                                     centering, ctf, model.ctf_type, model.sigma, 0.0)
+                                                     centering, ctf, model.ctf_type, render_sigma_eff, 0.0)
         else:
             images_corrected, _ = phys_decoder(x, values, coords, model.xsize, rotations_refined, shifts_refined,
-                                               centering, ctf, model.ctf_type, model.sigma, 0.0)
+                                               centering, ctf, model.ctf_type, render_sigma_eff, 0.0)
             images_corrected_field = images_corrected
 
         # if not model.delta_volume_decoder.transport_mass:
@@ -994,9 +995,14 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         # if not model.delta_volume_decoder.transport_mass:
         #     images_consensus_loss = images_consensus_loss * projected_mask
 
-        recon_loss = 0.1 * model.representation_loss_fn(images_corrected_loss, x_loss, freq_alpha) + 0.9 * model.representation_loss_fn(images_corrected_field_loss, x_loss, freq_alpha)
+        recon_loss = 0.1 * model.representation_loss_fn(images_corrected_loss, x_loss, freq_alpha, ceiling_px) + 0.9 * model.representation_loss_fn(images_corrected_field_loss, x_loss, freq_alpha, ceiling_px)
         # if model.delta_volume_decoder.transport_mass:
-        recons_loss_all = recon_loss.mean()
+
+        # Keep the per-sample (and, when M>1, per-pose) loss here. It must NOT be
+        # collapsed to a scalar before the M>1 importance weighting below, which
+        # needs a (B, M) tensor. For M=1 the downstream `.mean()` reproduces the
+        # previous scalar exactly, so this is behaviour-preserving.
+        recons_loss_all = recon_loss
         # else:
         #     recons_loss_all = 0.5 * (recon_loss.mean() + mse(images_consensus_loss[..., None], x_loss[..., None]).mean())
 
@@ -1065,8 +1071,13 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
 
         # Variational loss (poses)
         if M > 1:
+            # Responsibility (importance) weighting over the M sampled poses.
+            # Detach the weights so the gradient flows through the per-pose losses
+            # (soft-EM style), not through the softmax that produced the weights.
             w_pose, _ = importance_weights(recons_loss_all, log_q)
-            nll = jnp.sum(w_pose * recons_loss_all).mean()
+            w_pose = jax.lax.stop_gradient(w_pose)
+            # Sum over the pose axis (-1), then average over the batch.
+            nll = jnp.sum(w_pose * recons_loss_all, axis=-1).mean()
             kl_pose = PoseDistMatrix.kl_to_isotropic_prior(rotations_logscale, prior_log_scale=0.0).mean()
         else:
             nll = recons_loss_all.mean()
@@ -1086,8 +1097,21 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
                                                                               consensus_distances, edge_weights)
             loss_repulsion = calculate_repulsion_loss_batch(deformed_positions, radius_graph, tau)
 
+            # As-rigid-as-possible term: penalise only the non-rigid part of the
+            # local deformation (factors out the best local rotation), so hinge /
+            # domain motions are not over-stiffened while noise-driven shear is
+            # resisted. Consensus (rest) positions are the decoder's normalized
+            # coords; deformed_positions are in the same normalized frame.
+            if arap_lambda > 0.0:
+                consensus_positions = model.delta_volume_decoder.coords[0]
+                num_points = deformed_positions.shape[1]
+                loss_arap = calculate_arap_loss_batch(deformed_positions, consensus_positions,
+                                                      radius_graph, edge_weights, num_points).mean()
+            else:
+                loss_arap = 0.0
+
             # Total loss
-            loss_graph = (loss_def_regularity + 0.01 * loss_repulsion).mean()
+            loss_graph = (loss_def_regularity + 0.01 * loss_repulsion).mean() + arap_lambda * loss_arap
         else:
             loss_graph = 0.0
 
@@ -1615,6 +1639,147 @@ def validation_step_hetsiren(graphdef, state, x, labels, md, key):
 
 
 
+def run_gold_standard(args, generator, md_columns, vol, mask, coords, values, sigma,
+                      transport_mass, local_reconstruction, isTomoSIREN, use_implicit,
+                      use_point_transformer, train_inverse, use_vae,
+                      writer, base_rng):
+    """Gold-standard half-set validation.
+
+    Trains two independent networks on two disjoint halves of the particles in
+    "Alternate" mode (both stepped every iteration), periodically computes the
+    FSC between their decoded consensus maps, and turns that resolution into a
+    conservative ceiling for the reconstruction loss band. Saves both half
+    models and the FSC curve, and returns the final ``ceiling_px`` (an rFFT ring
+    index) to be reused when training the combined full-data model.
+
+    Notes
+    -----
+    * "Alternate" keeps both models resident; each half trains on
+      ``batch_size // 2`` images to stay within memory.
+    * The two networks share the provided reference volume (separate per-half
+      consensus reconstruction is a future refinement); combined with the fact
+      that we FSC *decoded* maps, the raw FSC is optimistic, which is exactly why
+      the ceiling is applied conservatively (0.5 threshold + margin + hysteresis).
+    """
+    import os
+    import sys
+    from tqdm import tqdm
+    import optax
+    from hax.checkpointer import NeuralNetworkCheckpointer
+
+    xsize = generator.md.getMetaDataImage(0).shape[0]
+    lat_dim = args.lat_dim
+    batch_half = max(1, args.batch_size // 2)
+
+    print(f"{bcolors.OKCYAN}\n###### Gold-standard: training two independent half-set models "
+          f"(batch {batch_half}/half)... ######{bcolors.ENDC}")
+
+    def build_model(seed):
+        m = HetSIREN(lat_dim, vol, mask, coords, values, xsize, args.sr, sigma=sigma,
+                     ctf_type=args.ctf_type, decoupling=True, isVae=use_vae, transport_mass=transport_mass,
+                     local_reconstruction=local_reconstruction, bank_size=10000,
+                     isTomoSIREN=isTomoSIREN, is_implicit=use_implicit,
+                     point_transformer=use_point_transformer, train_inverse=train_inverse,
+                     loss_type=args.loss_type,
+                     architecture="convnn", rngs=nnx.Rngs(seed))
+        m.train()
+        params = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('delta_volume_decoder')))
+        if args.grad_clip_norm and args.grad_clip_norm > 0:
+            tx = optax.chain(optax.clip_by_global_norm(args.grad_clip_norm), optax.adamw(args.learning_rate))
+        else:
+            tx = optax.adamw(args.learning_rate)
+        opt = nnx.Optimizer(m, tx, wrt=params)
+        return nnx.split((m, opt))
+
+    key_a, key_b = jnr.split(base_rng, 2)
+    gd_a, st_a = build_model(int(jnr.randint(key_a, (), 0, 2 ** 30)))
+    gd_b, st_b = build_model(int(jnr.randint(key_b, (), 0, 2 ** 30)))
+
+    loader_a, loader_b = generator.return_grain_dataset(batch_size=batch_half, shuffle="global",
+                                                        num_epochs=None, num_workers=-1, num_threads=1,
+                                                        split_fraction=[0.5, 0.5],
+                                                        load_to_ram=args.load_images_to_ram)
+    it_a, it_b = iter(loader_a), iter(loader_b)
+    steps_per_epoch = max(1, int(0.5 * len(generator.md) / batch_half))
+
+    # Consensus decode (zero latent) + 3D FSC machinery.
+    @jax.jit
+    def decode_consensus(graphdef, state):
+        model, _ = nnx.merge(graphdef, state)
+        return model.decode_volume(jnp.zeros((1, lat_dim)))[0]
+
+    shell_index, n_shells = build_fourier_shells_3d(xsize)
+    mask_jnp = jnp.asarray(mask)
+    minpx, maxpx = recommended_band(box_size=xsize, apix=args.sr, min_resolution_A=30., max_resolution_A=2. * args.sr)
+
+    graph_lambda = args.deformation_lambda if (args.vol is not None and transport_mass) else 0.0
+
+    ceiling_px = None
+    rng = base_rng
+    i = 0
+    pbar = tqdm(range(args.epochs * steps_per_epoch), file=sys.stdout, ascii=" >=", colour="magenta",
+                bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
+    for total_steps in pbar:
+        (xa, la) = next(it_a)
+        (xb, lb) = next(it_b)
+
+        if total_steps % steps_per_epoch == 0:
+            pbar.set_description(f"[gold-standard] Epoch {i + 1}/{args.epochs}")
+            # Recompute the half-set FSC and update the conservative ceiling.
+            if i % max(1, args.fsc_every) == 0:
+                vA = decode_consensus(gd_a, st_a)
+                vB = decode_consensus(gd_b, st_b)
+                fsc = fsc_3d(vA, vB, shell_index, n_shells, mask_jnp)
+                res_A, shell_at = fsc_resolution(fsc, xsize, args.sr, threshold=0.5)
+                new_ceiling = conservative_band_ceiling(res_A, xsize, args.sr, minpx, maxpx,
+                                                        margin=args.fsc_margin, prev_ceiling_px=ceiling_px)
+                ceiling_px = new_ceiling
+                # Log the FSC curve and the resolution/ceiling.
+                for s in range(n_shells):
+                    writer.add_scalar("Gold-standard FSC (half maps)", float(fsc[s]), s)
+                writer.add_scalar("Gold-standard resolution (A) @FSC=0.5", res_A, i)
+                writer.add_scalar("Gold-standard band ceiling (px)", float(ceiling_px), i)
+                pbar.set_postfix_str(f"FSC@0.5={res_A:.1f}A | ceiling={ceiling_px}px")
+            i += 1
+
+        freq_alpha = _freq_alpha(args, total_steps, steps_per_epoch)
+        ceil_arg = None if ceiling_px is None else jnp.float32(ceiling_px)
+
+        _, _, st_a, rng = train_step_hetsiren(gd_a, st_a, xa, la, md_columns, rng,
+                                              l1_lambda=args.denoising_strength, graph_lambda=graph_lambda,
+                                              warmup_alpha=0.0, pose_refine_reg=args.pose_refine_reg,
+                                              decoupling_lambda=args.decoupling_lambda,
+                                              distance_preservation_lambda=args.distance_preservation_lambda,
+                                              kl_lambda=args.kl_lambda, freq_alpha=freq_alpha, ceiling_px=ceil_arg,
+                                              arap_lambda=args.arap_lambda)
+        _, _, st_b, rng = train_step_hetsiren(gd_b, st_b, xb, lb, md_columns, rng,
+                                              l1_lambda=args.denoising_strength, graph_lambda=graph_lambda,
+                                              warmup_alpha=0.0, pose_refine_reg=args.pose_refine_reg,
+                                              decoupling_lambda=args.decoupling_lambda,
+                                              distance_preservation_lambda=args.distance_preservation_lambda,
+                                              kl_lambda=args.kl_lambda, freq_alpha=freq_alpha, ceiling_px=ceil_arg,
+                                              arap_lambda=args.arap_lambda)
+
+    # Save the two half models.
+    model_a, _ = nnx.merge(gd_a, st_a)
+    model_b, _ = nnx.merge(gd_b, st_b)
+    NeuralNetworkCheckpointer.save(model_a, os.path.join(args.output_path, "HetSIREN_half1"))
+    NeuralNetworkCheckpointer.save(model_b, os.path.join(args.output_path, "HetSIREN_half2"))
+    print(f"{bcolors.OKGREEN}Gold-standard half models saved. Final conservative band ceiling = "
+          f"{ceiling_px} px.{bcolors.ENDC}")
+    return ceiling_px
+
+
+def _freq_alpha(args, total_steps, steps_per_epoch):
+    """Coarse-to-fine frequency-annealing factor (shared by the gold-standard and
+    combined loops). Ramps from ``freq_anneal_start`` to 1.0 over
+    ``freq_anneal_epochs``; returns 1.0 when annealing is disabled."""
+    if args.freq_anneal_epochs and args.freq_anneal_epochs > 0:
+        freq_steps = max(1, int(args.freq_anneal_epochs * steps_per_epoch))
+        return float(args.freq_anneal_start + (1.0 - args.freq_anneal_start) * min(1.0, total_steps / freq_steps))
+    return 1.0
+
+
 def main():
     import os
     import sys
@@ -1630,7 +1795,7 @@ def main():
     from hax.networks import train_step_hetsiren
     from hax.metrics import JaxSummaryWriter
     from hax.programs import fit_gaussian_splat, fit_weights_to_images, fit_volume, adjust_weights_to_images
-    # from hax.schedulers import CosineAnnealingScheduler
+    from hax.schedulers import CosineAnnealingScheduler
 
     from hax.cli import common_args as ca
 
@@ -1707,22 +1872,60 @@ def main():
     parser.add_argument("--grad_clip_norm", required=False, type=float, default=1.0,
                         help=f"Global-norm gradient clipping threshold for the HetSIREN optimizer. Gradients whose global norm exceeds this value are rescaled down, which "
                              f"prevents occasional gradient spikes. Set to 0 to disable clipping.")
-    parser.add_argument("--loss_type", required=False, type=str, default="mse", choices=["mse", "frc", "spectral"],
+    parser.add_argument("--loss_type", required=False, type=str, default="mse", choices=["mse", "frc"],
                         help=f"Reconstruction (representation) loss. {bcolors.ITALIC}mse{bcolors.ENDC} (default): image-space L2 (robust on noise but blurs "
-                             f"high frequencies). {bcolors.ITALIC}frc{bcolors.ENDC}: Fourier Ring Correlation (sharp on clean data, but weights noise-dominated shells equally "
-                             f"and tends to overfit noise on experimental data). {bcolors.ITALIC}spectral{bcolors.ENDC}: a per-shell SSNR/Wiener-weighted spectral L2 that puts "
-                             f"the noise model into the data term - it keeps MSE's robustness but down-weights the noisy high-resolution shells, so it is the recommended choice "
-                             f"for noisy experimental data. {bcolors.WARNING}NOTE{bcolors.ENDC}: the point transformer decoder always uses a Fourier-space loss (frc) regardless "
-                             f"of this setting; {bcolors.ITALIC}spectral{bcolors.ENDC} estimates its per-shell weights once from a representative batch of your data at startup.")
+                             f"high frequencies). {bcolors.ITALIC}frc{bcolors.ENDC}: Fourier Ring Correlation (sharp on clean data, but weights noise-dominated shells equally, so "
+                             f"on experimental data it must be band-limited to a trusted resolution to avoid overfitting noise - see {bcolors.ITALIC}--freq_anneal_epochs{bcolors.ENDC}, "
+                             f"{bcolors.ITALIC}--gold_standard{bcolors.ENDC} and {bcolors.ITALIC}--sigma_anneal_factor{bcolors.ENDC}, which together reproduce the EMAN2/e2gmm recipe "
+                             f"of a resolution-capped FRC over a band-limited Gaussian representation). {bcolors.WARNING}NOTE{bcolors.ENDC}: the point transformer decoder always uses "
+                             f"a Fourier-space loss (frc) regardless of this setting.")
     parser.add_argument("--freq_anneal_epochs", required=False, type=float, default=0.0,
-                        help=f"Coarse-to-fine (spectral) annealing: number of initial epochs over which the effective resolution is ramped in. During this window the decoder's "
-                             f"first-SIREN-layer frequency (w0) and the upper limit of the FRC/spectral loss band are scaled up from {bcolors.ITALIC}--freq_anneal_start{bcolors.ENDC} "
-                             f"to full resolution. This forces the network to fit low-frequency structure before high-frequency detail, which strongly stabilizes training on noisy "
-                             f"data (it prevents the SIREN from overfitting high-frequency noise early). Set to 0 to disable (train at full resolution from the first step). "
+                        help=f"Coarse-to-fine annealing: number of initial epochs over which the effective resolution is ramped in. During this window the decoder's "
+                             f"first-SIREN-layer frequency (w0) and the upper limit of the FRC loss band are scaled up from {bcolors.ITALIC}--freq_anneal_start{bcolors.ENDC} "
+                             f"to full resolution (and, if {bcolors.ITALIC}--sigma_anneal_factor{bcolors.ENDC} > 1, the Gaussian render width is annealed on the same clock). This "
+                             f"forces the network to fit low-frequency structure before high-frequency detail, which strongly stabilizes training on noisy data (it prevents the "
+                             f"SIREN from overfitting high-frequency noise early). Set to 0 to disable (train at full resolution from the first step). "
                              f"{bcolors.WARNING}NOTE{bcolors.ENDC}: does not affect the point transformer decoder's w0 (it has no SIREN first layer), but still anneals its loss band.")
     parser.add_argument("--freq_anneal_start", required=False, type=float, default=0.2,
                         help=f"Starting fraction (in (0, 1]) for {bcolors.ITALIC}--freq_anneal_epochs{bcolors.ENDC}: freq_alpha begins at this value and ramps linearly to 1.0. "
                              f"Smaller values start coarser (lower resolution). Ignored when {bcolors.ITALIC}--freq_anneal_epochs{bcolors.ENDC} is 0.")
+    parser.add_argument("--gold_standard", action='store_true',
+                        help=f"Gold-standard half-set validation. Trains TWO independent networks on two disjoint halves of the particles (Alternate mode: both stepped each "
+                             f"iteration), periodically computes the Fourier Shell Correlation (FSC) between their decoded consensus maps, and uses that resolution to CAP the "
+                             f"reconstruction loss band so the networks never fit beyond what the two halves agree on (with conservative guards against the known optimism of "
+                             f"decoded-map FSC). Saves {bcolors.UNDERLINE}HetSIREN_half1{bcolors.ENDC}/{bcolors.UNDERLINE}HetSIREN_half2{bcolors.ENDC} plus the FSC curve, then trains "
+                             f"the final full-data model with the same conservative ceiling. {bcolors.WARNING}NOTE{bcolors.ENDC}: to fit two resident models, each half trains on "
+                             f"{bcolors.ITALIC}batch_size // 2{bcolors.ENDC} images; lower {bcolors.ITALIC}--batch_size{bcolors.ENDC} further if you hit memory limits.")
+    parser.add_argument("--fsc_every", required=False, type=int, default=5,
+                        help=f"With {bcolors.ITALIC}--gold_standard{bcolors.ENDC}: recompute the half-set FSC (and update the loss-band ceiling) every this many epochs.")
+    parser.add_argument("--fsc_margin", required=False, type=float, default=1.15,
+                        help=f"With {bcolors.ITALIC}--gold_standard{bcolors.ENDC}: safety factor (>1) applied to the measured FSC resolution before it caps the loss band. Larger "
+                             f"values are more conservative (keep the band a bit inside the FSC limit), compensating for the optimism of decoded-map FSC.")
+    parser.add_argument("--sigma_anneal_factor", required=False, type=float, default=1.0,
+                        help=f"EMAN2/e2gmm-style band-limited representation for the FRC loss. The Gaussian render width used in the training loss starts at "
+                             f"{bcolors.ITALIC}sigma_anneal_factor x base_sigma{bcolors.ENDC} (broad, low-resolution blobs) and shrinks back to the base width on the SAME coarse-to-fine "
+                             f"clock as {bcolors.ITALIC}--freq_anneal_epochs{bcolors.ENDC}. Broadening the Gaussians makes the density itself intrinsically band-limited early on, so the "
+                             f"amplitude-invariant FRC cannot pour gradient into high-resolution noise shells the model is not yet allowed to represent (this is the safeguard that lets "
+                             f"EMAN2 use FRC on experimental data). Only affects mass-transport rendering. Requires {bcolors.ITALIC}--freq_anneal_epochs{bcolors.ENDC} > 0 (it shares that "
+                             f"clock). Set to 1.0 to disable (default; fixed base width). Typical: 2-2.5 - the render blur uses a fixed 9-px kernel, so a broadened width beyond "
+                             f"~2.5x the base sigma is progressively truncated (still broadens, just sub-linearly), which bounds the useful range.")
+    parser.add_argument("--arap_lambda", required=False, type=float, default=0.0,
+                        help=f"Weight of the as-rigid-as-possible (ARAP) deformation prior. Unlike the distance-preservation term, ARAP factors out the best local rotation per "
+                             f"Gaussian before penalizing the deformation, so locally rigid motions (hinges, domain rotations) are NOT over-stiffened while noise-driven non-rigid "
+                             f"shear is still resisted. Only active with mass transport and a reference volume. Set to 0 to disable (default); a small value (e.g. 0.05-0.2) is a good "
+                             f"starting point, tuned together with {bcolors.ITALIC}--deformation_lambda{bcolors.ENDC}/{bcolors.ITALIC}--distance_preservation_lambda{bcolors.ENDC}.")
+    parser.add_argument("--lr_schedule", action='store_true',
+                        help=f"Use a warmup + cosine-decay learning-rate schedule for the HetSIREN optimizer instead of a constant learning rate. The LR ramps linearly from "
+                             f"{bcolors.ITALIC}1e-5{bcolors.ENDC} to {bcolors.ITALIC}--learning_rate{bcolors.ENDC} over the first 10%% of training, then follows a cosine decay down to "
+                             f"0 by the final epoch. This warms up the SIREN safely (avoiding early high-frequency instabilities) and anneals the step size at the end for a sharper, "
+                             f"more stable final model. Resumes correctly from a checkpoint (the schedule follows the optimizer step count). Default: off (constant learning rate).")
+    parser.add_argument("--ema_decay", required=False, type=float, default=0.0,
+                        help=f"Exponential moving average (Polyak averaging) of the trainable weights. When > 0 (typical: {bcolors.ITALIC}0.999{bcolors.ENDC}), a running average "
+                             f"{bcolors.ITALIC}ema = decay*ema + (1-decay)*weights{bcolors.ENDC} is maintained during training and the AVERAGED weights (not the last raw ones) are "
+                             f"exported as the final model. This smooths out the noise in the late-training weight trajectory and typically yields a cleaner, higher-resolution "
+                             f"reconstruction on noisy data. The averaged forward model is also used as the (frozen) target when training the decoder inverse. Set to 0 to disable "
+                             f"(default). {bcolors.WARNING}NOTE{bcolors.ENDC}: the EMA buffer is checkpointed, so a training resume restores the running average exactly (legacy "
+                             f"checkpoints without an EMA buffer fall back to re-seeding it from the resumed weights).")
     parser.add_argument("--deformation_lambda", required=False, type=float, default=0.9,
                         help=f"Weight of the graph-based deformation regularization (deformation regularity + repulsion) that keeps the local geometry of the moving Gaussians "
                              f"consistent during mass transport. Lower it (e.g. 0.3-0.5) to allow sharper/larger motions at the risk of less regular deformations, raise it for "
@@ -1905,20 +2108,6 @@ def main():
                     values = vol[inds[:, 0], inds[:, 1], inds[:, 2]]
                     sigma = model.get_sigma()
 
-            # For the spectral loss, estimate its per-shell SSNR/Wiener weights
-            # once from a representative batch of the actual data.
-            spectral_ring_weight = None
-            if args.loss_type == "spectral":
-                x_rw, _ = next(iter(data_loader_train))
-                if isTomoSIREN:
-                    x_rw = x_rw[0]
-                x_rw = jnp.asarray(x_rw, dtype=jnp.float32)
-                if x_rw.ndim == 4:
-                    x_rw = jnp.squeeze(x_rw, axis=-1)
-                spectral_ring_weight = estimate_ring_weights(x_rw, generator.md.getMetaDataImage(0).shape[0])
-                print(f"\n{bcolors.OKCYAN}Estimated spectral SSNR ring weights from a representative batch "
-                      f"(shape {tuple(np.asarray(spectral_ring_weight).shape)}).{bcolors.ENDC}")
-
             # A zero KL weight makes the VAE prior term inactive, so drop the
             # variational machinery entirely and use a plain (deterministic)
             # autoencoder latent instead.
@@ -1932,9 +2121,23 @@ def main():
                                 local_reconstruction=local_reconstruction, bank_size=10000,
                                 isTomoSIREN=isTomoSIREN, is_implicit=use_implicit,
                                 point_transformer=use_point_transformer, train_inverse=train_inverse,
-                                loss_type=args.loss_type, spectral_ring_weight=spectral_ring_weight,
+                                loss_type=args.loss_type,
                                 architecture="convnn", rngs=nnx.Rngs(model_key))
         hetsiren.train()
+
+        # Gold-standard half-set validation: train two independent networks on
+        # two disjoint halves, then reuse their (conservative) FSC resolution as a
+        # loss-band ceiling for the combined full-data model trained below.
+        gold_ceiling_px = None
+        if args.gold_standard and args.reload is None:
+            rng, gold_key = jax.random.split(rng)
+            gold_ceiling_px = run_gold_standard(
+                args, generator, md_columns, vol, mask, coords, values, sigma,
+                transport_mass, local_reconstruction, isTomoSIREN, use_implicit,
+                use_point_transformer, train_inverse, args.kl_lambda != 0,
+                writer, gold_key)
+            print(f"{bcolors.OKCYAN}\n###### Training combined full-data model "
+                  f"(band capped at gold-standard resolution)... ######{bcolors.ENDC}")
 
         # Example of training data for Tensorboard
         if hetsiren.isTomoSIREN:
@@ -1944,17 +2147,24 @@ def main():
         x_example = jax.vmap(min_max_scale)(x_example)
         writer.add_images("Training data batch", x_example, dataformats="NHWC")
 
-        # Learning rate scheduler
-        # total_steps = args.epochs * len(data_loader)
-        # lr_schedule = CosineAnnealingScheduler.getScheduler(peak_value=args.learning_rate, total_steps=total_steps, warmup_frac=0.1, end_value=0.0, init_value=1e-5)
+        # Learning rate: constant (default) or a warmup + cosine-decay schedule
+        # (--lr_schedule). The schedule is a function of the optimizer step count,
+        # so it resumes correctly from a checkpoint.
+        total_train_steps = max(1, int(args.epochs * steps_per_epoch))
+        if args.lr_schedule:
+            lr_value = CosineAnnealingScheduler.getScheduler(
+                peak_value=args.learning_rate, total_steps=total_train_steps,
+                warmup_frac=0.1, init_value=1e-5, end_value=0.0)
+        else:
+            lr_value = args.learning_rate
 
         # Optimizers (HetSIREN)
         params = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('delta_volume_decoder')))
         params_inv = nnx.All(nnx.Param, nnx.PathContains('inverse_volume_decoder'))
         if args.grad_clip_norm and args.grad_clip_norm > 0:
-            tx = optax.chain(optax.clip_by_global_norm(args.grad_clip_norm), optax.adamw(args.learning_rate))
+            tx = optax.chain(optax.clip_by_global_norm(args.grad_clip_norm), optax.adamw(lr_value))
         else:
-            tx = optax.adamw(args.learning_rate)
+            tx = optax.adamw(lr_value)
         optimizer = nnx.Optimizer(hetsiren, tx, wrt=params)
         optimizer_inv = nnx.Optimizer(hetsiren, optax.adam(1e-4), wrt=params_inv)
         graphdef, state = nnx.split((hetsiren, optimizer))
@@ -1968,6 +2178,31 @@ def main():
 
         if not os.path.isdir(os.path.join(args.output_path, "Intermediate_volumes")):
             os.mkdir(os.path.join(args.output_path, "Intermediate_volumes"))
+
+        # Exponential moving average (Polyak) of the trainable weights. Updated
+        # every step. On a resume it is restored exactly from the checkpoint;
+        # otherwise it is seeded from the current weights. The tree.map takes a
+        # concrete snapshot so the buffer is decoupled from the live module's
+        # Variables (nnx.state returns references to them).
+        if args.ema_decay and args.ema_decay > 0.0:
+            _ema_src, _ = nnx.merge(graphdef, state)
+            ema_template = nnx.state(_ema_src, params)
+            restored_ema = NeuralNetworkCheckpointer.load_ema(
+                os.path.join(args.output_path, "HetSIREN_CHECKPOINT"), ema_template)
+            if restored_ema is not None:
+                ema_params = restored_ema
+                print(f"{bcolors.WARNING}Restored EMA weight buffer from checkpoint.{bcolors.ENDC}")
+            else:
+                ema_params = jax.tree.map(lambda x: x, ema_template)
+        else:
+            ema_params = None
+
+        @jax.jit
+        def ema_update(graphdef, state, ema_params):
+            model, _ = nnx.merge(graphdef, state)
+            cur = nnx.state(model, params)
+            return jax.tree.map(lambda e, c: args.ema_decay * e + (1.0 - args.ema_decay) * c,
+                                ema_params, cur)
 
         # Jitted functions to improve performance
         @partial(jax.jit, static_argnames=["ctf_type", "return_latent", "corrupt_projection_with_ctf"])
@@ -2100,10 +2335,11 @@ def main():
                         writer.add_embedding(latents_intermediate, label_img=latents_images[:, None, ...],
                                              tag="HetSIREN latent space", global_step=i)
 
-                        # Save checkpoint model
+                        # Save checkpoint model (+ EMA buffer when enabled, so a
+                        # resume restores the average exactly).
                         NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path,
                                                                                                   "HetSIREN_CHECKPOINT"),
-                                                                    epoch=i)
+                                                                    epoch=i, ema_params=ema_params)
 
                     i += 1
 
@@ -2114,13 +2350,26 @@ def main():
                 # Coarse-to-fine frequency annealing: ramp freq_alpha from
                 # freq_anneal_start up to 1.0 over the first freq_anneal_epochs.
                 # It scales the decoder's first-SIREN-layer w0 and the upper limit
-                # of the (FRC/spectral) loss band. 0 epochs -> disabled (== 1.0).
+                # of the FRC loss band. 0 epochs -> disabled (== 1.0).
                 if args.freq_anneal_epochs and args.freq_anneal_epochs > 0:
                     freq_steps = max(1, int(args.freq_anneal_epochs * steps_per_epoch))
                     freq_alpha = float(args.freq_anneal_start
                                        + (1.0 - args.freq_anneal_start) * min(1.0, total_steps / freq_steps))
                 else:
                     freq_alpha = 1.0
+
+                # Band-limited representation: on the same clock, broaden the Gaussian 
+                # render width (sigma_anneal_factor x base at freq_anneal_start, back 
+                # to base at full resolution) so the density itself is intrinsically 
+                # low-pass early and the FRC cannot chase high-resolution noise. 
+                # None -> use the model's fixed base sigma.
+                if args.sigma_anneal_factor > 1.0 and args.freq_anneal_epochs and args.freq_anneal_epochs > 0:
+                    frac = (freq_alpha - args.freq_anneal_start) / max(1e-6, 1.0 - args.freq_anneal_start)
+                    frac = min(1.0, max(0.0, frac))
+                    sigma_mult = args.sigma_anneal_factor * (1.0 - frac) + frac
+                    render_sigma = jnp.float32(hetsiren.sigma * sigma_mult)
+                else:
+                    render_sigma = None
 
                 loss, recon_loss, state, rng = train_step_hetsiren(graphdef, state, x, labels, md_columns, rng,
                                                                    l1_lambda=args.denoising_strength,
@@ -2130,9 +2379,16 @@ def main():
                                                                    decoupling_lambda=args.decoupling_lambda,
                                                                    distance_preservation_lambda=args.distance_preservation_lambda,
                                                                    kl_lambda=args.kl_lambda,
-                                                                   freq_alpha=freq_alpha)
+                                                                   ceiling_px=(None if gold_ceiling_px is None else jnp.float32(gold_ceiling_px)),
+                                                                   freq_alpha=freq_alpha,
+                                                                   arap_lambda=args.arap_lambda,
+                                                                   render_sigma=render_sigma)
                 total_loss += loss
                 total_recon_loss += recon_loss
+
+                # Polyak/EMA update of the trainable weights (only when enabled).
+                if ema_params is not None:
+                    ema_params = ema_update(graphdef, state, ema_params)
 
                 # Summary writer (training loss)
                 if step % int(np.ceil(0.1 * steps_per_epoch)) == 0:
@@ -2165,6 +2421,11 @@ def main():
                 step += 1
 
             hetsiren, optimizer = nnx.merge(graphdef, state)
+
+            # Export the EMA-averaged weights as the final forward model (also
+            # used as the frozen target for the subsequent inverse training).
+            if ema_params is not None:
+                nnx.update(hetsiren, ema_params)
 
             # Save model
             NeuralNetworkCheckpointer.save(hetsiren, os.path.join(args.output_path, "HetSIREN_No_Inv"))
