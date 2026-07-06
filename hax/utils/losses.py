@@ -569,25 +569,24 @@ class FRCLoss:
         band_mask_np = ((np.arange(self.n_rings) >= minpx) & (np.arange(self.n_rings) <= maxpx)).astype(np.float32)
         self.band_mask = jnp.asarray(band_mask_np)
 
-    def _band_mask(self, freq_alpha, ceiling_px=None):
-        """Band mask, optionally annealed and FSC-capped.
+    def _band_mask(self, freq_alpha):
+        """Band mask, optionally annealed.
 
         ``freq_alpha`` in [0, 1] ramps the upper ring from ``minpx`` (coarse) up
-        to ``maxpx`` (full band). ``ceiling_px`` (if given) additionally caps the
-        upper ring at an FSC-derived resolution. Both accept traced scalars so
-        this works inside ``jit``.
+        to ``maxpx`` (full band). Accepts a traced scalar so this works inside
+        ``jit``.
         """
-        return dynamic_band_mask(self.ring_ids, self.minpx, self.maxpx, freq_alpha, ceiling_px)
+        return dynamic_band_mask(self.ring_ids, self.minpx, self.maxpx, freq_alpha)
 
-    def __call__(self, pred_real: jax.Array, obs_real: jax.Array, freq_alpha=1.0, ceiling_px=None) -> jax.Array:
+    def __call__(self, pred_real: jax.Array, obs_real: jax.Array, freq_alpha=1.0) -> jax.Array:
         pred_ft = preprocess_particles(pred_real,
                                        apply_mean_subtract=self.apply_mean_subtract)
         obs_ft = preprocess_particles(obs_real,
                                       apply_mean_subtract=self.apply_mean_subtract)
-        return self.call_complex(pred_ft, obs_ft, freq_alpha, ceiling_px)
+        return self.call_complex(pred_ft, obs_ft, freq_alpha)
 
-    def call_complex(self, pred_ft: jax.Array, obs_ft: jax.Array, freq_alpha=1.0, ceiling_px=None) -> jax.Array:
-        return frc_loss(pred_ft, obs_ft, self.rings, self._band_mask(freq_alpha, ceiling_px))
+    def call_complex(self, pred_ft: jax.Array, obs_ft: jax.Array, freq_alpha=1.0) -> jax.Array:
+        return frc_loss(pred_ft, obs_ft, self.rings, self._band_mask(freq_alpha))
 
 
 def recommended_band(
@@ -606,122 +605,24 @@ def recommended_band(
     return minpx, maxpx
 
 
-def dynamic_band_mask(ring_ids: jax.Array, minpx: int, maxpx: int, freq_alpha=1.0, ceiling_px=None) -> jax.Array:
-    """Soft band mask with an annealed and (optionally) FSC-capped upper limit.
+def dynamic_band_mask(ring_ids: jax.Array, minpx: int, maxpx: int, freq_alpha=1.0) -> jax.Array:
+    """Soft band mask with an annealed upper limit.
 
     Rings below ``minpx`` are always excluded. The upper limit ramps linearly
     from ``minpx`` (``freq_alpha=0``) up to ``maxpx`` (``freq_alpha=1``), with a
     1-ring-wide soft edge so the newly admitted shell fades in smoothly instead
     of switching on abruptly (which would otherwise cause a loss/grad jump).
+    ``freq_alpha`` may be a traced scalar, so this is ``jit``-safe.
 
-    ``ceiling_px`` (if given) is an additional hard cap on the upper ring, meant
-    to be driven by a gold-standard half-set FSC resolution so the loss never
-    tries to fit beyond the resolution the data actually supports. The effective
-    upper ring is ``min(freq_alpha-ramp, ceiling_px)``. Both ``freq_alpha`` and
-    ``ceiling_px`` may be traced scalars, so this is ``jit``-safe.
-
-    With ``freq_alpha=1.0`` and ``ceiling_px=None`` (or >= maxpx) this reproduces
-    the closed-closed ``[minpx, maxpx]`` hard mask exactly.
+    With ``freq_alpha=1.0`` this reproduces the closed-closed ``[minpx, maxpx]``
+    hard mask exactly.
     """
     freq_alpha = jnp.clip(jnp.asarray(freq_alpha, dtype=jnp.float32), 0.0, 1.0)
     cur_max = minpx + freq_alpha * (maxpx - minpx)
-    if ceiling_px is not None:
-        cur_max = jnp.minimum(cur_max, jnp.asarray(ceiling_px, dtype=jnp.float32))
     lower = (ring_ids >= minpx).astype(jnp.float32)
     # Soft upper edge: 1 well inside the band, linearly to 0 one ring past cur_max.
     upper = jnp.clip(cur_max - ring_ids.astype(jnp.float32) + 1.0, 0.0, 1.0)
     return lower * upper
-
-
-def build_fourier_shells_3d(box_size: int) -> tuple[jax.Array, int]:
-    """Integer radial-shell index for a full (unshifted) 3D FFT grid.
-
-    Returns ``(shell_index, n_shells)`` where ``shell_index`` is an
-    ``(D, D, D)`` int32 array giving the rounded frequency radius (in pixels,
-    0..Nyquist) of every voxel of ``jnp.fft.fftn`` output, and
-    ``n_shells = box_size // 2 + 1`` (DC..Nyquist). Voxels beyond Nyquist (the
-    corners) are clamped to the last shell; treat that last shell as unreliable.
-    """
-    f = jnp.fft.fftfreq(box_size) * box_size            # -D/2 .. D/2-1, in pixels
-    kz, ky, kx = jnp.meshgrid(f, f, f, indexing="ij")
-    r = jnp.sqrt(kx ** 2 + ky ** 2 + kz ** 2)
-    n_shells = box_size // 2 + 1
-    shell = jnp.clip(jnp.round(r).astype(jnp.int32), 0, n_shells - 1)
-    return shell, n_shells
-
-
-def fsc_3d(vol1: jax.Array, vol2: jax.Array, shell_index: jax.Array, n_shells: int,
-           mask: jax.Array = None) -> jax.Array:
-    """Fourier Shell Correlation between two 3D volumes.
-
-    ``FSC(s) = Σ Re(F1·conj(F2)) / sqrt(Σ|F1|²·Σ|F2|²)`` per shell — the 3D
-    analogue of :func:`frc_loss`'s per-ring correlation. Pass ``shell_index`` /
-    ``n_shells`` from :func:`build_fourier_shells_3d`. An optional real-space
-    ``mask`` (e.g. the reconstruction mask) is applied before the FFT so solvent
-    does not inflate the correlation.
-
-    Returns an ``(n_shells,)`` array (DC..Nyquist).
-    """
-    if mask is not None:
-        vol1 = vol1 * mask
-        vol2 = vol2 * mask
-    f1 = jnp.fft.fftn(vol1)
-    f2 = jnp.fft.fftn(vol2)
-    cross = (f1.real * f2.real + f1.imag * f2.imag).reshape(-1)
-    p1 = (f1.real ** 2 + f1.imag ** 2).reshape(-1)
-    p2 = (f2.real ** 2 + f2.imag ** 2).reshape(-1)
-    seg = shell_index.reshape(-1)
-    cross_s = jax.ops.segment_sum(cross, seg, num_segments=n_shells)
-    p1_s = jax.ops.segment_sum(p1, seg, num_segments=n_shells)
-    p2_s = jax.ops.segment_sum(p2, seg, num_segments=n_shells)
-    return cross_s / (jnp.sqrt(p1_s * p2_s) + 1e-12)
-
-
-def fsc_resolution(fsc: jax.Array, box_size: int, apix: float, threshold: float = 0.5) -> tuple:
-    """Resolution (Å) and shell index where the FSC first drops below ``threshold``.
-
-    Uses ``threshold=0.5`` by default (the conservative "half-bit"-style
-    criterion), which is deliberately stricter than the 0.143 gold-standard
-    criterion so a decoded-map FSC — which is known to be optimistic — does not
-    drive the loss band too far. Shell 0 (DC) is skipped. If the FSC never falls
-    below the threshold, returns the Nyquist shell.
-
-    Returns ``(resolution_A, shell)`` as host ints/floats.
-    """
-    fsc = np.asarray(fsc)
-    n = fsc.shape[0]
-    below = fsc[1:] < threshold
-    if np.any(below):
-        shell = int(np.argmax(below)) + 1
-    else:
-        shell = n - 1
-    resolution_A = box_size * apix / max(shell, 1)
-    return float(resolution_A), int(shell)
-
-
-def conservative_band_ceiling(resolution_A: float, box_size: int, apix: float,
-                              minpx: int, maxpx: int, margin: float = 1.15,
-                              prev_ceiling_px: int = None, max_step: int = 2) -> int:
-    """Turn an FSC resolution into a conservative upper-band ring for the loss.
-
-    Three guards against an over-optimistic decoded-map FSC:
-      * ``margin`` (>1) coarsens the resolution before converting to a ring, so
-        the band stays a shell or two inside the measured FSC limit;
-      * the result is clamped to ``[minpx+1, maxpx]`` (never below the low-res
-        floor, never past the target band);
-      * ``max_step`` + ``prev_ceiling_px`` add hysteresis: the ceiling may only
-        rise a few rings per update, so a single optimistic FSC spike cannot
-        immediately open the band.
-
-    Returns an int ring index to pass as ``ceiling_px`` to the loss.
-    """
-    res = resolution_A * margin
-    ceil_px = int(round(box_size * apix / max(res, 1e-6)))
-    ceil_px = int(np.clip(ceil_px, minpx + 1, maxpx))
-    if prev_ceiling_px is not None:
-        ceil_px = min(ceil_px, int(prev_ceiling_px) + max_step)
-        ceil_px = int(np.clip(ceil_px, minpx + 1, maxpx))
-    return ceil_px
 
 
 def chamfer_distance(x, y):

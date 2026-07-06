@@ -19,6 +19,7 @@ Design notes:
 import os
 import sys
 import json
+import argparse
 
 from hax.utils import bcolors
 
@@ -26,6 +27,24 @@ from hax.utils import bcolors
 def list_of_floats(arg):
     """argparse ``type`` for a comma-separated list of floats (e.g. ``0.8,0.2``)."""
     return list(map(float, arg.split(',')))
+
+
+def batch_size_or_auto(arg):
+    """argparse ``type`` for ``--batch_size``: a positive int, or the string ``auto``.
+
+    ``auto`` is a sentinel a program can resolve at run time (e.g. via
+    :func:`hax.utils.estimate_batch_size`) into the largest memory-safe batch for
+    the user's GPU. Everything else must parse as an integer >= 1.
+    """
+    if isinstance(arg, str) and arg.strip().lower() == "auto":
+        return "auto"
+    try:
+        value = int(arg)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"--batch_size must be a positive integer or 'auto' (got {arg!r})")
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"--batch_size must be >= 1 (got {value})")
+    return value
 
 
 # --------------------------------------------------------------------------- #
@@ -65,7 +84,8 @@ EPOCHS_HELP = ("Number of epochs to train the network (i.e. how many times to lo
 
 BATCH_SIZE_HELP = ("Determines how many images will be load in the GPU at any moment during training (set by default to 8 - "
                    f"you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like {bcolors.UNDERLINE}nvidia-smi{bcolors.ENDC} "
-                   f"to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions")
+                   f"to monitor and/or measure memory usage and adjust this value - keep also in mind that bigger batch sizes might be less precise when looking for very local motions - "
+                   f"pass {bcolors.ITALIC}auto{bcolors.ENDC} to let hax estimate the largest batch size that fits on your GPU (this maximizes GPU utilization, not necessarily accuracy)")
 # Shorter variant used by the gray-scale adjusters / covariance / deconvolution programs.
 BATCH_SIZE_HELP_ADJUST = ("Determines how many images will be load in the GPU at any moment during training (set by default to 8 - "
                           f"you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like {bcolors.UNDERLINE}nvidia-smi{bcolors.ENDC} "
@@ -150,7 +170,7 @@ def add_epochs(parser, default=50, help=EPOCHS_HELP):
 
 
 def add_batch_size(parser, default=8, help=BATCH_SIZE_HELP):
-    return parser.add_argument("--batch_size", required=False, type=int, default=default, help=help)
+    return parser.add_argument("--batch_size", required=False, type=batch_size_or_auto, default=default, help=help)
 
 
 def add_learning_rate(parser, default=1e-4, help=LEARNING_RATE_HELP):

@@ -673,7 +673,7 @@ class HetSIREN(nnx.Module):
     @save_config
     def __init__(self, lat_dim, reference_volume, reconstruction_mask, coords, values, xsize, sr, bank_size=1024, ctf_type="apply",
                  sigma=1.0, decoupling=False, isVae=False, transport_mass=False, local_reconstruction=False, architecture="convnn",
-                 is_implicit=True, isTomoSIREN=False, train_inverse=False, point_transformer=False, use_frc_loss=False,
+                 is_implicit=True, isTomoSIREN=False, train_inverse=False, point_transformer=False,
                  loss_type=None, *, rngs: nnx.Rngs):
         super(HetSIREN, self).__init__()
         self.xsize = xsize
@@ -712,7 +712,7 @@ class HetSIREN(nnx.Module):
         #   explicitly. If None, defaults to "mse" (or "frc" for the point
         #   transformer decoder, which needs a Fourier-space loss).
         if loss_type is None:
-            loss_type = "frc" if use_frc_loss else "mse"
+            loss_type = "mse"
         if self.delta_volume_decoder.point_transformer and loss_type == "mse":
             loss_type = "frc"
         self.loss_type = loss_type
@@ -720,7 +720,7 @@ class HetSIREN(nnx.Module):
         if loss_type == "frc":
             self.representation_loss_fn = FRCLoss(box_size=xsize, apix=sr, min_resolution_A=30., max_resolution_A=2. * sr)
         else:
-            self.representation_loss_fn = lambda x, y, freq_alpha=1.0, ceiling_px=None: mse(x[..., None], y[..., None])
+            self.representation_loss_fn = lambda x, y, freq_alpha=1.0: mse(x[..., None], y[..., None])
 
     def __call__(self, x, rngs=None, **kwargs):
         if self.isVae:
@@ -836,7 +836,7 @@ class HetSIREN(nnx.Module):
                                    "decoupling_lambda", "distance_preservation_lambda", "kl_lambda", "arap_lambda"))
 def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_lambda=1e-4, graph_lambda=1e-4,
                         warmup_alpha=1.0, pose_refine_reg=0.1, decoupling_lambda=1e-4, distance_preservation_lambda=1e-4,
-                        kl_lambda=1e-3, freq_alpha=1.0, ceiling_px=None, arap_lambda=0.0, render_sigma=None):
+                        kl_lambda=1e-3, freq_alpha=1.0, arap_lambda=0.0, render_sigma=None):
     model, optimizer = nnx.merge(graphdef, state)
     distributions_key, rot_sample_key, choice_key, key = jnr.split(key, 4)
 
@@ -995,7 +995,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         # if not model.delta_volume_decoder.transport_mass:
         #     images_consensus_loss = images_consensus_loss * projected_mask
 
-        recon_loss = 0.1 * model.representation_loss_fn(images_corrected_loss, x_loss, freq_alpha, ceiling_px) + 0.9 * model.representation_loss_fn(images_corrected_field_loss, x_loss, freq_alpha, ceiling_px)
+        recon_loss = 0.1 * model.representation_loss_fn(images_corrected_loss, x_loss, freq_alpha) + 0.9 * model.representation_loss_fn(images_corrected_field_loss, x_loss, freq_alpha)
         # if model.delta_volume_decoder.transport_mass:
 
         # Keep the per-sample (and, when M>1, per-pose) loss here. It must NOT be
@@ -1637,149 +1637,6 @@ def validation_step_hetsiren(graphdef, state, x, labels, md, key):
     return loss
 
 
-
-
-def run_gold_standard(args, generator, md_columns, vol, mask, coords, values, sigma,
-                      transport_mass, local_reconstruction, isTomoSIREN, use_implicit,
-                      use_point_transformer, train_inverse, use_vae,
-                      writer, base_rng):
-    """Gold-standard half-set validation.
-
-    Trains two independent networks on two disjoint halves of the particles in
-    "Alternate" mode (both stepped every iteration), periodically computes the
-    FSC between their decoded consensus maps, and turns that resolution into a
-    conservative ceiling for the reconstruction loss band. Saves both half
-    models and the FSC curve, and returns the final ``ceiling_px`` (an rFFT ring
-    index) to be reused when training the combined full-data model.
-
-    Notes
-    -----
-    * "Alternate" keeps both models resident; each half trains on
-      ``batch_size // 2`` images to stay within memory.
-    * The two networks share the provided reference volume (separate per-half
-      consensus reconstruction is a future refinement); combined with the fact
-      that we FSC *decoded* maps, the raw FSC is optimistic, which is exactly why
-      the ceiling is applied conservatively (0.5 threshold + margin + hysteresis).
-    """
-    import os
-    import sys
-    from tqdm import tqdm
-    import optax
-    from hax.checkpointer import NeuralNetworkCheckpointer
-
-    xsize = generator.md.getMetaDataImage(0).shape[0]
-    lat_dim = args.lat_dim
-    batch_half = max(1, args.batch_size // 2)
-
-    print(f"{bcolors.OKCYAN}\n###### Gold-standard: training two independent half-set models "
-          f"(batch {batch_half}/half)... ######{bcolors.ENDC}")
-
-    def build_model(seed):
-        m = HetSIREN(lat_dim, vol, mask, coords, values, xsize, args.sr, sigma=sigma,
-                     ctf_type=args.ctf_type, decoupling=True, isVae=use_vae, transport_mass=transport_mass,
-                     local_reconstruction=local_reconstruction, bank_size=10000,
-                     isTomoSIREN=isTomoSIREN, is_implicit=use_implicit,
-                     point_transformer=use_point_transformer, train_inverse=train_inverse,
-                     loss_type=args.loss_type,
-                     architecture="convnn", rngs=nnx.Rngs(seed))
-        m.train()
-        params = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('delta_volume_decoder')))
-        if args.grad_clip_norm and args.grad_clip_norm > 0:
-            tx = optax.chain(optax.clip_by_global_norm(args.grad_clip_norm), optax.adamw(args.learning_rate))
-        else:
-            tx = optax.adamw(args.learning_rate)
-        opt = nnx.Optimizer(m, tx, wrt=params)
-        return nnx.split((m, opt))
-
-    key_a, key_b = jnr.split(base_rng, 2)
-    gd_a, st_a = build_model(int(jnr.randint(key_a, (), 0, 2 ** 30)))
-    gd_b, st_b = build_model(int(jnr.randint(key_b, (), 0, 2 ** 30)))
-
-    loader_a, loader_b = generator.return_grain_dataset(batch_size=batch_half, shuffle="global",
-                                                        num_epochs=None, num_workers=-1, num_threads=1,
-                                                        split_fraction=[0.5, 0.5],
-                                                        load_to_ram=args.load_images_to_ram)
-    it_a, it_b = iter(loader_a), iter(loader_b)
-    steps_per_epoch = max(1, int(0.5 * len(generator.md) / batch_half))
-
-    # Consensus decode (zero latent) + 3D FSC machinery.
-    @jax.jit
-    def decode_consensus(graphdef, state):
-        model, _ = nnx.merge(graphdef, state)
-        return model.decode_volume(jnp.zeros((1, lat_dim)))[0]
-
-    shell_index, n_shells = build_fourier_shells_3d(xsize)
-    mask_jnp = jnp.asarray(mask)
-    minpx, maxpx = recommended_band(box_size=xsize, apix=args.sr, min_resolution_A=30., max_resolution_A=2. * args.sr)
-
-    graph_lambda = args.deformation_lambda if (args.vol is not None and transport_mass) else 0.0
-
-    ceiling_px = None
-    rng = base_rng
-    i = 0
-    pbar = tqdm(range(args.epochs * steps_per_epoch), file=sys.stdout, ascii=" >=", colour="magenta",
-                bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
-    for total_steps in pbar:
-        (xa, la) = next(it_a)
-        (xb, lb) = next(it_b)
-
-        if total_steps % steps_per_epoch == 0:
-            pbar.set_description(f"[gold-standard] Epoch {i + 1}/{args.epochs}")
-            # Recompute the half-set FSC and update the conservative ceiling.
-            if i % max(1, args.fsc_every) == 0:
-                vA = decode_consensus(gd_a, st_a)
-                vB = decode_consensus(gd_b, st_b)
-                fsc = fsc_3d(vA, vB, shell_index, n_shells, mask_jnp)
-                res_A, shell_at = fsc_resolution(fsc, xsize, args.sr, threshold=0.5)
-                new_ceiling = conservative_band_ceiling(res_A, xsize, args.sr, minpx, maxpx,
-                                                        margin=args.fsc_margin, prev_ceiling_px=ceiling_px)
-                ceiling_px = new_ceiling
-                # Log the FSC curve and the resolution/ceiling.
-                for s in range(n_shells):
-                    writer.add_scalar("Gold-standard FSC (half maps)", float(fsc[s]), s)
-                writer.add_scalar("Gold-standard resolution (A) @FSC=0.5", res_A, i)
-                writer.add_scalar("Gold-standard band ceiling (px)", float(ceiling_px), i)
-                pbar.set_postfix_str(f"FSC@0.5={res_A:.1f}A | ceiling={ceiling_px}px")
-            i += 1
-
-        freq_alpha = _freq_alpha(args, total_steps, steps_per_epoch)
-        ceil_arg = None if ceiling_px is None else jnp.float32(ceiling_px)
-
-        _, _, st_a, rng = train_step_hetsiren(gd_a, st_a, xa, la, md_columns, rng,
-                                              l1_lambda=args.denoising_strength, graph_lambda=graph_lambda,
-                                              warmup_alpha=0.0, pose_refine_reg=args.pose_refine_reg,
-                                              decoupling_lambda=args.decoupling_lambda,
-                                              distance_preservation_lambda=args.distance_preservation_lambda,
-                                              kl_lambda=args.kl_lambda, freq_alpha=freq_alpha, ceiling_px=ceil_arg,
-                                              arap_lambda=args.arap_lambda)
-        _, _, st_b, rng = train_step_hetsiren(gd_b, st_b, xb, lb, md_columns, rng,
-                                              l1_lambda=args.denoising_strength, graph_lambda=graph_lambda,
-                                              warmup_alpha=0.0, pose_refine_reg=args.pose_refine_reg,
-                                              decoupling_lambda=args.decoupling_lambda,
-                                              distance_preservation_lambda=args.distance_preservation_lambda,
-                                              kl_lambda=args.kl_lambda, freq_alpha=freq_alpha, ceiling_px=ceil_arg,
-                                              arap_lambda=args.arap_lambda)
-
-    # Save the two half models.
-    model_a, _ = nnx.merge(gd_a, st_a)
-    model_b, _ = nnx.merge(gd_b, st_b)
-    NeuralNetworkCheckpointer.save(model_a, os.path.join(args.output_path, "HetSIREN_half1"))
-    NeuralNetworkCheckpointer.save(model_b, os.path.join(args.output_path, "HetSIREN_half2"))
-    print(f"{bcolors.OKGREEN}Gold-standard half models saved. Final conservative band ceiling = "
-          f"{ceiling_px} px.{bcolors.ENDC}")
-    return ceiling_px
-
-
-def _freq_alpha(args, total_steps, steps_per_epoch):
-    """Coarse-to-fine frequency-annealing factor (shared by the gold-standard and
-    combined loops). Ramps from ``freq_anneal_start`` to 1.0 over
-    ``freq_anneal_epochs``; returns 1.0 when annealing is disabled."""
-    if args.freq_anneal_epochs and args.freq_anneal_epochs > 0:
-        freq_steps = max(1, int(args.freq_anneal_epochs * steps_per_epoch))
-        return float(args.freq_anneal_start + (1.0 - args.freq_anneal_start) * min(1.0, total_steps / freq_steps))
-    return 1.0
-
-
 def main():
     import os
     import sys
@@ -1875,9 +1732,9 @@ def main():
     parser.add_argument("--loss_type", required=False, type=str, default="mse", choices=["mse", "frc"],
                         help=f"Reconstruction (representation) loss. {bcolors.ITALIC}mse{bcolors.ENDC} (default): image-space L2 (robust on noise but blurs "
                              f"high frequencies). {bcolors.ITALIC}frc{bcolors.ENDC}: Fourier Ring Correlation (sharp on clean data, but weights noise-dominated shells equally, so "
-                             f"on experimental data it must be band-limited to a trusted resolution to avoid overfitting noise - see {bcolors.ITALIC}--freq_anneal_epochs{bcolors.ENDC}, "
-                             f"{bcolors.ITALIC}--gold_standard{bcolors.ENDC} and {bcolors.ITALIC}--sigma_anneal_factor{bcolors.ENDC}, which together reproduce the EMAN2/e2gmm recipe "
-                             f"of a resolution-capped FRC over a band-limited Gaussian representation). {bcolors.WARNING}NOTE{bcolors.ENDC}: the point transformer decoder always uses "
+                             f"on experimental data it must be band-limited to a trusted resolution to avoid overfitting noise - see {bcolors.ITALIC}--freq_anneal_epochs{bcolors.ENDC} "
+                             f"and {bcolors.ITALIC}--sigma_anneal_factor{bcolors.ENDC}, which together reproduce the EMAN2/e2gmm recipe "
+                             f"of a band-limited FRC over a band-limited Gaussian representation). {bcolors.WARNING}NOTE{bcolors.ENDC}: the point transformer decoder always uses "
                              f"a Fourier-space loss (frc) regardless of this setting.")
     parser.add_argument("--freq_anneal_epochs", required=False, type=float, default=0.0,
                         help=f"Coarse-to-fine annealing: number of initial epochs over which the effective resolution is ramped in. During this window the decoder's "
@@ -1889,18 +1746,6 @@ def main():
     parser.add_argument("--freq_anneal_start", required=False, type=float, default=0.2,
                         help=f"Starting fraction (in (0, 1]) for {bcolors.ITALIC}--freq_anneal_epochs{bcolors.ENDC}: freq_alpha begins at this value and ramps linearly to 1.0. "
                              f"Smaller values start coarser (lower resolution). Ignored when {bcolors.ITALIC}--freq_anneal_epochs{bcolors.ENDC} is 0.")
-    parser.add_argument("--gold_standard", action='store_true',
-                        help=f"Gold-standard half-set validation. Trains TWO independent networks on two disjoint halves of the particles (Alternate mode: both stepped each "
-                             f"iteration), periodically computes the Fourier Shell Correlation (FSC) between their decoded consensus maps, and uses that resolution to CAP the "
-                             f"reconstruction loss band so the networks never fit beyond what the two halves agree on (with conservative guards against the known optimism of "
-                             f"decoded-map FSC). Saves {bcolors.UNDERLINE}HetSIREN_half1{bcolors.ENDC}/{bcolors.UNDERLINE}HetSIREN_half2{bcolors.ENDC} plus the FSC curve, then trains "
-                             f"the final full-data model with the same conservative ceiling. {bcolors.WARNING}NOTE{bcolors.ENDC}: to fit two resident models, each half trains on "
-                             f"{bcolors.ITALIC}batch_size // 2{bcolors.ENDC} images; lower {bcolors.ITALIC}--batch_size{bcolors.ENDC} further if you hit memory limits.")
-    parser.add_argument("--fsc_every", required=False, type=int, default=5,
-                        help=f"With {bcolors.ITALIC}--gold_standard{bcolors.ENDC}: recompute the half-set FSC (and update the loss-band ceiling) every this many epochs.")
-    parser.add_argument("--fsc_margin", required=False, type=float, default=1.15,
-                        help=f"With {bcolors.ITALIC}--gold_standard{bcolors.ENDC}: safety factor (>1) applied to the measured FSC resolution before it caps the loss band. Larger "
-                             f"values are more conservative (keep the band a bit inside the FSC limit), compensating for the optimism of decoded-map FSC.")
     parser.add_argument("--sigma_anneal_factor", required=False, type=float, default=1.0,
                         help=f"EMAN2/e2gmm-style band-limited representation for the FRC loss. The Gaussian render width used in the training loss starts at "
                              f"{bcolors.ITALIC}sigma_anneal_factor x base_sigma{bcolors.ENDC} (broad, low-resolution blobs) and shrinks back to the base width on the SAME coarse-to-fine "
@@ -2020,10 +1865,9 @@ def main():
         #                                                                     load_to_ram=args.load_images_to_ram)
         # steps_per_epoch = int(int(args.dataset_split_fraction[0] * len(generator.md)) / args.batch_size)
         # steps_per_val = int(int(args.dataset_split_fraction[1] * len(generator.md)) / args.batch_size)
-        data_loader_train = generator.return_grain_dataset(batch_size=args.batch_size, shuffle="global_data_loader",
-                                                           num_epochs=None, num_workers=-1, num_threads=1,
-                                                           load_to_ram=args.load_images_to_ram)
-        steps_per_epoch = int(len(generator.md) / args.batch_size)
+        # NOTE: the training data loader and steps_per_epoch are built further down,
+        # once the model exists and ``--batch_size auto`` (if requested) has been
+        # resolved into a concrete value (both depend on the batch size).
 
         # Projector help text in Tensorboard
         legend_projector = """
@@ -2125,19 +1969,60 @@ def main():
                                 architecture="convnn", rngs=nnx.Rngs(model_key))
         hetsiren.train()
 
-        # Gold-standard half-set validation: train two independent networks on
-        # two disjoint halves, then reuse their (conservative) FSC resolution as a
-        # loss-band ceiling for the combined full-data model trained below.
-        gold_ceiling_px = None
-        if args.gold_standard and args.reload is None:
-            rng, gold_key = jax.random.split(rng)
-            gold_ceiling_px = run_gold_standard(
-                args, generator, md_columns, vol, mask, coords, values, sigma,
-                transport_mass, local_reconstruction, isTomoSIREN, use_implicit,
-                use_point_transformer, train_inverse, args.kl_lambda != 0,
-                writer, gold_key)
-            print(f"{bcolors.OKCYAN}\n###### Training combined full-data model "
-                  f"(band capped at gold-standard resolution)... ######{bcolors.ENDC}")
+        # Resolve ``--batch_size auto`` before the data loader and steps_per_epoch
+        # (both depend on it) are built. The largest memory-safe batch is estimated
+        # analytically from the peak memory of ``train_step_hetsiren`` -- no
+        # execution, no OOM probing (see hax.utils.estimate_batch_size). A throwaway
+        # optimizer of the same structure as the real one gives the correct
+        # parameter/optimizer memory footprint here without needing the LR schedule
+        # (which itself depends on steps_per_epoch, hence on the batch size). Any
+        # failure falls back to a fixed default so a run never aborts here.
+        if args.batch_size == "auto":
+            from hax.utils import estimate_batch_size
+            estimated = None
+            if hetsiren.isTomoSIREN:
+                print(f"{bcolors.WARNING}\nAutomatic batch size is not supported in Tomo mode; "
+                      f"using a fixed batch size instead.{bcolors.ENDC}")
+            else:
+                params_probe = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('delta_volume_decoder')))
+                params_inv_probe = nnx.All(nnx.Param, nnx.PathContains('inverse_volume_decoder'))
+                probe_optimizer = nnx.Optimizer(hetsiren, optax.adamw(args.learning_rate), wrt=params_probe)
+                probe_graphdef, probe_state = nnx.split((hetsiren, probe_optimizer))
+
+                # Headroom for buffers this probe does not see but the real run
+                # allocates after this point: the EMA weight copy (one extra copy
+                # of the trainable params) and the inverse-decoder Adam optimizer
+                # (mu + nu, i.e. ~2x its params). The main optimizer is already
+                # reflected via bytes_in_use (probe_optimizer is resident now).
+                def _nbytes(tree):
+                    total = 0
+                    for leaf in jax.tree_util.tree_leaves(tree):
+                        nb = getattr(leaf, "nbytes", None) or getattr(getattr(leaf, "value", None), "nbytes", None)
+                        if nb:
+                            total += int(nb)
+                    return total
+                reserve_bytes = 2 * _nbytes(nnx.state(hetsiren, params_inv_probe))
+                if args.ema_decay and args.ema_decay > 0.0:
+                    reserve_bytes += _nbytes(nnx.state(hetsiren, params_probe))
+
+                estimated = estimate_batch_size(
+                    probe_graphdef, probe_state, train_step_hetsiren, md_columns, rng,
+                    (hetsiren.xsize, hetsiren.xsize, 1),
+                    reserved_bytes=reserve_bytes,
+                    step_kwargs=dict(do_update=True))
+
+                # Release the probe's optimizer buffers so they do not transiently
+                # coexist with the real optimizer built below.
+                del probe_optimizer, probe_graphdef, probe_state
+            args.batch_size = estimated if estimated is not None else 8
+            if estimated is None:
+                print(f"{bcolors.WARNING}Falling back to --batch_size {args.batch_size}.{bcolors.ENDC}")
+
+        # Training data loader and steps_per_epoch (batch size is now concrete).
+        data_loader_train = generator.return_grain_dataset(batch_size=args.batch_size, shuffle="global_data_loader",
+                                                           num_epochs=None, num_workers=-1, num_threads=1,
+                                                           load_to_ram=args.load_images_to_ram)
+        steps_per_epoch = int(len(generator.md) / args.batch_size)
 
         # Example of training data for Tensorboard
         if hetsiren.isTomoSIREN:
@@ -2379,7 +2264,6 @@ def main():
                                                                    decoupling_lambda=args.decoupling_lambda,
                                                                    distance_preservation_lambda=args.distance_preservation_lambda,
                                                                    kl_lambda=args.kl_lambda,
-                                                                   ceiling_px=(None if gold_ceiling_px is None else jnp.float32(gold_ceiling_px)),
                                                                    freq_alpha=freq_alpha,
                                                                    arap_lambda=args.arap_lambda,
                                                                    render_sigma=render_sigma)
@@ -2492,6 +2376,11 @@ def main():
             shutil.rmtree(checkpoint_dir)
 
     elif args.mode == "predict":
+
+        # Automatic batch sizing targets training memory; for inference just use a
+        # fixed default if the user passed ``auto``.
+        if args.batch_size == "auto":
+            args.batch_size = 8
 
         hetsiren.eval()
 
