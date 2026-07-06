@@ -208,19 +208,108 @@ def fourier_resize(x, new_size):
 
     return resized_x
 
-def wiener2DFilter(images, ctf, pad_factor=2):
+def _radial_bins(shape):
+    """Integer radial-shell index for each pixel of a ``fftshift(rfft2(.))`` grid.
+
+    ``shape`` is the (P, Qr) spatial layout of the half-spectrum (Qr = P // 2 + 1).
+    Returns the per-pixel shell index and the number of shells, both matching the
+    frequency layout used by :func:`wiener2DFilter` (fftfreq on axis -2, rfftfreq
+    on axis -1, followed by an ``fftshift`` over both spatial axes).
+    """
+    P, Qr = shape
+    fy = jnp.fft.fftfreq(P)[:, None]        # (P, 1)   cycles / pixel
+    fx = jnp.fft.rfftfreq(P)[None, :]       # (1, Qr)  (image is square)
+    r_pix = jnp.sqrt((fy * P) ** 2 + (fx * P) ** 2)
+    r_pix = jnp.fft.fftshift(r_pix)         # match the spatial fftshift of ctf / ft
+    nbins = P // 2 + 1
+    r_bin = jnp.clip(jnp.round(r_pix).astype(jnp.int32), 0, nbins - 1)
+    return r_bin, nbins
+
+
+def _spectral_wiener_epsilon(ft_images, ctf_2, reg_frac=1e-2, noise_band=0.4, noise_quantile=0.25):
+    """Frequency-dependent Wiener regularizer ``eps(k) = <CTF^2>_shell(k) / SSNR_obs(k)``.
+
+    The signal-to-noise ratio is estimated per image from the radially-averaged
+    observed power spectrum: the noise floor is read off the low quantile of the
+    outer shells (the CTF-zero troughs there expose the pure noise level), and
+    ``SSNR_obs(k) = relu(P_obs(k) - P_noise) / P_noise``. The regularizer uses the
+    shell-averaged CTF^2 (smooth and positive at per-pixel CTF zeros), while the
+    caller keeps the per-pixel CTF in the filter numerator so the exact zeros stay
+    at zero gain. Replaces the previous flat ``0.1 * mean(CTF^2)`` (white-noise)
+    term, which under-regularized the high frequencies and blew up the value range.
+    """
+    P, Qr = ft_images.shape[-2], ft_images.shape[-1]
+    ctf_2 = jnp.broadcast_to(ctf_2, ft_images.shape)
+    r_bin, nbins = _radial_bins((P, Qr))
+
+    # Radial averaging via segment_sum over the flattened shell index (no dense
+    # membership matrix -> memory scales with the spectrum, not spectrum x shells).
+    seg = r_bin.reshape(-1)
+    counts = jax.ops.segment_sum(jnp.ones_like(seg, dtype=ft_images.real.dtype), seg, num_segments=nbins) + 1e-8
+
+    def radial(power):
+        pw = power.reshape(power.shape[0], -1).T                 # (N, batch)
+        return (jax.ops.segment_sum(pw, seg, num_segments=nbins) / counts[:, None]).T
+
+    p_obs = radial(ft_images.real ** 2 + ft_images.imag ** 2)   # (batch, nbins)
+    h2 = radial(ctf_2)                                           # (batch, nbins)
+
+    # Noise floor from the outer shells (robust low quantile catches the troughs).
+    k_lo = int(noise_band * nbins)
+    p_noise = jnp.quantile(p_obs[:, k_lo:], noise_quantile, axis=1, keepdims=True)
+
+    # Floor the noise estimate to a tiny fraction of the observed signal power.
+    # On noiseless (e.g. simulated) data the outer shells - and the zero padding
+    # added by the caller - have exactly zero power, so p_noise -> 0; without this
+    # floor the shells where p_obs is also 0 give nsr = (h2*0)/(0+0) = 0/0 = NaN,
+    # which propagates through the Wiener gain into the loss and then produces
+    # NaN Gaussian coordinates (illegal-memory scatter). Scaled to the signal so
+    # it stays scale-invariant and is negligible on real, noisy data.
+    p_scale = jnp.maximum(jnp.max(p_obs, axis=1, keepdims=True), 1e-12)
+    p_noise = jnp.maximum(p_noise, 1e-6 * p_scale)
+
+    ssnr_num = jnp.maximum(p_obs - p_noise, 0.0)                 # (batch, nbins)
+    nsr = h2 * p_noise / (ssnr_num + reg_frac * p_noise)         # eps(k), capped at h2 / reg_frac
+
+    return nsr[:, r_bin]                                         # (batch, P, Qr)
+
+
+def wiener2DFilter(images, ctf, pad_factor=2, epsilon=None, reg_frac=1e-2,
+                   noise_band=0.4, noise_quantile=0.25):
+    """Regularized CTF inversion (Wiener deconvolution).
+
+    By default the regularizer is a per-image, frequency-dependent spectral SNR
+    (see :func:`_spectral_wiener_epsilon`), which keeps the output range realistic
+    by suppressing noise amplification where the SNR collapses. Pass an explicit
+    ``epsilon`` (scalar or broadcastable array) to fall back to a fixed
+    regularization, e.g. ``0.1 * jnp.mean(ctf * ctf, axis=(-2, -1), keepdims=True)``
+    for the previous flat white-noise behaviour.
+    """
     xsize = images.shape[1]
 
     ctf_2 = ctf * ctf
-    epsilon = 0.1 * jnp.mean(ctf_2, axis=(-2, -1), keepdims=True)
 
     if pad_factor > 1:
         pad_diff = xsize * (pad_factor - 1) // pad_factor
         images = jnp.pad(images, ((0, 0), (pad_diff, pad_diff), (pad_diff, pad_diff)), mode="constant")
 
     ft_images = jnp.fft.fftshift(jnp.fft.rfft2(images))
-    ft_ctf_images_real = ft_images.real * ctf / (ctf_2 + epsilon)
-    ft_ctf_images_imag = ft_images.imag * ctf / (ctf_2 + epsilon)
+
+    if epsilon is None:
+        # The regularizer is a per-batch noise-model *statistic* (built from
+        # radial quantiles/maxima of the observed power). Differentiating through
+        # it is both wrong and numerically unstable: for a near-zero input (e.g.
+        # the model projections early in training) the gradient of the quantile /
+        # max over the degenerate all-equal spectrum is NaN, which then poisons
+        # the whole update. Stop-gradient keeps epsilon adaptive per step while
+        # letting gradients flow only through the actual filtering, matching the
+        # old fixed-epsilon behaviour.
+        epsilon = jax.lax.stop_gradient(
+            _spectral_wiener_epsilon(ft_images, ctf_2, reg_frac, noise_band, noise_quantile))
+
+    wiener_gain = ctf / (ctf_2 + epsilon)
+    ft_ctf_images_real = ft_images.real * wiener_gain
+    ft_ctf_images_imag = ft_images.imag * wiener_gain
     ft_ctf_images = jlx.complex(ft_ctf_images_real, ft_ctf_images_imag)
     images = jnp.fft.irfft2(jnp.fft.ifftshift(ft_ctf_images))
 
