@@ -98,14 +98,6 @@ def estimate_batch_size(graphdef, state, step, md, rng, input_shape_per_sample,
     accuracy-optimal batch size (larger batches can generalize worse and give
     fewer updates per epoch), so keep ``max_batch`` as a sane cap.
 
-    Args mirror :func:`find_max_batch_size` (its analytical, non-OOM counterpart):
-    ``step`` is the jitted ``train_step_*`` function, ``state`` the split model +
-    optimizer state, ``md`` the metadata columns, ``rng`` a PRNG key, and
-    ``input_shape_per_sample`` the per-image shape (e.g. ``(xsize, xsize, 1)``).
-    ``step_kwargs`` are extra static keyword arguments forwarded to ``step`` when
-    compiling (pass ``do_update=True`` so the estimate includes the backward pass
-    and optimizer update -- the real training peak).
-
     Returns the chosen batch size (int), or ``None`` if the estimate could not be
     made (unsupported backend, tracing failure, ...) so the caller can fall back
     to a fixed default.
