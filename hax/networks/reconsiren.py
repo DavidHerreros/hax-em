@@ -220,7 +220,7 @@ class PoseHeadEnsemble(nnx.Module):
 
 
 class EncoderPose(nnx.Module):
-    def __init__(self, input_dim, pyramid_levels=4, num_components=64, refine_current_assignment=False, *, rngs: nnx.Rngs):
+    def __init__(self, input_dim, pyramid_levels=4, num_components=18, refine_current_assignment=False, *, rngs: nnx.Rngs):
         self.input_dim = input_dim
         self.input_conv_dim = 64  # Original was 64
         self.out_conv_dim = int(self.input_conv_dim / (2 ** 3))
