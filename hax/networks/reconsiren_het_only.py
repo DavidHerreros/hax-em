@@ -771,7 +771,7 @@ class ReconSIRENHetOnly(nnx.Module):
     @save_config
     def __init__(self, reference_volume, reconstruction_mask, xsize, sr, bank_size=2048, ctf_type="apply", lat_dim=8,
                  transport_mass=False, symmetry_group="c1", refine_current_assignment=False,
-                 learn_delta_volume=True, *, rngs: nnx.Rngs):
+                 learn_delta_volume=True, num_components=18, *, rngs: nnx.Rngs):
         super(ReconSIRENHetOnly, self).__init__()
         self.xsize = xsize
         self.ctf_type = ctf_type
@@ -786,7 +786,7 @@ class ReconSIRENHetOnly(nnx.Module):
         reference_values = reference_volume[self.inds[..., 0], self.inds[..., 1], self.inds[..., 2]][None, ...]
 
         # Models
-        self.encoder_pose = EncoderPose(self.xsize, refine_current_assignment=refine_current_assignment, rngs=rngs)
+        self.encoder_pose = EncoderPose(self.xsize, num_components=num_components, refine_current_assignment=refine_current_assignment, rngs=rngs)
         self.encoder_het = EncoderHet(self.xsize, lat_dim=lat_dim, rngs=rngs)
         self.delta_het_decoder = HetVolumeDecoder(10000, lat_dim=lat_dim, volume_size=self.xsize, rngs=rngs)
         self.phys_decoder = PhysDecoder(self.xsize, transport_mass=transport_mass)
@@ -1152,6 +1152,12 @@ def main():
                         help=f"If your input metadata has already and angular assignment and shifts, you can provide this option to refine those angles instead of finding an {bcolors.ITALIC}ab initio{bcolors.ENDC} "
                              f"alignment.")
     ca.add_symmetry_group(parser)
+    parser.add_argument("--num_components", required=False, type=int, default=18,
+                        help=f"Number of candidate pose hypotheses the pose encoder proposes per image during the {bcolors.ITALIC}ab initio{bcolors.ENDC} search. "
+                             f"For every image the network evaluates this many orientations (anchored on a spherical grid), renders a projection for each and keeps the "
+                             f"best-matching one. A larger value covers orientation space more densely, making the pose search more robust to local minima, but increases GPU "
+                             f"memory and compute roughly linearly (this is the main driver of ReconSIREN's training footprint). Set it lower to fit a smaller GPU at the cost of a "
+                             f"coarser pose search. Default: 18.")
     ca.add_ctf_type(parser)
     ca.add_mode(parser)
     ca.add_epochs(parser)
@@ -1211,7 +1217,8 @@ def main():
     # Prepare network (ReconSIREN)
     reconsiren = ReconSIRENHetOnly(vol, mask, xsize, args.sr, ctf_type=args.ctf_type, symmetry_group=args.symmetry_group,
                                    transport_mass=True, refine_current_assignment=args.refine_current_assignment, lat_dim=8,
-                                   bank_size=10000, learn_delta_volume=not args.do_not_learn_volume, rngs=nnx.Rngs(model_key))
+                                   bank_size=10000, learn_delta_volume=not args.do_not_learn_volume,
+                                   num_components=args.num_components, rngs=nnx.Rngs(model_key))
 
     # Reload network
     if args.reload is not None:
