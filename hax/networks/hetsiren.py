@@ -674,7 +674,7 @@ class HetSIREN(nnx.Module):
     def __init__(self, lat_dim, reference_volume, reconstruction_mask, coords, values, xsize, sr, bank_size=1024, ctf_type="apply",
                  sigma=1.0, decoupling=False, isVae=False, transport_mass=False, local_reconstruction=False, architecture="convnn",
                  is_implicit=True, isTomoSIREN=False, train_inverse=False, point_transformer=False,
-                 loss_type=None, *, rngs: nnx.Rngs):
+                 loss_type=None, *, rngs: nnx.Rngs, **kwargs):
         super(HetSIREN, self).__init__()
         self.xsize = xsize
         self.ctf_type = ctf_type
@@ -833,10 +833,11 @@ class HetSIREN(nnx.Module):
 
 
 @partial(jax.jit, static_argnames=("do_update", "l1_lambda", "graph_lambda", "pose_refine_reg",
-                                   "decoupling_lambda", "distance_preservation_lambda", "kl_lambda", "arap_lambda"))
+                                   "decoupling_lambda", "distance_preservation_lambda", "kl_lambda", "arap_lambda",
+                                   "geometric_lambda"))
 def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_lambda=1e-4, graph_lambda=1e-4,
                         warmup_alpha=1.0, pose_refine_reg=0.1, decoupling_lambda=1e-4, distance_preservation_lambda=1e-4,
-                        kl_lambda=1e-3, freq_alpha=1.0, arap_lambda=0.0, render_sigma=None):
+                        kl_lambda=1e-3, freq_alpha=1.0, arap_lambda=0.0, geometric_lambda=0.0, render_sigma=None):
     model, optimizer = nnx.merge(graphdef, state)
     distributions_key, rot_sample_key, choice_key, key = jnr.split(key, 4)
 
@@ -1152,9 +1153,30 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         else:
             decoupling_loss = 0.0
 
+        # Geometric correction
+        if geometric_lambda > 0.0:
+            rot_ctx = rotations_refined if M == 1 else rotations_refined[:, 0]
+            geom_ctx = (rot_ctx, shifts_refined, ctf)
+
+            def _render_point(z, ctx_i):
+                rot_i, shift_i, ctf_i = ctx_i
+                z_b = z[None, :]
+                coords_z, values_z = model.delta_volume_decoder(z_b, freq_alpha=freq_alpha)
+                img, _ = model.phys_decoder(z_b, values_z, coords_z, model.xsize,
+                                            rot_i[None], shift_i[None], centering,
+                                            ctf_i[None], model.ctf_type, render_sigma_eff, 0.0)
+                return img[0].reshape(-1)  # (xsize*xsize,)
+
+            # Exact (all pixels). For large boxes pass e.g.
+            # pixel_subsample=16384, key=choice_key to switch to the unbiased O(k*d) Gram estimato.
+            loss_geometric = composed_geometric_correction_loss(
+                latent, _render_point, geom_ctx, model.xsize * model.xsize)
+        else:
+            loss_geometric = 0.0
+
         loss = (nll + kl_lambda * kl_loss + 0.000001 * kl_pose + decoupling_lambda * decoupling_loss
                 + l1_lambda * l1_loss + graph_lambda * loss_graph + 100. * hist_loss + distance_preservation_lambda * loss_dp
-                + pose_refine_reg * pose_refine_loss)
+                + pose_refine_reg * pose_refine_loss + geometric_lambda * loss_geometric)
         return loss, (recon_loss.mean(), latent)
 
     # Check if Tomo mode
@@ -1759,6 +1781,12 @@ def main():
                              f"Gaussian before penalizing the deformation, so locally rigid motions (hinges, domain rotations) are NOT over-stiffened while noise-driven non-rigid "
                              f"shear is still resisted. Only active with mass transport and a reference volume. Set to 0 to disable (default); a small value (e.g. 0.05-0.2) is a good "
                              f"starting point, tuned together with {bcolors.ITALIC}--deformation_lambda{bcolors.ENDC}/{bcolors.ITALIC}--distance_preservation_lambda{bcolors.ENDC}.")
+    parser.add_argument("--geometric_lambda", required=False, type=float, default=0.0,
+                        help=f"Weight of the geometric-correction loss. It penalises the local volume distortion of the heterogeneity decoder via the Gram determinant "
+                             f"{bcolors.ITALIC}det(J_D(z)^T J_D(z)){bcolors.ENDC} of its Jacobian (the derivative of the decoded deformation w.r.t. the latent), pushing the decoded "
+                             f"latent-to-shape map towards a locally volume-preserving (isometric) embedding. Set to 0 to disable (default). {bcolors.WARNING}NOTE{bcolors.ENDC}: computing "
+                             f"the decoder Jacobian is expensive (it runs the decoder once per latent dimension and is differentiated again by the optimizer), so only enable it when the "
+                             f"geometric term is actually needed.")
     parser.add_argument("--lr_schedule", action='store_true',
                         help=f"Use a warmup + cosine-decay learning-rate schedule for the HetSIREN optimizer instead of a constant learning rate. The LR ramps linearly from "
                              f"{bcolors.ITALIC}1e-5{bcolors.ENDC} to {bcolors.ITALIC}--learning_rate{bcolors.ENDC} over the first 10%% of training, then follows a cosine decay down to "
@@ -1893,7 +1921,7 @@ def main():
 
                     # Consensus volume
                     if args.num_gaussians is not None:
-                        model, _, _ = fit_volume(vol * mask_fit, mask=mask_fit, iterations=20000, learning_rate=0.001, n_init=args.num_gaussians, fixed_gaussians=True)
+                        model, _, _ = fit_volume(vol, mask=mask_fit, iterations=20000, learning_rate=0.001, n_init=args.num_gaussians, fixed_gaussians=True)
 
                         model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr,
                                                             learning_rate=0.01,
@@ -2266,6 +2294,7 @@ def main():
                                                                    kl_lambda=args.kl_lambda,
                                                                    freq_alpha=freq_alpha,
                                                                    arap_lambda=args.arap_lambda,
+                                                                   geometric_lambda=args.geometric_lambda,
                                                                    render_sigma=render_sigma)
                 total_loss += loss
                 total_recon_loss += recon_loss

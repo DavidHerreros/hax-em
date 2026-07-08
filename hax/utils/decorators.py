@@ -13,10 +13,16 @@ def save_config(init_func):
         bound_args = sig.bind(self, *args, **kwargs)
         bound_args.apply_defaults()
 
-        # 2. Extract arguments, filtering out 'self' and 'rngs'
+        # 2. Extract arguments, filtering out 'self', 'rngs' and any variadic
+        #    (*args / **kwargs) parameters. The catch-all is used only to absorb
+        #    deprecated arguments from older configs; persisting it would store an
+        #    empty {} that nests one level deeper on every save/load round-trip.
+        variadic = {name for name, p in sig.parameters.items()
+                    if p.kind in (inspect.Parameter.VAR_POSITIONAL,
+                                  inspect.Parameter.VAR_KEYWORD)}
         config_dict = {}
         for k, v in bound_args.arguments.items():
-            if k not in ('self', 'rngs'):
+            if k not in ('self', 'rngs') and k not in variadic:
                 if isinstance(v, list):
                     v = nnx.List(v)
                 elif isinstance(v, dict):
