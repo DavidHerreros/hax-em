@@ -250,13 +250,15 @@ class PoseHeadEnsemble(nnx.Module):
 
 
 class EncoderPose(nnx.Module):
-    def __init__(self, input_dim, pyramid_levels=4, num_components=18, refine_current_assignment=False, *, rngs: nnx.Rngs):
+    def __init__(self, input_dim, pyramid_levels=4, num_components=18, refine_current_assignment=False,
+                 use_anchor_rotations=True, *, rngs: nnx.Rngs):
         self.input_dim = input_dim
         self.input_conv_dim = 64  # Original was 64
         self.out_conv_dim = int(self.input_conv_dim / (2 ** 3))
         self.pyramid_levels = pyramid_levels
         self.num_components = num_components
         self.refine_current_assignment = refine_current_assignment
+        self.use_anchor_rotations = use_anchor_rotations
 
         # Anchor rotations
         self.anchor_rotations = jnp.array(generate_spherical_rotations(num_components))
@@ -345,7 +347,8 @@ class EncoderPose(nnx.Module):
         b3 = jnp.cross(b1, b2, axis=-1)
         rotations = jnp.stack([b1, b2, b3], axis=-1)
         rotations = rotations.reshape(x.shape[0], self.num_components, 3, 3)
-        rotations = jnp.einsum('bnhk,nkw->bnhw', rotations, self.anchor_rotations)
+        if self.use_anchor_rotations:
+            rotations = jnp.einsum('bnhk,nkw->bnhw', rotations, self.anchor_rotations)
         # if key is not None:
         #     rotations = self.matrix_fisher_sample(key, rotations, logstd_rotations).squeeze(axis=0)
 
@@ -771,7 +774,7 @@ class ReconSIRENHetOnly(nnx.Module):
     @save_config
     def __init__(self, reference_volume, reconstruction_mask, xsize, sr, bank_size=2048, ctf_type="apply", lat_dim=8,
                  transport_mass=False, symmetry_group="c1", refine_current_assignment=False,
-                 learn_delta_volume=True, num_components=18, *, rngs: nnx.Rngs):
+                 learn_delta_volume=True, num_components=18, use_anchor_rotations=True, *, rngs: nnx.Rngs):
         super(ReconSIRENHetOnly, self).__init__()
         self.xsize = xsize
         self.ctf_type = ctf_type
@@ -786,7 +789,8 @@ class ReconSIRENHetOnly(nnx.Module):
         reference_values = reference_volume[self.inds[..., 0], self.inds[..., 1], self.inds[..., 2]][None, ...]
 
         # Models
-        self.encoder_pose = EncoderPose(self.xsize, num_components=num_components, refine_current_assignment=refine_current_assignment, rngs=rngs)
+        self.encoder_pose = EncoderPose(self.xsize, num_components=num_components, refine_current_assignment=refine_current_assignment,
+                                        use_anchor_rotations=use_anchor_rotations, rngs=rngs)
         self.encoder_het = EncoderHet(self.xsize, lat_dim=lat_dim, rngs=rngs)
         self.delta_het_decoder = HetVolumeDecoder(10000, lat_dim=lat_dim, volume_size=self.xsize, rngs=rngs)
         self.phys_decoder = PhysDecoder(self.xsize, transport_mass=transport_mass)
@@ -1151,6 +1155,9 @@ def main():
     parser.add_argument("--refine_current_assignment", action="store_true",
                         help=f"If your input metadata has already and angular assignment and shifts, you can provide this option to refine those angles instead of finding an {bcolors.ITALIC}ab initio{bcolors.ENDC} "
                              f"alignment.")
+    parser.add_argument("--do_not_use_anchor_rotations", action="store_true",
+                        help=f"By default the poses proposed by the encoder are composed with a fixed set of anchor rotations spread on a spherical grid (one per pose hypothesis), which "
+                             f"biases the {bcolors.ITALIC}ab initio{bcolors.ENDC} pose search to cover orientation space more evenly. Provide this option to disable that composition.")
     ca.add_symmetry_group(parser)
     parser.add_argument("--num_components", required=False, type=int, default=18,
                         help=f"Number of candidate pose hypotheses the pose encoder proposes per image during the {bcolors.ITALIC}ab initio{bcolors.ENDC} search. "
@@ -1218,7 +1225,8 @@ def main():
     reconsiren = ReconSIRENHetOnly(vol, mask, xsize, args.sr, ctf_type=args.ctf_type, symmetry_group=args.symmetry_group,
                                    transport_mass=True, refine_current_assignment=args.refine_current_assignment, lat_dim=8,
                                    bank_size=10000, learn_delta_volume=not args.do_not_learn_volume,
-                                   num_components=args.num_components, rngs=nnx.Rngs(model_key))
+                                   num_components=args.num_components,
+                                   use_anchor_rotations=not args.do_not_use_anchor_rotations, rngs=nnx.Rngs(model_key))
 
     # Reload network
     if args.reload is not None:
