@@ -1022,7 +1022,7 @@ def main():
                         help="Degree of Zernike3D radial component (increasing this value might help finding more localized motions at the expense of higher memory consumption)")
     parser.add_argument("--L2", required=False, type=int, default=7,
                         help="Degree of Zernike3D angular component (increasing this value might help finding more localized motions at the expense of higher memory consumption)")
-    ca.add_mode(parser, help=ca.MODE_HELP_WITH_PICKLE)
+    ca.add_mode(parser)
     parser.add_argument("--num_gaussians", required=False, type=int,
                         help="Before training the network, Zernike3Deep will try to fit a set of Gaussians in the reference volume to recreate it. "
                              "The default criterium is to automatically determine the number of Gaussians neede to reproduce the reference volume "
@@ -1409,11 +1409,6 @@ def main():
 
         # Save latents in metadata
         md_pred.write(os.path.join(args.output_path, "predicted_latents" +  os.path.splitext(args.md)[1]))
-
-    elif args.mode == "send_to_pickle":
-
-        # Save mode to pickle
-        NeuralNetworkCheckpointer.save(zernike3deep, os.path.join(args.output_path, "Zernike3Deep"))
 
     # If exists, clean MMAP
     # if not args.load_images_to_ram and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):

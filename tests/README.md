@@ -54,7 +54,7 @@ python tests/run_tests.py --gpu 0 --keep hetsiren     # keep the work dir for in
 | Option / axis | Covered by |
 |---|---|
 | `--ctf_type None / apply / wiener / precorrect` | `train_none_ram` / `train_apply_mmap` / `train_wiener` / `train_precorrect` |
-| `--mode train / predict / send_to_pickle` | `train_*` / `predict_none` / `send_to_pickle_none` |
+| `--mode train / predict` | `train_*` / `predict_none` |
 | `--vol`, `--mask` | `train_vol_transport_implicit`, `train_vol_local_recon` |
 | `--transport_mass`, `--implicit_network`, `--num_gaussians` | `train_vol_transport_implicit` |
 | `--local_reconstruction` | `train_vol_local_recon` |
@@ -73,13 +73,13 @@ scenario exercising the default densify fit.
 | Option / axis | Covered by |
 |---|---|
 | `--ctf_type None / apply / wiener / precorrect` | `train_none` / `train_apply_mmap` / `train_wiener` / `train_precorrect` |
-| `--mode train / predict / send_to_pickle` | `train_*` / `predict_none` / `send_to_pickle_none` |
+| `--mode train / predict` | `train_*` / `predict_none` |
 | `--vol` (required) / `--mask` provided vs auto-generated | all / `train_apply_automask` |
 | `--L1`, `--L2` (incl. defaults) | `train_none`(3,3), `train_apply_mmap`(5,5), `train_default_fit`(7,7) |
 | `--num_gaussians` set vs default densify fit | most / `train_default_fit` |
 | `--lat_dim`, `--batch_size`, `--learning_rate`, `--dataset_split_fraction` | varied across scenarios |
 | `--load_images_to_ram` (on) / mmap (off) + `--ssd_scratch_folder` | most scenarios / `train_apply_mmap` |
-| `--epochs`, `--reload` | all (+ `train_none_short`) / `predict_none`, `send_to_pickle_none` |
+| `--epochs`, `--reload` | all (+ `train_none_short`) / `predict_none` |
 
 Data checks confirm the phantom is genuinely continuous-only: total density is
 conserved across conformations while atom positions change (and the
@@ -151,7 +151,7 @@ region where the first space follows a rotated (disagreeing) trend.
 |---|---|
 | `--input_space` (N spaces, `NAME:path`) | all |
 | `--lat_dim` default (min input dim) vs explicit | `train_default` / `train_custom` |
-| `--mode train / predict / send_to_pickle` | `train_*` / `predict` / `send_to_pickle` |
+| `--mode train / predict` | `train_*` / `predict` |
 | `--epochs`, `--batch_size`, `--learning_rate` | varied |
 | outputs: `FlexConsensus` model; `*_consensus.npy`, `*_consensus_error.npy`, `*_representation_error.npy` | train / predict |
 

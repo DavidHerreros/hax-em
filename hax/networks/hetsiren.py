@@ -1813,7 +1813,7 @@ def main():
     args = ca.parse_with_config(parser)
 
     # Ensure the output path exists for every mode (train creates it via the
-    # metrics writer, but predict/send_to_pickle write straight into it).
+    # metrics writer, but predict writes straight into it).
     os.makedirs(args.output_path, exist_ok=True)
 
     # Manually handed parameters

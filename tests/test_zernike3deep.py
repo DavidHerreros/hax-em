@@ -9,16 +9,13 @@ Zernike3Deep models conformational variability as a **continuous deformation**
 Coverage of the ``zernike3deep`` options:
 
 * ``--ctf_type``   : None, apply, wiener, precorrect
-* ``--mode``       : train, predict, send_to_pickle
+* ``--mode``       : train, predict
 * ``--vol`` (required) / ``--mask`` (provided and auto-generated)
 * ``--L1`` / ``--L2``       (Zernike degrees, varied incl. defaults)
 * ``--num_gaussians``       (fixed small count, and the default densify fit)
 * ``--lat_dim`` / ``--batch_size`` / ``--learning_rate`` / ``--dataset_split_fraction``
 * ``--load_images_to_ram`` (on) and the mmap path (off) + ``--ssd_scratch_folder``
 * ``--epochs`` / ``--reload``
-
-``send_to_pickle`` still (by design) requires ``--reload``: it just re-saves the
-reloaded model.
 """
 
 import os
@@ -123,19 +120,7 @@ def scenarios(workdir, data):
         expect_files=[os.path.join(out("predict_none"), "predicted_latents.xmd")],
         timeout=600))
 
-    # 3) send_to_pickle | reload from (1), re-save the model  (must create own output dir)
-    scn.append(Scenario(
-        name="send_to_pickle_none",
-        description="send_to_pickle | ctf=None | --reload from train_none (re-saves model)",
-        program="zernike3deep",
-        args=["--md", noctf["md"], "--vol", noctf["vol"], "--mask", noctf["mask"],
-              "--ctf_type", "None", "--mode", "send_to_pickle",
-              "--lat_dim", "6", "--reload", out("train_none"),
-              "--output_path", out("send_to_pickle_none"), "--sr", str(SR)],
-        expect_files=[z3d("send_to_pickle_none")],
-        timeout=300))
-
-    # 4) train | ctf=apply | memory-mapped (no RAM) + ssd scratch + custom split/L1/L2
+    # 3) train | ctf=apply | memory-mapped (no RAM) + ssd scratch + custom split/L1/L2
     #    Exercises the record-level train/val split fix on a single-shard dataset.
     scn.append(Scenario(
         name="train_apply_mmap",
@@ -166,7 +151,7 @@ def scenarios(workdir, data):
         expect_files=[z3d("train_none_short")],
         timeout=900))
 
-    # 5) train | ctf=apply | NO --mask -> auto-generated mask path (+writes mask.mrc)
+    # 4) train | ctf=apply | NO --mask -> auto-generated mask path (+writes mask.mrc)
     scn.append(Scenario(
         name="train_apply_automask",
         description="train | ctf=apply | auto-generated mask (no --mask) | num_gaussians=100",
@@ -180,7 +165,7 @@ def scenarios(workdir, data):
                       os.path.join(out("train_apply_automask"), "mask.mrc")],
         timeout=1200))
 
-    # 6) train | ctf=wiener  (SLOW)
+    # 5) train | ctf=wiener  (SLOW)
     scn.append(Scenario(
         name="train_wiener",
         description="train | ctf=wiener | --vol --mask | num_gaussians=100 | RAM",
@@ -193,7 +178,7 @@ def scenarios(workdir, data):
         expect_files=[z3d("train_wiener")],
         timeout=1200))
 
-    # 7) train | ctf=precorrect  (SLOW)
+    # 6) train | ctf=precorrect  (SLOW)
     scn.append(Scenario(
         name="train_precorrect",
         description="train | ctf=precorrect | --vol --mask | num_gaussians=100 | RAM",
@@ -206,7 +191,7 @@ def scenarios(workdir, data):
         expect_files=[z3d("train_precorrect")],
         timeout=1200))
 
-    # 8) train | ctf=apply | DEFAULT Zernike degrees + DEFAULT densify fit (n_init=2500)  (SLOW)
+    # 7) train | ctf=apply | DEFAULT Zernike degrees + DEFAULT densify fit (n_init=2500)  (SLOW)
     scn.append(Scenario(
         name="train_default_fit",
         description="train | ctf=apply | default L1/L2(=7) + default densify Gaussian fit",

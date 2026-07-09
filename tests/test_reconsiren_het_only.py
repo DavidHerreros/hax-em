@@ -9,7 +9,7 @@ without the ab-initio Gaussian consensus volume that ``reconsiren`` learns.
 Coverage:
 
 * ``--ctf_type``               : None, apply, wiener, precorrect
-* ``--mode``                   : train, predict, send_to_pickle
+* ``--mode``                   : train, predict
 * ``--vol`` / ``--mask``       : reference volume + reconstruction mask (adds the
                                  volume-adjustment warm-up step)
 * ``--do_not_learn_volume``    : pose/shift + heterogeneity against a reference
@@ -131,19 +131,7 @@ def scenarios(workdir, data):
                       os.path.join(out("predict_none"), "reconsiren_hetmap_01.mrc")],
         timeout=900))
 
-    # 3) send_to_pickle (currently a no-op for reconsiren_het_only — must still
-    #    exit cleanly).  --load_images_to_ram avoids the mmap-cleanup path.
-    scn.append(Scenario(
-        name="send_to_pickle_none",
-        description="send_to_pickle | ctf=None (no-op smoke check)",
-        program="reconsiren_het_only",
-        args=["--md", noctf["md"], "--ctf_type", "None", "--mode", "send_to_pickle",
-              "--output_path", out("send_to_pickle_none"),
-              "--sr", str(SR), "--load_images_to_ram"],
-        expect_files=[],
-        timeout=300))
-
-    # 4) train, ctf=apply, memory-mapped (no RAM) + ssd scratch + custom hyperparams
+    # 3) train, ctf=apply, memory-mapped (no RAM) + ssd scratch + custom hyperparams
     scn.append(Scenario(
         name="train_apply_mmap",
         description="train | ctf=apply | mmap+ssd_scratch | bs=4 lr=5e-5 split=0.7,0.3",
@@ -157,7 +145,7 @@ def scenarios(workdir, data):
         expect_files=[rs("train_apply_mmap")],
         timeout=1200))
 
-    # 5) train, ctf=wiener
+    # 4) train, ctf=wiener
     scn.append(Scenario(
         name="train_wiener",
         description="train | ctf=wiener | RAM",
@@ -168,7 +156,7 @@ def scenarios(workdir, data):
         expect_files=[rs("train_wiener")],
         timeout=1200))
 
-    # 6) train, ctf=precorrect
+    # 5) train, ctf=precorrect
     scn.append(Scenario(
         name="train_precorrect",
         description="train | ctf=precorrect | RAM",
@@ -179,7 +167,7 @@ def scenarios(workdir, data):
         expect_files=[rs("train_precorrect")],
         timeout=1200))
 
-    # 7) train, refine an existing assignment under a symmetry group.
+    # 6) train, refine an existing assignment under a symmetry group.
     scn.append(Scenario(
         name="train_refine_symmetry",
         description="train | ctf=apply | --refine_current_assignment --symmetry_group c2 | RAM",
@@ -191,7 +179,7 @@ def scenarios(workdir, data):
         expect_files=[rs("train_refine_symmetry")],
         timeout=1200))
 
-    # 8) train with reference volume + mask: exercises the volume-adjustment
+    # 7) train with reference volume + mask: exercises the volume-adjustment
     #    warm-up (VolumeAdjustment) before the ReconSIREN training loop.
     #
     #    SKIPPED: the --vol path is currently broken.  After the volume-adjustment
@@ -218,9 +206,9 @@ def scenarios(workdir, data):
         timeout=1800,
         skip=True, skip_reason=_VOL_BUG))
 
-    # 9) train with reference volume, pose/shift + heterogeneity only
+    # 8) train with reference volume, pose/shift + heterogeneity only
     #    (--do_not_learn_volume): reference map kept fixed.  SKIPPED: same --vol
-    #    AttributeError as scenario (8).
+    #    AttributeError as scenario (7).
     scn.append(Scenario(
         name="train_vol_no_learn_volume",
         description="train | ctf=apply | --vol --mask --do_not_learn_volume",

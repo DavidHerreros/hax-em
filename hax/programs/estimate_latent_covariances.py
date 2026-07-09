@@ -89,7 +89,7 @@ def main():
     ca.add_ssd_scratch_folder(parser)
     args = ca.parse_with_config(parser)
 
-    # Load neural network (note it MUST be saved in pickle mode to make this script general)
+    # Load neural network
     model = NeuralNetworkCheckpointer.load(args.nn_path)
 
     # Prepare metadata

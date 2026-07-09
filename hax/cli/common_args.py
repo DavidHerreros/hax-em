@@ -69,15 +69,10 @@ SSD_SCRATCH_FOLDER_HELP = (
     f"When the parameter {bcolors.UNDERLINE}load_images_to_ram{bcolors.ENDC} is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from "
     f"the default disk.")
 
-MODE_CHOICES = ["train", "predict", "send_to_pickle"]
+MODE_CHOICES = ["train", "predict"]
 # Two-line variant (HetSIREN / ReconSIREN / FlexConsensus)
 MODE_HELP = (f"{bcolors.BOLD}train{bcolors.ENDC}: train a neural network from scratch or from a previous execution if reload is provided\n"
              f"{bcolors.BOLD}predict{bcolors.ENDC}: predict the latent vectors from the input images ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case)")
-# Variant that also documents send_to_pickle (Zernike3Deep)
-MODE_HELP_WITH_PICKLE = (f"{bcolors.BOLD}train{bcolors.ENDC}: train a neural network from scratch or from a previous execution if reload is provided\n"
-                         f"{bcolors.BOLD}predict{bcolors.ENDC}: predict the latent vectors from the input images ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case)\n"
-                         f"{bcolors.BOLD}send_to_pickle{bcolors.ENDC}: save the network in pickle format. ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case - "
-                         f"needed by program {bcolors.UNDERLINE}estimate_latent_covariances{bcolors.ENDC})")
 
 EPOCHS_HELP = ("Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 50 - "
                "as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it")

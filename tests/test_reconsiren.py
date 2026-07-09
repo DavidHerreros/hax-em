@@ -8,7 +8,7 @@ particle pose, shifts and an initial (heterogeneous) volume with neural
 networks.  Coverage:
 
 * ``--ctf_type``               : None, apply, wiener, precorrect
-* ``--mode``                   : train, predict, send_to_pickle
+* ``--mode``                   : train, predict
 * ``--vol`` / ``--mask``       : reference-volume start (Gaussian fitting path)
 * ``--num_gaussians``          : size of the Gaussian point cloud
 * ``--do_not_learn_volume``    : pose/shift-only refinement against a reference
@@ -137,19 +137,7 @@ def scenarios(workdir, data):
                       os.path.join(out("predict_none"), "reconsiren_map.mrc")],
         timeout=900))
 
-    # 3) send_to_pickle (currently a no-op for reconsiren — must still exit cleanly)
-    scn.append(Scenario(
-        name="send_to_pickle_none",
-        description="send_to_pickle | ctf=None (no-op smoke check)",
-        program="reconsiren",
-        args=["--md", noctf["md"], "--ctf_type", "None", "--mode", "send_to_pickle",
-              "--num_gaussians", str(NUM_GAUSS),
-              "--output_path", out("send_to_pickle_none"),
-              "--sr", str(SR), "--load_images_to_ram"],
-        expect_files=[],
-        timeout=300))
-
-    # 4) train, ctf=apply, memory-mapped (no RAM) + ssd scratch + custom hyperparams
+    # 3) train, ctf=apply, memory-mapped (no RAM) + ssd scratch + custom hyperparams
     scn.append(Scenario(
         name="train_apply_mmap",
         description="train | ctf=apply | mmap+ssd_scratch | bs=4 lr=5e-5 split=0.7,0.3",
@@ -164,7 +152,7 @@ def scenarios(workdir, data):
         expect_files=[rs("train_apply_mmap")],
         timeout=1200))
 
-    # 5) train, ctf=wiener
+    # 4) train, ctf=wiener
     scn.append(Scenario(
         name="train_wiener",
         description="train | ctf=wiener | RAM",
@@ -175,7 +163,7 @@ def scenarios(workdir, data):
         expect_files=[rs("train_wiener")],
         timeout=1200))
 
-    # 6) train, ctf=precorrect
+    # 5) train, ctf=precorrect
     scn.append(Scenario(
         name="train_precorrect",
         description="train | ctf=precorrect | RAM",
@@ -186,7 +174,7 @@ def scenarios(workdir, data):
         expect_files=[rs("train_precorrect")],
         timeout=1200))
 
-    # 7) train, refine an existing assignment under a symmetry group.
+    # 6) train, refine an existing assignment under a symmetry group.
     #    The phantom md already carries per-particle angles/shifts, so
     #    --refine_current_assignment has a starting alignment to refine.
     scn.append(Scenario(
@@ -200,7 +188,7 @@ def scenarios(workdir, data):
         expect_files=[rs("train_refine_symmetry")],
         timeout=1200))
 
-    # 8) train with reference volume: Gaussian fitting of --vol inside --mask.
+    # 7) train with reference volume: Gaussian fitting of --vol inside --mask.
     scn.append(Scenario(
         name="train_vol_mask",
         description="train | ctf=apply | --vol --mask (Gaussian volume fitting)",
@@ -216,7 +204,7 @@ def scenarios(workdir, data):
                       os.path.join(out("train_vol_mask"), "consensus_volume.mrc")],
         timeout=1800))
 
-    # 9) train with reference volume, pose/shift-only (--do_not_learn_volume):
+    # 8) train with reference volume, pose/shift-only (--do_not_learn_volume):
     #    the documented "high-resolution reference, no map refinement" use case.
     scn.append(Scenario(
         name="train_vol_no_learn_volume",
