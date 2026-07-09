@@ -837,7 +837,8 @@ class HetSIREN(nnx.Module):
                                    "geometric_lambda"))
 def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_lambda=1e-4, graph_lambda=1e-4,
                         warmup_alpha=1.0, pose_refine_reg=0.1, decoupling_lambda=1e-4, distance_preservation_lambda=1e-4,
-                        kl_lambda=1e-3, freq_alpha=1.0, arap_lambda=0.0, geometric_lambda=0.0, render_sigma=None):
+                        kl_lambda=1e-3, freq_alpha=1.0, arap_lambda=0.0, geometric_lambda=0.0, render_sigma=None,
+                        amp_recon_weight=0.1):
     model, optimizer = nnx.merge(graphdef, state)
     distributions_key, rot_sample_key, choice_key, key = jnr.split(key, 4)
 
@@ -996,7 +997,11 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         # if not model.delta_volume_decoder.transport_mass:
         #     images_consensus_loss = images_consensus_loss * projected_mask
 
-        recon_loss = 0.1 * model.representation_loss_fn(images_corrected_loss, x_loss, freq_alpha) + 0.9 * model.representation_loss_fn(images_corrected_field_loss, x_loss, freq_alpha)
+        # Split the reconstruction between the amplitude pathway (learned values at
+        # frozen coords -> images_corrected) and the mass-transport pathway (fixed
+        # reference values at learned coords -> images_corrected_field)
+        recon_loss = amp_recon_weight * model.representation_loss_fn(images_corrected_loss, x_loss, freq_alpha) + (1.0 - amp_recon_weight) * model.representation_loss_fn(images_corrected_field_loss, x_loss, freq_alpha)
+
         # if model.delta_volume_decoder.transport_mass:
 
         # Keep the per-sample (and, when M>1, per-pose) loss here. It must NOT be
@@ -1776,6 +1781,25 @@ def main():
                              f"EMAN2 use FRC on experimental data). Only affects mass-transport rendering. Requires {bcolors.ITALIC}--freq_anneal_epochs{bcolors.ENDC} > 0 (it shares that "
                              f"clock). Set to 1.0 to disable (default; fixed base width). Typical: 2-2.5 - the render blur uses a fixed 9-px kernel, so a broadened width beyond "
                              f"~2.5x the base sigma is progressively truncated (still broadens, just sub-linearly), which bounds the useful range.")
+    parser.add_argument("--schedule_recon_split", action='store_true',
+                        help=f"Schedule the mass-transport reconstruction split instead of using the fixed {bcolors.ITALIC}0.1 / 0.9{bcolors.ENDC} weighting. The reconstruction loss "
+                             f"is a blend of an amplitude pathway (learned densities at frozen positions) and a mass-transport pathway (fixed reference densities at learned positions); "
+                             f"the weight of the amplitude term ramps linearly from {bcolors.ITALIC}--recon_split_start{bcolors.ENDC} to {bcolors.ITALIC}--recon_split_final{bcolors.ENDC} "
+                             f"over {bcolors.ITALIC}--recon_split_epochs{bcolors.ENDC} (the motion term takes the complement). Starting near 0 makes early training explain the data almost "
+                             f"purely by moving mass, so large-amplitude motions emerge and converge faster before the amplitude head is allowed to absorb residual density changes. Only "
+                             f"meaningful with mass transport ({bcolors.ITALIC}--transport_mass{bcolors.ENDC}). Default: off (fixed {bcolors.ITALIC}--recon_split_final{bcolors.ENDC} throughout, "
+                             f"i.e. the historical 0.1 / 0.9).")
+    parser.add_argument("--recon_split_start", required=False, type=float, default=0.0,
+                        help=f"Amplitude-term weight at the START of training when {bcolors.ITALIC}--schedule_recon_split{bcolors.ENDC} is on. {bcolors.ITALIC}0.0{bcolors.ENDC} (default) "
+                             f"means pure mass transport early (the reconstruction is explained entirely by motion). Ignored when scheduling is off.")
+    parser.add_argument("--recon_split_final", required=False, type=float, default=0.1,
+                        help=f"Amplitude-term weight at the END of the ramp (and the fixed weight used throughout when {bcolors.ITALIC}--schedule_recon_split{bcolors.ENDC} is off). "
+                             f"{bcolors.ITALIC}0.1{bcolors.ENDC} (default) reproduces the historical 0.1 / 0.9 split. The motion term always takes the complement (1 - this).")
+    parser.add_argument("--recon_split_epochs", required=False, type=float, default=0.0,
+                        help=f"Number of initial epochs over which the amplitude-term weight ramps from {bcolors.ITALIC}--recon_split_start{bcolors.ENDC} to {bcolors.ITALIC}--recon_split_final"
+                             f"{bcolors.ENDC} when {bcolors.ITALIC}--schedule_recon_split{bcolors.ENDC} is on. If left at 0, it rides the coarse-to-fine clock and reuses "
+                             f"{bcolors.ITALIC}--freq_anneal_epochs{bcolors.ENDC} (amplitude is introduced as the resolution is refined); if both are 0 the weight jumps straight to "
+                             f"{bcolors.ITALIC}--recon_split_final{bcolors.ENDC}.")
     parser.add_argument("--arap_lambda", required=False, type=float, default=0.0,
                         help=f"Weight of the as-rigid-as-possible (ARAP) deformation prior. Unlike the distance-preservation term, ARAP factors out the best local rotation per "
                              f"Gaussian before penalizing the deformation, so locally rigid motions (hinges, domain rotations) are NOT over-stiffened while noise-driven non-rigid "
@@ -2284,6 +2308,21 @@ def main():
                 else:
                     render_sigma = None
 
+                # Mass-transport reconstruction split: weight of the amplitude term
+                # (the motion term takes the complement)
+                if args.schedule_recon_split:
+                    if args.recon_split_epochs and args.recon_split_epochs > 0:
+                        split_steps = max(1, int(args.recon_split_epochs * steps_per_epoch))
+                    elif args.freq_anneal_epochs and args.freq_anneal_epochs > 0:
+                        split_steps = max(1, int(args.freq_anneal_epochs * steps_per_epoch))
+                    else:
+                        split_steps = 1
+                    split_frac = min(1.0, total_steps / split_steps)
+                    amp_recon_weight = jnp.float32(args.recon_split_start
+                                                   + (args.recon_split_final - args.recon_split_start) * split_frac)
+                else:
+                    amp_recon_weight = jnp.float32(args.recon_split_final)
+
                 loss, recon_loss, state, rng = train_step_hetsiren(graphdef, state, x, labels, md_columns, rng,
                                                                    l1_lambda=args.denoising_strength,
                                                                    graph_lambda=graph_lambda,
@@ -2295,7 +2334,8 @@ def main():
                                                                    freq_alpha=freq_alpha,
                                                                    arap_lambda=args.arap_lambda,
                                                                    geometric_lambda=args.geometric_lambda,
-                                                                   render_sigma=render_sigma)
+                                                                   render_sigma=render_sigma,
+                                                                   amp_recon_weight=amp_recon_weight)
                 total_loss += loss
                 total_recon_loss += recon_loss
 
