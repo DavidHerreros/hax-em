@@ -19,6 +19,7 @@ from hax.utils.ctf import computeCTF
 from hax.utils.fourier_filters import ctfFilter
 from hax.utils.euler import euler_matrix_batch
 from hax.utils.decorators import save_config
+from hax.utils.fourier_filters import wiener2DFilter
 
 from hax.programs.gaussian_volume_fitting import fit_volume, adjust_weights_to_images
 
@@ -119,7 +120,7 @@ class CryoCheck(nnx.Module):
     return nnx.Sequential(*layers)
 
   @nnx.jit(static_argnames='eval')
-  def __call__(self,x, eval=True):
+  def __call__(self,x, eval=False, train=False):
     if x.ndim == 3:
       # if x is (N,H,W) add a channel dimension
       x=jnp.expand_dims(x, -1)
@@ -150,6 +151,7 @@ class CryoCheck(nnx.Module):
 
     # Pooling and classification
     x = jnp.mean(x, axis=(1,2))
+
     x = self.fc(x)
 
     if eval:
@@ -235,7 +237,7 @@ def Preprocessing(vol, mask, euler_angles, shifts, ctf):
   
     # Scatter image
     B = euler_angles.shape[0]  
-    xsize=vol.shape[0] #o vol.shape[1]
+    xsize=vol.shape[0] #or vol.shape[1]
     c_sampling = jnp.stack([coords[..., 1], coords[..., 0]], axis=2)
     images = jnp.zeros((B, xsize, xsize), dtype=vol.dtype) 
 
@@ -333,8 +335,7 @@ def main():
                              f"the default disk.")
   parser.add_argument("--num_gaussians", required=False, type=int, default=5000,
                         help="Number of Gaussians to fit the input volume to recreate it. This is a crucial step to adjust the grey levels of the input volume to the ones of the images.")
-                        
-
+  
   args, _ = parser.parse_known_args()
 
 
@@ -357,23 +358,23 @@ def main():
       #cryoCheck = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "cryoCheck"))
       cryoCheck = NeuralNetworkCheckpointer.load(args.reload)
 
+  # Load metadata
+  generator = MetaDataGenerator(args.md)
+  md_columns = extract_columns(generator.md)
+
+  if not args.load_images_to_ram and args.mode in ["train", "predict"]:
+    mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
+    # Prepare grain dataset
+    generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4,
+                                                precision=np.float16, group_size=1, shard_size=10000)  #shard: significa che ho più archivi con 10000 immagini ciascuno e non tutti le immagini in uno solo
+  
   ### Train network ###
   if args.mode == "train":
     
     cryoCheck.train()
     # Prepare summary writer
     writer = JaxSummaryWriter(os.path.join(args.output_path, "cryoCheck_metrics"))
-
-    # Load metadata
-    generator = MetaDataGenerator(args.md)
-    md_columns = extract_columns(generator.md)
-
-    mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
-
-    # Prepare grain dataset
-    if not args.load_images_to_ram:generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4,
-                                                 precision=np.float16, group_size=1, shard_size=10000)  #shard: significa che ho più archivi con 10000 immagini ciascuno e non tutti le immagini in uno solo
-            
+ 
 
     # Gaussian Splatting to adjust grey levels of the input volume
     if args.vol is not None:
@@ -385,6 +386,8 @@ def main():
         # Adjust to images
         model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.0001,
                                                               num_epochs=5, is_global=True, ctf_type="apply")
+
+        # think applying it when adjusting the gray level ctf=jnp.ones_like(ctf)) - wiener2DFilter(x[..., 0], ctf)[..., None]
 
         # Save model
         NeuralNetworkCheckpointer.save(model, fit_path)
@@ -410,6 +413,9 @@ def main():
     steps_per_epoch = int(int(args.dataset_split_fraction[0] * len(generator.md)) / args.batch_size) 
     steps_per_val = int(int(args.dataset_split_fraction[1] * len(generator.md)) / args.batch_size)
 
+    # Optimizer
+    optimizer = nnx.Optimizer(cryoCheck, optax.adamw(args.learning_rate), wrt=nnx.Param)  # optax.adamw, optax.sgd
+    
     # Resume if checkpoint exists
     if os.path.isdir(os.path.join(args.output_path, "cryoCheck_CHECKPOINT")):
       graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "cryoCheck_CHECKPOINT"), optimizer)
@@ -419,8 +425,6 @@ def main():
     else:
       resume_epoch = 0
 
-    # Optimizer
-    optimizer = nnx.Optimizer(cryoCheck, optax.adamw(args.learning_rate), wrt=nnx.Param)  # optax.sgd
 
     #TRAINING LOOP
     print(f"{bcolors.OKCYAN}\n###### Training CryoCheck... ######") 
@@ -433,6 +437,10 @@ def main():
     total_loss = 0
 
     with closing(iter(data_loader_train)) as iter_data_loader_train, closing(iter(data_loader_val)) as iter_data_loader_val:
+
+      t_score = []
+      t_labels = []
+
       for total_steps in pbar:
         (x, index) = next(iter_data_loader_train) 
 
@@ -441,40 +449,72 @@ def main():
         batch_size = len(index)
         
         # Aligned images
+        #aligned_imgs = jnp.abs(Preprocessing(vol=vol,
+         #                         mask=mask,
+          #                        euler_angles=euler_angles,
+           #                      shifts=shifts,
+            #                     ctf=ctf) - x)
         aligned_imgs = jnp.abs(Preprocessing(vol=vol,
-                                 mask=mask,
-                                 euler_angles=euler_angles,
-                                 shifts=shifts,
-                                 ctf=ctf) - x)
-     #   aligned_imgs = jnp.abs(Preprocessing(vol=vol,
-     #                            mask=mask,
-     #                            euler_angles=euler_angles,
-     #                            shifts=shifts,
-     #                            ctf=jnp.ones_like(ctf)) - wiener2DFilter(x[..., 0], ctf)[..., None])
+                                mask=mask,
+                                euler_angles=euler_angles,
+                                shifts=shifts,
+                                ctf=jnp.ones_like(ctf)) - wiener2DFilter(x[..., 0], ctf)[..., None])
         aligned_labels = jnp.ones((batch_size,1)) #label for aligned imgs is 1
 
         # Misaligned images - Data Augmentation
         rngs, subkey = jax.random.split(rngs)
-        noise = (jax.random.normal(subkey, shape=euler_angles.shape) * 2) + 5
+        noise = (jax.random.normal(subkey, shape=euler_angles.shape) * 2) + 20
         euler_angles_noisy = euler_angles + noise
 
         misaligned_imgs = jnp.abs(Preprocessing(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles_noisy,
                                  shifts=shifts,
-                                 ctf=ctf) - x)
+                                 ctf=jnp.ones_like(ctf)) - wiener2DFilter(x[..., 0], ctf)[..., None])
         misaligned_labels = jnp.zeros((batch_size,1)) #label for misaligned imgs is 0
       
        
         imgs=jnp.concatenate([aligned_imgs, misaligned_imgs], axis=0)
         labels=jnp.concatenate([aligned_labels, misaligned_labels], axis=0)
 
+
+        # === PRINT VALUES RANGE (ONLY FOR THE FIRST BATCH) ===
+        if total_steps == 0:
+            # Extract the first sample of the batch for debugging
+            proj_sample = Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles, shifts=shifts, ctf=jnp.ones_like(ctf))[0]
+            wiener_sample = wiener2DFilter(x[..., 0], ctf)[0]
+            
+            print("\n" + "="*50)
+            print("[VALUES RANGE - FIRST SAMPLE ]")
+            print(f"PURE PROJECTION  -> Min: {jnp.min(proj_sample):.4f} | Max: {jnp.max(proj_sample):.4f} | Mean: {jnp.mean(proj_sample):.4f}")
+            print(f"WIENER IMAGE  -> Min: {jnp.min(wiener_sample):.4f} | Max: {jnp.max(wiener_sample):.4f} | Mean: {jnp.mean(wiener_sample):.4f}")
+            print(f"ALIGNED RESIDUAL  -> Min: {jnp.min(aligned_imgs[0]):.4f} | Max: {jnp.max(aligned_imgs[0]):.4f} | Mean: {jnp.mean(aligned_imgs[0]):.4f}")
+            print("="*50 + "\n")
+        ##############################################################
+        
+
         loss, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs, labels=labels, train=True)
         total_loss += loss
+        
+        ######## roc and confusion matrix #######
+        t_score.append(cryoCheck(imgs, eval=True)) 
+        t_labels.append(labels)
 
 
         #VALIDATION STEP at the end of each epoch  
         if (total_steps + 1) % steps_per_epoch == 0:    
+
+
+          t_score_epoch= jnp.concatenate(t_score, axis=0)
+          t_labels_epoch = jnp.concatenate(t_labels, axis=0)
+
+          optimal_threshold_t = writer.add_roc_curve(t_labels_epoch, t_score_epoch, global_step=i, tag="ROC Curve - Training step")
+
+          t_score_heavy = t_score_epoch > optimal_threshold_t
+          writer.add_confusion_matrix(t_labels_epoch, t_score_heavy, global_step=i, tag="Confusion Matrix - Training step")
+            
+          ##########################################
+
          
           # average training loss at the end of each epoch 
           avg_train_loss = total_loss / steps_per_epoch
@@ -488,12 +528,12 @@ def main():
 
           total_loss = 0
           total_validation_loss = 0
-
-          val_score = []
-          val_labels = []
           
           # Validation step 
           print(f"{bcolors.WARNING}\n###### Running Validation Step... ######{bcolors.ENDC}")
+
+          val_score = []
+          val_labels = []
 
           for _ in range(steps_per_val):
             
@@ -503,51 +543,70 @@ def main():
 
             batch_size_v = len(index_validation)
 
+
             # Aligned images
             aligned_vimgs = jnp.abs(Preprocessing(vol=vol,
                               mask=mask,
                               euler_angles=euler_angles,
                               shifts=shifts,
-                              ctf=ctf) - x_validation)
+                              ctf=jnp.ones_like(ctf)) - wiener2DFilter(x_validation[..., 0], ctf)[..., None])
             aligned_vlabels = jnp.ones((batch_size_v,1))
         
     
             # Misaligned images
             rngs, subkey_v = jax.random.split(rngs)
-            noise = (jax.random.normal(subkey_v, shape=euler_angles.shape) * 2) + 5
+            noise = (jax.random.normal(subkey_v, shape=euler_angles.shape) * 2) + 20
             euler_angles_noisy = euler_angles + noise
 
             misaligned_vimgs = jnp.abs(Preprocessing(vol=vol,
                               mask=mask,
                               euler_angles=euler_angles_noisy,
                               shifts=shifts,
-                              ctf=ctf) - x_validation)
+                              ctf=jnp.ones_like(ctf)) - wiener2DFilter(x_validation[..., 0], ctf)[..., None])
             misaligned_vlabels = jnp.zeros((batch_size_v,1))
           
             imgs_validation = jnp.concatenate([aligned_vimgs, misaligned_vimgs],axis=0)
             labels_validation = jnp.concatenate([aligned_vlabels, misaligned_vlabels], axis=0)
-    
+
+            if _ == 0:
+              ##########################
+              # Debugging: save pure projection and wiener image to TensorBoard
+              pure_proj = jnp.squeeze(Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles, shifts=shifts, ctf=jnp.ones_like(ctf))[0])
+              wiener_img = jnp.squeeze(wiener2DFilter(x[..., 0], ctf[...])[0])
+
+              writer.add_image("Pure_Projection", pure_proj, global_step=i, dataformats='HW')
+              writer.add_image("Wiener_Image", wiener_img, global_step=i, dataformats='HW')
+
+              # Debugging: save aligned and misaligned residuals to TensorBoard
+              img_aligned = jnp.squeeze(aligned_imgs[0])
+              img_misaligned = jnp.squeeze(misaligned_imgs[0])
+
+              writer.add_image("Residual_Visual/Aligned_Sample", img_aligned, global_step=i, dataformats='HW')
+              writer.add_image("Residual_Visual/Misaligned_Sample", img_misaligned, global_step=i, dataformats='HW')
+              ############################
+
 
             loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels_validation, train=False)
             total_validation_loss += loss_validation
             
-            val_score.append(predict_fn(imgs_validation,eval=True)) #predictions for the validation step
+            val_score.append(cryoCheck(imgs_validation, eval=True)) #predictions for the validation step
             val_labels.append(labels_validation)
             
-          val_score_np = np.array(val_score).flatten()
-          val_labels_np = np.array(val_labels).flatten()
           
-          val_score = jnp.concatenate(val_score, axis=0)
-          val_labels = jnp.concatenate(val_labels, axis=0)
+          val_score_epoch = jnp.concatenate(val_score, axis=0)
+          val_labels_epoch = jnp.concatenate(val_labels, axis=0)
 
-          # Roc Curve and Confision Matrix
+          # Roc Curve and Confusion Matrix 
+          optimal_threshold = writer.add_roc_curve(val_labels_epoch, val_score_epoch, global_step=i, tag="ROC Curve - Validation step")
+          
+          # Save optimal threshold value 
+          threshold_path = os.path.join(args.output_path, "optimal_threshold_value.txt")
+          with open(threshold_path, "w") as f:
+              f.write(str(optimal_threshold))
 
-          #writer.add_roc_curve(val_labels, val_score, global_step=i)
-          optimal_threshold = writer.add_roc_curve(val_labels, val_score, global_step=i)
-           
-          val_score_heavy = val_score > optimal_threshold
-          writer.add_confusion_matrix(val_labels, val_score_heavy, global_step=i)
 
+          val_score_heavy = val_score_epoch > optimal_threshold
+          writer.add_confusion_matrix(val_labels_epoch, val_score_heavy, global_step=i, tag="Confusion Matrix - Validation step")
 
           avg_val_loss = total_validation_loss / steps_per_val
           pbar.write(f"\n--- End of Validation for Epoch {int((total_steps + 1) / steps_per_epoch)} ---")
@@ -563,6 +622,11 @@ def main():
           NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "cryoCheck_CHECKPOINT"),
                                                       epoch=i)  
 
+          t_score = []
+          t_labels = []
+
+        
+
           i += 1
 
     # Save model
@@ -576,21 +640,17 @@ def main():
 
     cryoCheck.eval()
 
-    # Prepare network
-    generator = MetaDataGenerator(args.md)
-    md_columns = extract_columns(generator.md)
-
     # Prepare grain dataset
     data_loader = generator.return_grain_dataset(batch_size=args.batch_size, shuffle=False, num_epochs=1,
                                                      num_workers=-1, load_to_ram=args.load_images_to_ram)
     steps_per_epoch = int(np.ceil(len(generator.md) / args.batch_size))
     
     # Jitted prediction function
-    predict_fn = nnx.jit(cryoCheck.__call__)
+    #predict_fn = nnx.jit(cryoCheck.__call__)
     #predict_fn = nnx.jit(lambda x: cryoCheck(x))
 
     # PREDICTION LOOP
-    print(f"{bcolors.OKCYAN}\n###### Predicting CryoCheck... ######")
+    print(f"{bcolors.OKCYAN}\n###### Predicting CryoCheck... ######") 
 
     pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green", total=steps_per_epoch,
                     bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
@@ -598,25 +658,37 @@ def main():
 
     labels_prediction = []
 
+
     for (x, index) in pbar:
 
       euler_angles, shifts, ctf = md_extraction (md_columns, index, vol, args)
+      
 
       prediction_imgs = jnp.abs(Preprocessing(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles,
                                  shifts=shifts,
-                                 ctf=ctf) - x)
+                                 ctf=jnp.ones_like(ctf)) - wiener2DFilter(x[..., 0], ctf)[..., None])
       
-      
-      predictions = predict_fn(prediction_imgs,eval=True)
-      #predictions = cryoCheck(prediction_imgs)
+    
+      #predictions = predict_fn(prediction_imgs,eval=True)
+      predictions = cryoCheck(prediction_imgs, eval=True)
 
       labels_prediction.append(np.array(predictions))
 
     final_predictions = np.concatenate(labels_prediction, axis=0)
-    final_predictions_heavy = final_predictions > optimal_threshold
+
+    # Retieve optimal threshold value from training step
+    threshold_path = os.path.join(args.output_path, "optimal_threshold_value.txt")
+    try:
+        with open(threshold_path, "r") as f:
+            optimal_threshold = float(f.read().strip())
+    except FileNotFoundError:
+        optimal_threshold = 0.5
+
+    final_predictions_heavy = (final_predictions > optimal_threshold).astype(int)
     
+  
     # Save results 
     md=generator.md 
     md[:, "misalignment_score"] = final_predictions
