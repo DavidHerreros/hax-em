@@ -166,7 +166,7 @@ class CryoCheck(nnx.Module):
 def cryoCheck_step(model, optimizer, x, labels,*, train: bool):
 
     def loss_fn(model, x, labels):
-        logits = model(x, eval=False)  # Get raw logits for loss computation
+        logits = model(x, eval=False, train=train)  # Get raw logits for loss computation
         # Binary cross entropy
         loss = jnp.mean(optax.sigmoid_binary_cross_entropy(logits, labels)) #avg loss per batch
 
@@ -367,6 +367,8 @@ def main():
     # Prepare grain dataset
     generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4,
                                                 precision=np.float16, group_size=1, shard_size=10000)  #shard: significa che ho più archivi con 10000 immagini ciascuno e non tutti le immagini in uno solo
+  else:
+    mmap_output_dir = None
   
   ### Train network ###
   if args.mode == "train":
@@ -381,13 +383,13 @@ def main():
       fit_path = os.path.join(args.output_path, "Gaussian_volume_fitting")
       if not os.path.isdir(os.path.join(fit_path)):
       
-        model, _, _ = fit_volume(vol * mask, mask=mask, iterations=20000, learning_rate=0.001, n_init=args.num_gaussians, fixed_gaussians=True)
+        model, _, _ = fit_volume(vol, mask=mask, iterations=20000, learning_rate=0.001, n_init=args.num_gaussians, fixed_gaussians=True)
         
         # Adjust to images
-        model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.0001,
-                                                              num_epochs=5, is_global=True, ctf_type="apply")
+        model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
+                                            num_epochs=5, is_global=True, ctf_type="wiener")
 
-        # think applying it when adjusting the gray level ctf=jnp.ones_like(ctf)) - wiener2DFilter(x[..., 0], ctf)[..., None]
+        # think applying the wiener filter when adjusting the gray levels
 
         # Save model
         NeuralNetworkCheckpointer.save(model, fit_path)
@@ -486,6 +488,7 @@ def main():
             
             print("\n" + "="*50)
             print("[VALUES RANGE - FIRST SAMPLE ]")
+            print(f"EXP PROJECTION  -> Min: {jnp.min(x[0]):.4f} | Max: {jnp.max(x[0]):.4f} | Mean: {jnp.mean(x[0]):.4f}")
             print(f"PURE PROJECTION  -> Min: {jnp.min(proj_sample):.4f} | Max: {jnp.max(proj_sample):.4f} | Mean: {jnp.mean(proj_sample):.4f}")
             print(f"WIENER IMAGE  -> Min: {jnp.min(wiener_sample):.4f} | Max: {jnp.max(wiener_sample):.4f} | Mean: {jnp.mean(wiener_sample):.4f}")
             print(f"ALIGNED RESIDUAL  -> Min: {jnp.min(aligned_imgs[0]):.4f} | Max: {jnp.max(aligned_imgs[0]):.4f} | Mean: {jnp.mean(aligned_imgs[0]):.4f}")
@@ -503,7 +506,6 @@ def main():
 
         #VALIDATION STEP at the end of each epoch  
         if (total_steps + 1) % steps_per_epoch == 0:    
-
 
           t_score_epoch= jnp.concatenate(t_score, axis=0)
           t_labels_epoch = jnp.concatenate(t_labels, axis=0)
@@ -531,6 +533,8 @@ def main():
           
           # Validation step 
           print(f"{bcolors.WARNING}\n###### Running Validation Step... ######{bcolors.ENDC}")
+
+          cryoCheck.eval()
 
           val_score = []
           val_labels = []
@@ -570,12 +574,16 @@ def main():
 
             if _ == 0:
               ##########################
-              # Debugging: save pure projection and wiener image to TensorBoard
-              pure_proj = jnp.squeeze(Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles, shifts=shifts, ctf=jnp.ones_like(ctf))[0])
-              wiener_img = jnp.squeeze(wiener2DFilter(x[..., 0], ctf[...])[0])
+              # Debugging: save pure projection aligned and misaligned without ctf
+              pure_proj_aligned = jnp.squeeze(Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles, shifts=shifts, ctf=jnp.ones_like(ctf))[0])
+              pure_proj_misaligned = jnp.squeeze(Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles_noisy, shifts=shifts, ctf=jnp.ones_like(ctf))[0])
+              # wiener_img = jnp.squeeze(wiener2DFilter(x[..., 0], ctf[...])[0])
 
-              writer.add_image("Pure_Projection", pure_proj, global_step=i, dataformats='HW')
-              writer.add_image("Wiener_Image", wiener_img, global_step=i, dataformats='HW')
+              writer.add_image("Pure_Projection/Aligned", pure_proj_aligned, global_step=i, dataformats='HW')
+              writer.add_image("Pure_Projection/Misaligned", pure_proj_misaligned, global_step=i, dataformats='HW')
+
+              ImageHandler().write(np.array(pure_proj_aligned), os.path.join(args.output_path, "pure_projection_aligned.mrcs"), overwrite=True)
+              ImageHandler().write(np.array(pure_proj_misaligned), os.path.join(args.output_path, "pure_projection_misaligned.mrcs"), overwrite=True)
 
               # Debugging: save aligned and misaligned residuals to TensorBoard
               img_aligned = jnp.squeeze(aligned_imgs[0])
@@ -583,6 +591,10 @@ def main():
 
               writer.add_image("Residual_Visual/Aligned_Sample", img_aligned, global_step=i, dataformats='HW')
               writer.add_image("Residual_Visual/Misaligned_Sample", img_misaligned, global_step=i, dataformats='HW')
+
+              ImageHandler().write(np.array(img_aligned), os.path.join(args.output_path, "aligned_residual_sample.mrcs"), overwrite=True)
+              ImageHandler().write(np.array(img_misaligned), os.path.join(args.output_path, "misaligned_residual_sample.mrcs"), overwrite=True)
+
               ############################
 
 
@@ -592,9 +604,11 @@ def main():
             val_score.append(cryoCheck(imgs_validation, eval=True)) #predictions for the validation step
             val_labels.append(labels_validation)
             
-          
+
           val_score_epoch = jnp.concatenate(val_score, axis=0)
           val_labels_epoch = jnp.concatenate(val_labels, axis=0)
+
+          cryoCheck.train()
 
           # Roc Curve and Confusion Matrix 
           optimal_threshold = writer.add_roc_curve(val_labels_epoch, val_score_epoch, global_step=i, tag="ROC Curve - Validation step")
@@ -628,6 +642,8 @@ def main():
         
 
           i += 1
+
+        
 
     # Save model
     NeuralNetworkCheckpointer.save(cryoCheck, os.path.join(args.output_path, "cryoCheck"))
