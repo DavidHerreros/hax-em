@@ -68,19 +68,22 @@ def _peak_bytes(step, graphdef, state, md, rng, batch_size, input_shape_per_samp
                + analysis.output_size_in_bytes)
 
 
-def estimate_batch_size(graphdef, state, step, md, rng, input_shape_per_sample,
-                        *, probe_sizes=(32, 128), safety=0.7, reserved_bytes=0,
-                        multiple_of=8, min_batch=1, max_batch=1024,
-                        device=None, step_kwargs=None, verbose=True):
-    """Estimate a memory-safe batch size analytically, without running the step.
+def estimate_batch_size_from_peak_fn(peak_fn, *, probe_sizes=(32, 128), safety=0.7,
+                                     reserved_bytes=0, multiple_of=8, min_batch=1,
+                                     max_batch=1024, device=None, verbose=True):
+    """Estimate a memory-safe batch size from a peak-memory probe, without running it.
 
-    The device memory one training ``step`` needs is affine in the batch size
-    ``B``. This ahead-of-time compiles ``step`` at two batch sizes and reads XLA's
-    ``memory_analysis`` (see :func:`_peak_bytes` -- compilation only, no execution,
-    no image data allocated, no OOM), fits the peak-vs-``B`` line, and solves for
-    the largest ``B`` whose predicted peak stays under ``safety`` x total device
-    memory (minus ``reserved_bytes``). The result is rounded down to a multiple of
-    ``multiple_of`` and clamped to ``[min_batch, max_batch]``.
+    The backend of :func:`estimate_batch_size`, factored out so any batched JAX
+    computation -- not just a training step -- can be sized. ``peak_fn(batch)``
+    must return the peak device bytes that computation would need at that batch
+    size (typically via ``jit_fn.lower(...).compile().memory_analysis()``, which
+    allocates nothing), or ``None`` if it could not be measured.
+
+    The device memory a batched computation needs is affine in the batch size
+    ``B``. This probes ``peak_fn`` at two batch sizes, fits the peak-vs-``B`` line,
+    and solves for the largest ``B`` whose predicted peak stays under ``safety`` x
+    total device memory (minus ``reserved_bytes``). The result is rounded down to a
+    multiple of ``multiple_of`` and clamped to ``[min_batch, max_batch]``.
 
     Why the conservative ``safety`` default and larger ``probe_sizes``: XLA's
     ``memory_analysis`` reports an *idealized* buffer-assignment total that on the
@@ -88,21 +91,15 @@ def estimate_batch_size(graphdef, state, step, md, rng, input_shape_per_sample,
     is mildly *super-linear* in ``B`` -- so probing at tiny batches underestimates
     the slope. Probing in the tens-to-low-hundreds captures a representative slope,
     and budgeting to ~70% of memory absorbs the fragmentation gap plus the extra
-    GPU memory the *surrounding* training loop uses but this isolated probe cannot
-    see (an EMA copy, a second optimizer, cached decode/clustering kernels, input
-    pipeline buffers). ``reserved_bytes`` lets the caller subtract known extras
-    (e.g. the EMA buffer). The goal is "a big batch that reliably fits", not the
-    theoretical maximum -- a slightly small batch is vastly cheaper than an OOM.
-
-    This sizes for *throughput / GPU utilization*; it does not claim to be the
-    accuracy-optimal batch size (larger batches can generalize worse and give
-    fewer updates per epoch), so keep ``max_batch`` as a sane cap.
+    GPU memory the *surrounding* loop uses but this isolated probe cannot see.
+    ``reserved_bytes`` lets the caller subtract known extras. The goal is "a big
+    batch that reliably fits", not the theoretical maximum -- a slightly small
+    batch is vastly cheaper than an OOM.
 
     Returns the chosen batch size (int), or ``None`` if the estimate could not be
     made (unsupported backend, tracing failure, ...) so the caller can fall back
     to a fixed default.
     """
-    step_kwargs = dict(step_kwargs or {})
     device = device or jax.devices()[0]
     gib = 1024 ** 3
 
@@ -121,7 +118,7 @@ def estimate_batch_size(graphdef, state, step, md, rng, input_shape_per_sample,
         raise ValueError(f"estimate_batch_size needs at least two distinct probe_sizes, got {probe_sizes!r}")
 
     def _try_probe(b):
-        """memory_analysis peak at batch ``b``, or None if it could not be taken.
+        """peak_fn(b), or None if it could not be taken.
 
         Compilation never allocates the batch's working buffers, so this cannot
         OOM on batch size. The only failure mode is XLA's GEMM autotuner
@@ -129,7 +126,7 @@ def estimate_batch_size(graphdef, state, step, md, rng, input_shape_per_sample,
         such failure as "probe unavailable" and let the caller back off.
         """
         try:
-            return _peak_bytes(step, graphdef, state, md, rng, b, input_shape_per_sample, step_kwargs)
+            return peak_fn(b)
         except Exception:
             return None
 
@@ -187,3 +184,26 @@ def estimate_batch_size(graphdef, state, step, md, rng, input_shape_per_sample,
               f"(predicted peak ~{predicted:.2f} GiB, capped at {max_batch})")
 
     return rounded
+
+
+def estimate_batch_size(graphdef, state, step, md, rng, input_shape_per_sample,
+                        *, step_kwargs=None, **kwargs):
+    """Estimate a memory-safe batch size for a hax training ``step``.
+
+    Thin wrapper over :func:`estimate_batch_size_from_peak_fn` that builds the
+    peak-memory probe for the canonical hax training-step signature
+    ``step(graphdef, state, images, labels, md, rng, **step_kwargs)``. See
+    :func:`_peak_bytes` for what the probe measures, and
+    :func:`estimate_batch_size_from_peak_fn` for the keyword arguments.
+
+    This sizes for *throughput / GPU utilization*; it does not claim to be the
+    accuracy-optimal batch size (larger batches can generalize worse and give
+    fewer updates per epoch), so keep ``max_batch`` as a sane cap.
+    """
+    resolved_kwargs = dict(step_kwargs or {})
+
+    def peak_fn(batch_size):
+        return _peak_bytes(step, graphdef, state, md, rng, batch_size,
+                           input_shape_per_sample, resolved_kwargs)
+
+    return estimate_batch_size_from_peak_fn(peak_fn, **kwargs)
