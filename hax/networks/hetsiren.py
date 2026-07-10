@@ -80,7 +80,7 @@ class Encoder(nnx.Module):
             self.latent = Linear(256, lat_dim, rngs=rngs)
 
     def sample_gaussian(self, mean, logstd, *, rngs):
-        return logstd * jnr.normal(rngs, shape=mean.shape) + mean
+        return jnp.exp(logstd) * jnr.normal(rngs, shape=mean.shape) + mean
 
     def __call__(self, x, return_last=False, *, rngs=None):
         if self.architecture == "mlpnn":
@@ -125,8 +125,7 @@ class Encoder(nnx.Module):
             if self.isVae:
                 # x = self.layer_normalization(x)
                 mean = self.mean_x(x)
-                logstd = self.logstd_x(x)
-                # logstd = jnp.clip(logstd, -4.0, 4.0)
+                logstd = jnp.clip(self.logstd_x(x), -4.0, 4.0)
                 sample = self.sample_gaussian(mean, logstd, rngs=rngs) if rngs is not None else mean
                 return sample, mean, logstd
             else:
@@ -154,7 +153,7 @@ class EncoderTomo(nnx.Module):
             self.latent = Linear(256, lat_dim, rngs=rngs)
 
     def sample_gaussian(self, mean, logstd, *, rngs):
-        return logstd * jnr.normal(rngs, shape=mean.shape) + mean
+        return jnp.exp(logstd) * jnr.normal(rngs, shape=mean.shape) + mean
 
     def __call__(self, x, return_last=False, *, rngs=None):
         for layer in self.hidden_layers:
@@ -165,7 +164,7 @@ class EncoderTomo(nnx.Module):
         else:
             if self.isVae:
                 mean = self.mean_x(x)
-                logstd = self.logstd_x(x)
+                logstd = jnp.clip(self.logstd_x(x), -4.0, 4.0)
                 sample = self.sample_gaussian(mean, logstd, rngs=rngs) if rngs is not None else mean
                 return sample, mean, logstd
             else:
@@ -205,7 +204,7 @@ class MultiEncoder(nnx.Module):
         self.rigid_shifts = nnx.Linear(256, 2, rngs=rngs, kernel_init=nnx.initializers.zeros_init(), bias_init=nnx.initializers.zeros_init())
 
     def sample_gaussian(self, mean, logstd, *, rngs):
-        return logstd * jnr.normal(rngs, shape=mean.shape) + mean
+        return jnp.exp(logstd) * jnr.normal(rngs, shape=mean.shape) + mean
 
     def __call__(self, x, encoder_id="encoder_exp", return_last=False, return_alignment_refinement=False, *,
                  rngs=None, warmup_alpha=1.0):
@@ -233,7 +232,7 @@ class MultiEncoder(nnx.Module):
 
         if self.isVae:
             mean = self.mean_x(x)
-            logstd = self.logstd_x(x)
+            logstd = jnp.clip(self.logstd_x(x), -4.0, 4.0)
             sample = self.sample_gaussian(mean, logstd, rngs=rngs) if rngs is not None else mean
             if return_last:
                 if return_alignment_refinement:
