@@ -5,7 +5,6 @@ import jax
 from jax import random as jnr, numpy as jnp
 from flax import nnx
 
-import random
 from functools import partial
 
 from hax.utils.miscellaneous import batched_knn
@@ -41,10 +40,8 @@ class Deconvolver(nnx.Module):
 
 
 @partial(jax.jit, static_argnames=["islog", "fraction", "subsetMode"])
-def train_deconv_step(graphdef, state, x, cov, z_space, islog=False, fraction=None, subsetMode="random"):
+def train_deconv_step(graphdef, state, x, cov, z_space, key, islog=False, fraction=None, subsetMode="random"):
     model, optimizer_deconv = nnx.merge(graphdef, state)
-
-    key = jnr.PRNGKey(random.randint(0, 2 ** 32 - 1))
 
     def density_at(z, mean, cov, islog=False):
         if islog:
@@ -277,7 +274,8 @@ def main():
 
                     i += 1
 
-                loss, state = train_deconv_step(graphdef, state, x, covariances, latents, islog=True,
+                step_key = jnr.fold_in(rng, total_steps)
+                loss, state = train_deconv_step(graphdef, state, x, covariances, latents, step_key, islog=True,
                                                 subsetMode="random", fraction=50000)
                 total_loss += loss
 

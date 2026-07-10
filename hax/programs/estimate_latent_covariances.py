@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 
-import random
 from functools import partial
 
 import jax
@@ -10,8 +9,8 @@ from jax import random as jnr, numpy as jnp
 from hax.utils import *
 
 
-@partial(jax.jit, static_argnames=["model",])
-def estimate_latent_covariances(model, x, labels, md):
+@partial(jax.jit, static_argnames=["model", "n_samples"])
+def estimate_latent_covariances(model, x, labels, md, key, n_samples=20):
     # Decode clean projection
     x_clean, latent = model.decode_image(x, labels, md, ctf_type=None, return_latent=True)
     x_clean = x_clean[..., None]
@@ -54,10 +53,9 @@ def estimate_latent_covariances(model, x, labels, md):
 
     # Covariance
     z_rnd = []
-    for _ in range(20):
-        key = jnr.PRNGKey(random.randint(0, 2 ** 32 - 1))
-        # noise = jax.random.normal(key, x_clean.shape) * jnp.sqrt(var_map)
-        noise = jax.random.normal(key, x_clean.shape)
+    for sample_key in jnr.split(key, n_samples):
+        # noise = jax.random.normal(sample_key, x_clean.shape) * jnp.sqrt(var_map)
+        noise = jax.random.normal(sample_key, x_clean.shape)
         noise = ctfFilter(noise[..., 0], amp_map[..., 0], pad_factor=2)[..., None]
         x_noisy = x_clean_ctf + noise
         z_rnd.append(model(x_noisy, return_alignment_refinement=False))
@@ -113,8 +111,10 @@ def main():
                 bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
     covariances = []
     latents = []
-    for (x, labels) in pbar:
-        z_rnd, z = estimate_latent_covariances(model, x, labels, md_columns)
+    key = jnr.PRNGKey(0)
+    for batch_idx, (x, labels) in enumerate(pbar):
+        batch_key = jnr.fold_in(key, batch_idx)
+        z_rnd, z = estimate_latent_covariances(model, x, labels, md_columns, batch_key)
         latents.append(z)
         diff = z_rnd - z_rnd.mean(axis=1)[:, None, :]
         for d in diff:
