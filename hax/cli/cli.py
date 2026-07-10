@@ -39,6 +39,8 @@ if os.environ.get("NO_COLOR") or (not os.environ.get("FORCE_COLOR") and not sys.
 
 
 MODULES_DICT = {
+    "preprocess_particles": ("hax.preprocessing.preprocess_particles", "Resize/crop a particle stack and optionally correct it for the CTF, to cut VRAM usage and speed up training"),
+    "preprocess_volumes": ("hax.preprocessing.preprocess_volumes", "Resize/crop volumes (reference maps, masks) to match a preprocessed particle set"),
     "hetsiren": ("hax.networks.hetsiren", "Heterogeneous volume reconstruction with HetSIREN neural network"),
     "zernike3deep": ("hax.networks.zernike3deep", "Estimation of motions using deep learning version of Zernike3Deep"),
     "flexconsensus": ("hax.networks.flexconsensus", "Consensus of conformational latent spaces using FlexConsensus neural network"),

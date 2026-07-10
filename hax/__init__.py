@@ -36,6 +36,7 @@ _SUBPACKAGES = (
     "generators",
     "layers",
     "networks",
+    "preprocessing",
     "programs",
     "utils",
     "metrics",

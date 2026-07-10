@@ -49,6 +49,56 @@ python tests/run_tests.py --gpu 0 --keep hetsiren     # keep the work dir for in
    `zernike3deep`, …) and passes only if it exits 0 **and** produces the expected
    outputs. A `NaN/Inf` loss is treated as a failure.
 
+4. **Semantic verification** *(preprocessing)* — "exit 0 + files exist" cannot see
+   whether a program produced the *right numbers*. Where the contract is exact, a
+   final scenario runs a checker script (`Scenario(script=...)`, the same mechanism
+   the headless GUI tests use) that reads the outputs back and asserts them against
+   independently recomputed references. See `preprocess_checks.py`.
+
+### preprocess_particles coverage (`test_preprocess_particles.py`)
+
+| Option / axis | Covered by |
+|---|---|
+| `--new_box_size` (down / up) | `resize` (48→24), `upsample` (48→64) |
+| `--crop_box_size` (crop / zero-pad) | `crop` (48→32), `pad` (48→64) |
+| both, in the documented crop-then-resize order | `crop_resize` (48 → crop 32 → resize 16) |
+| `--ctf_correction none / wiener / phase_flip` | `resize` / `wiener` / `phase_flip`, plus `ctf_only` (no geometry change) |
+| `--wiener_epsilon` (fixed vs adaptive regularizer) | `wiener_eps` |
+| `--batch_size` fixed and `auto` | `workers` / `batch_auto` |
+| `--device cpu` | `device_cpu` |
+| `--num_read_workers` / `--num_write_workers` | `workers` |
+| `--relative_image_paths` and the absolute default | `relative` / `resize` |
+| `.star` in → `.star` out | `star` |
+
+`verify_outputs` then asserts, for every run above: the output box, the header
+sampling rate (`sr × box_cropped / box_out`), the **rescaled in-plane shifts**, that
+angles and CTF columns are carried over untouched, that the pixel data matches an
+independent NumPy Fourier-resize / centred-crop oracle, that `--batch_size`,
+`--device` and the worker counts do **not** change the result, and that image paths
+resolve (absolute from any cwd; relative from the output folder).
+`verify_guards` asserts the CLI *refuses* an odd box, a no-op run, a zero batch or
+worker count, and CTF correction on metadata with no CTF.
+
+### preprocess_volumes coverage (`test_preprocess_volumes.py`)
+
+| Option / axis | Covered by |
+|---|---|
+| `--new_box_size` (down / up) | `resize` (48→24), `upsample` (48→64) |
+| `--crop_box_size` | `crop` (48→32) |
+| both, crop-then-resize | `crop_resize` |
+| several `--vol` in one call (map + mask) | `pair` |
+| duplicate stems → disambiguated names | `dup` |
+| `--sr` read from the header when omitted | `header_sr` |
+| `--num_workers` | `workers` |
+
+`verify_outputs` asserts the geometry and sampling rate, **gray-level preservation**
+(a Fourier resize keeps the DC term, so the mean density is preserved exactly), the
+centre of mass, an independent NumPy oracle, that `--num_workers` and the header-`sr`
+fallback are result-identical, and that a duplicate-stem run still leaves every output
+on a single `*_preprocessed.mrc` glob — the property the GUI's single-volume connector
+relies on. `verify_guards` asserts the CLI refuses a no-op, a non-cubic Fourier resize,
+and a (header-flagged) particle stack passed as `--vol`.
+
 ### HetSIREN coverage (`test_hetsiren.py`)
 
 | Option / axis | Covered by |
@@ -283,3 +333,10 @@ Create `tests/test_<program>.py` exposing:
 * `SLOW` *(optional)* → set of scenario names to skip under `--quick`.
 
 Then add `"<program>"` to `PROGRAMS` in `run_tests.py`.
+
+If the program has an exact numerical contract (a sampling rate, a rescaled column,
+preserved gray levels), do not stop at "it exited 0": add a checker script and append
+a `Scenario(script=..., args=["--check", ...])` after the runs that produce its inputs.
+Scenarios execute in order, so the checker sees everything written before it.
+`preprocess_checks.py` is the worked example — recompute the expected values with plain
+NumPy rather than by calling the code under test, or the check proves nothing.

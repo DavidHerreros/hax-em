@@ -47,7 +47,8 @@ from common import run_suite, print_header, GREEN, RED, YELLOW, BOLD, END  # noq
 
 # Registry of programs that have a test module ``test_<name>.py`` exposing
 # prepare_data(workdir) / data_checks(workdir) / scenarios(workdir, data) / SLOW.
-PROGRAMS = ["hetsiren", "reconsiren", "reconsiren_het_only", "zernike3deep",
+PROGRAMS = ["preprocess_particles", "preprocess_volumes",
+            "hetsiren", "reconsiren", "reconsiren_het_only", "zernike3deep",
             "estimate_latent_covariances", "latent_space_deconvolution",
             "filter_latents", "flexconsensus", "decode_states_from_latents",
             "modart", "annotate_space", "image_gray_scale_adjustment",
