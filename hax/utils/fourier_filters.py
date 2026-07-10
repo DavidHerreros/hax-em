@@ -149,6 +149,68 @@ def bspline_3d(x):
     ft_x = jlx.complex(ft_x_real, ft_x_imag)
     return jnp.fft.ifftn(jnp.fft.ifftshift(ft_x)).real
 
+def centered_crop_or_pad(array, new_shape, axes):
+    """Center-crop and/or zero-pad ``array`` so that ``axes`` have sizes ``new_shape``.
+
+    The centre is taken to be index ``n // 2`` -- the convention shared by
+    ``fftshift`` (which places the DC term there) and by the box centre that
+    Xmipp/Relion in-plane shifts are measured against. Anchoring on it means a
+    single rule, ``offset = old // 2 - new // 2``, keeps the DC term aligned in
+    Fourier space *and* keeps the particle centre fixed in real space, for any
+    mix of even and odd sizes. Crop and pad are exact inverses of each other.
+
+    Works on both NumPy and JAX arrays (including tracers, so it is ``jit``-safe:
+    every size involved is static).
+
+    :param array: array to resize.
+    :param new_shape: target size per entry of ``axes``.
+    :param axes: axes to crop/pad (may be negative).
+    :return: array whose ``axes`` have sizes ``new_shape``.
+    """
+    xp = jnp if isinstance(array, jnp.ndarray) else np
+
+    slices = [slice(None)] * array.ndim
+    pads = [(0, 0)] * array.ndim
+    for axis, new in zip(axes, new_shape):
+        axis = axis % array.ndim
+        old = array.shape[axis]
+        offset = old // 2 - new // 2
+        if offset >= 0:
+            slices[axis] = slice(offset, offset + new)
+        else:
+            pads[axis] = (-offset, new - old + offset)
+
+    out = array[tuple(slices)]
+    if any(pad != (0, 0) for pad in pads):
+        out = xp.pad(out, pads)
+    return out
+
+
+def fourier_resample(array, new_shape, axes):
+    """Resample ``array`` along ``axes`` by cropping/padding its spectrum.
+
+    Fourier cropping is an ideal (sinc) low-pass followed by decimation: it never
+    aliases, unlike real-space subsampling. The output is rescaled by
+    ``prod(new_shape) / prod(old_shape)`` so that gray levels are preserved --
+    the inverse transform divides by the *new* number of samples, which would
+    otherwise brighten a downsampled array by exactly that factor.
+
+    :param array: real-valued array.
+    :param new_shape: target size per entry of ``axes``.
+    :param axes: axes to resample (may be negative).
+    :return: real array whose ``axes`` have sizes ``new_shape``.
+    """
+    axes = tuple(axis % array.ndim for axis in axes)
+    old_shape = tuple(array.shape[axis] for axis in axes)
+
+    spectrum = jnp.fft.fftshift(jnp.fft.fftn(array, axes=axes), axes=axes)
+    spectrum = centered_crop_or_pad(spectrum, new_shape, axes)
+    resampled = jnp.fft.ifftn(jnp.fft.ifftshift(spectrum, axes=axes), axes=axes).real
+
+    scale = np.prod(new_shape) / np.prod(old_shape)
+    return resampled * scale
+
+
 def fourier_resize(x, new_size):
     """
     Resize tensor using Fourier transform. Supports 4D and 5D tensors.
@@ -158,55 +220,20 @@ def fourier_resize(x, new_size):
     could also be an integer to specify equal resizing for all dimensions.
     :return: Resized tensor.
     """
-    original_shape = x.shape
-    num_dims = len(original_shape)
+    num_dims = len(x.shape)
 
     # Check if the tensor is 4D or 5D
     if num_dims not in [4, 5]:
         raise ValueError("Input tensor must be 4D or 5D.")
 
+    # Spatial axes sit between the batch and channel axes.
+    axes = tuple(range(1, num_dims - 1))
+
     # Check new_size param
     if isinstance(new_size, int):
-        if num_dims == 5:
-            new_size = (new_size, new_size, new_size)
-        else:
-            new_size = (new_size, new_size)
+        new_size = (new_size,) * len(axes)
 
-    # FFT operation
-    if num_dims == 5:
-        B, D, H, W, C = original_shape
-        new_d, new_h, new_w = new_size
-        f_x = jnp.fft.fftn(x, axes=(1, 2, 3))
-        resized_f_x = jnp.zeros((B, new_d, new_h, new_w, C), dtype=jnp.complex64)
-    else:
-        B, H, W, C = original_shape
-        new_h, new_w = new_size
-        f_x = jnp.fft.fftn(x, axes=(1, 2))
-        resized_f_x = jnp.zeros((B, new_h, new_w, C), dtype=jnp.complex64)
-
-    # Central crop/padding for resizing
-    slicing = tuple(
-        slice(max((old - new) // 2, 0), max((old - new) // 2, 0) + min(new, old))
-        for old, new in zip(original_shape[-num_dims + 2:], new_size)
-    )
-    padding = tuple(
-        slice(max((new - old) // 2, 0), max((new - old) // 2, 0) + min(new, old))
-        for old, new in zip(original_shape[-num_dims + 2:], new_size)
-    )
-
-    # Resizing in Fourier domain
-    if num_dims == 5:
-        resized_f_x.at[:, padding[0], padding[1], padding[2], :].set(f_x[:, slicing[0], slicing[1], slicing[2], :])
-    else:
-        resized_f_x.at[:, padding[0], padding[1], :].set(f_x[:, slicing[0], slicing[1], :])
-
-    # Inverse FFT and conversion to real
-    if num_dims == 5:
-        resized_x = jnp.fft.ifftn(resized_f_x, axes=(1, 2, 3)).real
-    else:
-        resized_x = jnp.fft.ifftn(resized_f_x, axes=(1, 2)).real
-
-    return resized_x
+    return fourier_resample(x, new_size, axes)
 
 def _radial_bins(shape):
     """Integer radial-shell index for each pixel of a ``fftshift(rfft2(.))`` grid.
