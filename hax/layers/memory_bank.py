@@ -1,6 +1,25 @@
 from flax import nnx
 import jax
+from jax import random as jnr
 import jax.numpy as jnp
+
+
+def sample_bank(bank, key, n_samples, n_valid=None):
+    """Random subset of the rows of a memory bank that hold real data.
+
+    The training programs use this to show the learnt landscape without running a
+    second pass over the dataset: the bank already holds the latents the model has
+    encoded during training. ``n_valid`` is how many rows have been enqueued so far
+    (rows are filled from 0 upwards), so an early call does not sample the
+    zero-initialised tail; pass ``None`` once the bank is known to be full.
+    """
+    n_rows = bank.shape[0]
+    if n_valid is None:
+        n_valid = n_rows
+    n_valid = int(min(max(int(n_valid), 1), n_rows))
+    n_samples = int(min(int(n_samples), n_valid))
+    indices = jnr.choice(key, a=jnp.arange(n_valid), shape=(n_samples,), replace=False)
+    return bank[indices]
 
 
 class MemoryBank(nnx.Module):

@@ -1004,7 +1004,7 @@ def main():
     from hax.checkpointer import NeuralNetworkCheckpointer
     from hax.generators import MetaDataGenerator, extract_columns, NumpyGenerator
     from hax.networks import train_step_zernike3deep, train_step_volume_adjustment, VolumeAdjustment
-    from hax.metrics import JaxSummaryWriter
+    from hax.metrics import JaxSummaryWriter, TrainingLogger
     from hax.programs import fit_volume, adjust_weights_to_images
     # from hax.schedulers import CosineAnnealingScheduler
 
@@ -1034,6 +1034,7 @@ def main():
     ca.add_learning_rate(parser)
     ca.add_dataset_split_fraction(parser)
     ca.add_output_path(parser)
+    ca.add_logging_args(parser)
     ca.add_reload(parser,
                   help=f"Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data - "
                        f"{bcolors.WARNING}NOTE{bcolors.ENDC}: Since Zernike3Deep also learns a gray level adjustment, reload must be the path to a folder containing two additional "
@@ -1193,6 +1194,14 @@ def main():
 
         image_resize = jax.jit(jax.image.resize, static_argnames=("shape", "method"))
 
+        # Logging cadence + background offload of the host-side logging work.
+        logger = TrainingLogger(image_every=args.log_images_every,
+                                landscape_every=args.log_landscape_every,
+                                checkpoint_every=args.log_checkpoint_every,
+                                steps_per_epoch=steps_per_epoch,
+                                time_budget=args.log_time_budget,
+                                background=not args.log_sync).start()
+
         # Training loop (Zernike3Deep)
         print(f"{bcolors.OKCYAN}\n###### Training variability... ######")
 
@@ -1232,59 +1241,66 @@ def main():
                 pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
 
                 # Log intermediate results at the end of the epoch
-                # Get first 5 images from batch
-                if zernike3deep.isTomo:
-                    x_for_tb = x[0][:5]
-                else:
-                    x_for_tb = x[:5]
-                labels_for_tb = labels[:5]
+                if logger.should("images", i):
+                    with logger.section():
+                        # Get first 5 images from batch
+                        if zernike3deep.isTomo:
+                            x_for_tb = x[0][:5]
+                        else:
+                            x_for_tb = x[:5]
+                        labels_for_tb = labels[:5]
 
-                # Decode some images and show them in Tensorboard
-                x_pred_intermediate, latents_intermediate = zernike3deep_decode_image(graphdef, state, x_for_tb,
-                                                                                      labels_for_tb, md_columns,
-                                                                                      ctf_type=args.ctf_type,
-                                                                                      return_latent=True,
-                                                                                      corrupt_projection_with_ctf=True)
-                x_pred_intermediate = jax.vmap(min_max_scale)(x_pred_intermediate[..., None])
-                writer.add_images("Predicted images batch", x_pred_intermediate, dataformats="NHWC")
+                        # Decode some images and some states
+                        x_pred_intermediate, latents_intermediate = zernike3deep_decode_image(graphdef, state, x_for_tb,
+                                                                                              labels_for_tb, md_columns,
+                                                                                              ctf_type=args.ctf_type,
+                                                                                              return_latent=True,
+                                                                                              corrupt_projection_with_ctf=True)
+                        x_pred_intermediate = jax.vmap(min_max_scale)(x_pred_intermediate[..., None])
+                        volumes_intermediate = zernike3deep_decode_volume(graphdef, state, latents_intermediate)
 
-                # Decode some states and show them in Tensorboard
-                volumes_intermediate = zernike3deep_decode_volume(graphdef, state, latents_intermediate)
-                writer.add_volumes_slices(volumes_intermediate)
+                    logger.submit(writer.add_images, "Predicted images batch", x_pred_intermediate,
+                                  dataformats="NHWC")
+                    logger.submit(writer.add_volumes_slices, volumes_intermediate)
 
-                # Log landscape stored in memory bank
-                if i > 0 and i % 5 == 0:
-                    choice_key_use, choice_key = jax.random.split(choice_key, 2)
-                    zernike3deep_intermediate, _, _ = nnx.merge(graphdef, state)
-                    random_indices = jnr.choice(choice_key_use,
-                                                a=jnp.arange(zernike3deep_intermediate.bank_size),
-                                                shape=(zernike3deep_intermediate.subset_size,), replace=False)
-                    latents_intermediate = zernike3deep_intermediate.memory_bank.get_value()[random_indices]
-                    latents_data_loader = NumpyGenerator(latents_intermediate).return_grain_dataset(
-                        preShuffle=False, shuffle=False, batch_size=args.batch_size,
-                        num_epochs=1, num_workers=0)
-                    latents_images = []
-                    for (latents, _) in latents_data_loader:
-                        random_labels = jnp.asarray(
-                            np.random.randint(low=0, high=len(generator.md), size=(latents.shape[0],)),
-                            dtype=jnp.int32)
-                        x_pred_intermediate = zernike3deep_decode_image(graphdef, state, latents, random_labels,
-                                                                        md_columns, ctf_type=None,
-                                                                        return_latent=False,
-                                                                        corrupt_projection_with_ctf=False)
-                        x_pred_intermediate = \
-                        image_resize(x_pred_intermediate[..., None], (latents.shape[0], 128, 128, 1),
-                                     method="bilinear")[..., 0]
-                        latents_images.append(np.asarray(x_pred_intermediate))
-                    latents_images = np.concatenate(latents_images, axis=0)
-                    latent_images_min = latents_images.min(axis=(1, 2), keepdims=True)
-                    latent_images_max = latents_images.max(axis=(1, 2), keepdims=True)
-                    latents_images = (latents_images - latent_images_min) / (latent_images_max - latent_images_min)
-                    writer.add_embedding(latents_intermediate, label_img=latents_images[:, None, ...],
-                                         tag="Zernike3Deep latent space", global_step=i)
+                if logger.should("landscape", i):
+                    with logger.section():
+                        choice_key_use, choice_key = jax.random.split(choice_key, 2)
+                        zernike3deep_intermediate, _, _ = nnx.merge(graphdef, state)
+                        latents_intermediate = sample_bank(zernike3deep_intermediate.memory_bank.get_value(),
+                                                           choice_key_use,
+                                                           zernike3deep_intermediate.subset_size,
+                                                           n_valid=total_steps * args.batch_size)
+                        latents_images = []
+                        for start in range(0, latents_intermediate.shape[0], args.batch_size):
+                            latents = latents_intermediate[start:start + args.batch_size]
+                            random_labels = jnp.asarray(
+                                np.random.randint(low=0, high=len(generator.md), size=(latents.shape[0],)),
+                                dtype=jnp.int32)
+                            x_pred_intermediate = zernike3deep_decode_image(graphdef, state, latents, random_labels,
+                                                                            md_columns, ctf_type=None,
+                                                                            return_latent=False,
+                                                                            corrupt_projection_with_ctf=False)
+                            x_pred_intermediate = \
+                            image_resize(x_pred_intermediate[..., None], (latents.shape[0], 128, 128, 1),
+                                         method="bilinear")[..., 0]
+                            latents_images.append(np.asarray(x_pred_intermediate))
+                        latents_images = np.concatenate(latents_images, axis=0)
+                        latent_images_min = latents_images.min(axis=(1, 2), keepdims=True)
+                        latent_images_max = latents_images.max(axis=(1, 2), keepdims=True)
+                        latents_images = (latents_images - latent_images_min) / (latent_images_max - latent_images_min)
+                        latents_intermediate = np.asarray(latents_intermediate)
 
-                    # Save checkpoint model
-                    NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "Zernike3Deep_CHECKPOINT"),  epoch=i)
+                    logger.submit(writer.add_embedding, latents_intermediate,
+                                  label_img=latents_images[:, None, ...],
+                                  tag="Zernike3Deep latent space", global_step=i)
+
+                # Save checkpoint model
+                if logger.should("checkpoint", i):
+                    with logger.section():
+                        NeuralNetworkCheckpointer.save_intermediate(graphdef, state,
+                                                                    os.path.join(args.output_path, "Zernike3Deep_CHECKPOINT"),
+                                                                    epoch=i, wait=False)
 
                 i += 1
 
@@ -1292,20 +1308,21 @@ def main():
             total_loss += loss
             total_recon_loss += recon_loss
 
-            # Progress bar update  (TQDM)
-            pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss / step:.5f} | graph_lambda={graph_lambda:.5f}")
-
             # Summary writer (training loss)
-            if step % int(np.ceil(0.1 * steps_per_epoch)) == 0:
-                zernike3deep_intermediate, _, _ = nnx.merge(graphdef, state)
+            if logger.should_log_scalars(step):
+                mean_loss = float(total_loss) / step
+                mean_recon_loss = float(total_recon_loss) / step
 
                 writer.add_scalar('Training loss (Zernike3Deep)',
-                                  total_loss / step,
+                                  mean_loss,
                                   i * steps_per_epoch + step)
 
                 writer.add_scalars('Image loss (Zernike3Deep)',
-                                   {"train": total_recon_loss / step},
+                                   {"train": mean_recon_loss},
                                    i * steps_per_epoch + step)
+
+                # Progress bar update  (TQDM)
+                pbar.set_postfix_str(f"loss={mean_loss:.5f} | recon_loss={mean_recon_loss:.5f} | graph_lambda={graph_lambda:.5f}")
 
             # Summary writer (validation loss)
             if step % int(np.ceil(0.9 * steps_per_epoch)) == 0:
@@ -1318,7 +1335,7 @@ def main():
                     step_validation += 1
 
                 writer.add_scalars('Image loss (Zernike3Deep)',
-                                   {"validation": total_validation_loss / step_validation},
+                                   {"validation": float(total_validation_loss) / step_validation},
                                    i * steps_per_epoch + step)
 
             step += 1
@@ -1330,6 +1347,11 @@ def main():
         x_pred_example = zernike3deep_decode_image(graphdef, state, x_example, labels_example, md_columns, ctf_type=args.ctf_type, return_latent=False, corrupt_projection_with_ctf=True)
         x_pred_example = jax.vmap(min_max_scale)(x_pred_example[..., None])
         writer.add_images("Predicted images batch", x_pred_example, dataformats="NHWC")
+
+        # Let the background logging thread and the asynchronous checkpoint write finish
+        # before the process moves on.
+        logger.close()
+        NeuralNetworkCheckpointer.wait_for_pending()
 
         # Save model
         NeuralNetworkCheckpointer.save(zernike3deep, os.path.join(args.output_path, "Zernike3Deep"))

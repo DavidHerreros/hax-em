@@ -112,6 +112,29 @@ SYMMETRY_GROUP_HELP = (
     f"only {bcolors.ITALIC}c*{bcolors.ENDC} and {bcolors.ITALIC}d*{bcolors.ENDC} symmetry groups are currently supported - the parameter is lower case sensitive - even if symmetry is provided, "
     f"the network will learn a {bcolors.ITALIC}symmetry broken{bcolors.ENDC} set of angles in c1. Therefore, the angles can be directly used in a reconstruction/refinement.)")
 
+LOG_IMAGES_EVERY_HELP = (
+    f"How often (in epochs) to log the {bcolors.ITALIC}cheap{bcolors.ENDC} intermediate results to Tensorboard: the predicted images and the central slices of the "
+    f"predicted volumes (set by default to 1, i.e. every epoch - set to {bcolors.ITALIC}0{bcolors.ENDC} to disable)")
+
+LOG_LANDSCAPE_EVERY_HELP = (
+    f"How often (in epochs) to log the {bcolors.ITALIC}expensive{bcolors.ENDC} intermediate results: the latent space embedding (Tensorboard projector), the intermediate "
+    f"volumes written to disk and the angular distribution plots (set by default to 5 - set to {bcolors.ITALIC}0{bcolors.ENDC} to disable). {bcolors.WARNING}NOTE{bcolors.ENDC}: the "
+    f"embedding alone costs several seconds per call, so on small datasets it can easily dominate the training time - raise this value (or disable it) if logging is your bottleneck")
+
+LOG_CHECKPOINT_EVERY_HELP = (
+    f"How often (in epochs) to write the intermediate checkpoint used to resume an interrupted training (set by default to 5 - set to {bcolors.ITALIC}0{bcolors.ENDC} to disable). "
+    f"This is deliberately independent from {bcolors.ITALIC}--log_landscape_every{bcolors.ENDC}: how often you can resume should not be tied to how often you want pictures")
+
+LOG_TIME_BUDGET_HELP = (
+    f"Self-tuning guard: the maximum fraction of the total wall clock that may be spent logging (e.g. {bcolors.ITALIC}0.05{bcolors.ENDC} for 5%). When the logging carried out so far "
+    f"exceeds this share of the run, the expensive tiers are skipped until training catches up. This adapts to dataset and box size on its own, which a fixed number of epochs "
+    f"cannot do (set by default to 0, i.e. disabled - the cadence flags alone decide)")
+
+LOG_SYNC_HELP = (
+    f"Log on the training thread instead of on a background one. By default the host-side logging work (Tensorboard writes, {bcolors.ITALIC}.mrc{bcolors.ENDC} files, plots) is "
+    f"moved to a background thread so that it overlaps with the next epoch's GPU work rather than stalling it. Use this flag if you need the logs to be written in lockstep with "
+    f"training (e.g. while debugging)")
+
 
 # --------------------------------------------------------------------------- #
 # Builders
@@ -183,6 +206,25 @@ def add_output_path(parser, required=True, help=OUTPUT_PATH_HELP):
 
 def add_reload(parser, required=False, help=None):
     return parser.add_argument("--reload", required=required, type=str, help=help)
+
+
+def add_logging_args(parser, image_every=1, landscape_every=5, checkpoint_every=5):
+    """Cadence of the intermediate logging, shared by the training programs.
+
+    The tiers differ in cost by orders of magnitude (a loss scalar is free, volume
+    slices are ~0.07 s, a latent embedding is several seconds), so each gets its own
+    period instead of a single global one. See ``hax.metrics.TrainingLogger``.
+    """
+    parser.add_argument("--log_images_every", required=False, type=int, default=image_every,
+                        help=LOG_IMAGES_EVERY_HELP)
+    parser.add_argument("--log_landscape_every", required=False, type=int, default=landscape_every,
+                        help=LOG_LANDSCAPE_EVERY_HELP)
+    parser.add_argument("--log_checkpoint_every", required=False, type=int, default=checkpoint_every,
+                        help=LOG_CHECKPOINT_EVERY_HELP)
+    parser.add_argument("--log_time_budget", required=False, type=float, default=0.0,
+                        help=LOG_TIME_BUDGET_HELP)
+    parser.add_argument("--log_sync", action='store_true', help=LOG_SYNC_HELP)
+    return parser
 
 
 def validate_dataset_split_fraction(fractions):

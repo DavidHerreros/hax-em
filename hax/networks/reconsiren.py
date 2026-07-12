@@ -17,6 +17,11 @@ from hax.utils import *
 from hax.layers import *
 
 
+# How many latents to encode before clustering them into the intermediate
+# heterogeneous volumes
+LATENTS_FOR_CLUSTERING = 2048
+
+
 def generate_sphere_points(n):
     """
     Generates N points uniformly distributed within a unit sphere.
@@ -1119,7 +1124,7 @@ def main():
     from contextlib import closing
     from hax.checkpointer import NeuralNetworkCheckpointer
     from hax.generators import MetaDataGenerator, extract_columns
-    from hax.metrics import JaxSummaryWriter
+    from hax.metrics import JaxSummaryWriter, TrainingLogger
     from hax.networks import VolumeAdjustment, train_step_volume_adjustment
     from hax.programs import fit_volume, adjust_weights_to_images
     from hax.programs.gaussian_volume_fitting import get_cosine_reg_strength
@@ -1165,6 +1170,7 @@ def main():
     ca.add_learning_rate(parser)
     ca.add_dataset_split_fraction(parser)
     ca.add_output_path(parser)
+    ca.add_logging_args(parser)
     ca.add_reload(parser,
                   help="Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data).")
     ca.add_ssd_scratch_folder(parser)
@@ -1288,6 +1294,16 @@ def main():
         def decode_het_volume(model, x):
             return model.decode_het_volume(x)
 
+        def write_volume(volume, path):
+            """Write a map (runs on the logging thread)."""
+            ImageHandler().write(volume, path, overwrite=True)
+
+        def write_het_volumes(volumes, out_dir):
+            """Write the per-cluster heterogeneous maps (runs on the logging thread)."""
+            for idx, volume in enumerate(volumes, start=1):
+                ImageHandler().write(volume, os.path.join(out_dir, f"reconsiren_hetmap_{idx:02d}.mrc"),
+                                     overwrite=True)
+
         # Prepare data loader
         data_loader_train, data_loader_val = generator.return_grain_dataset(batch_size=args.batch_size,
                                                                             shuffle="global", num_epochs=None,
@@ -1326,6 +1342,14 @@ def main():
         else:
             resume_epoch = 0
 
+        # Logging cadence + background offload of the host-side logging work.
+        logger = TrainingLogger(image_every=args.log_images_every,
+                                landscape_every=args.log_landscape_every,
+                                checkpoint_every=args.log_checkpoint_every,
+                                steps_per_epoch=steps_per_epoch,
+                                time_budget=args.log_time_budget,
+                                background=not args.log_sync).start()
+
         # Training loop (ReconSIREN)
         training_volume_log = " / volume" if not args.do_not_learn_volume else ""
         print(f"{bcolors.OKCYAN}\n###### Training angular assignment / shifts{training_volume_log} / heterogeneity... ######")
@@ -1349,52 +1373,63 @@ def main():
                     step_validation = 1
                     pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
 
-                    if i > 0 and i % 1 == 0:
+                    if logger.should("images", i):
                         pbar.set_postfix_str(f"{bcolors.WARNING}Generating intermediate results...{bcolors.ENDC}")
 
-                        # Example of predicted data for Tensorboard
-                        reconsiren, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
-                        volume = decode_volume(reconsiren)
-                        middle_slize = int(np.round(0.5 * volume.shape[-1]))
-                        ImageHandler().write(np.array(volume),
-                                             os.path.join(args.output_path, "reconsiren_map_intermediate.mrc"),
-                                             overwrite=True)
-                        slice_xy, slice_xz, slice_yz = (min_max_scale(volume[0, middle_slize, :, :]),
-                                                        min_max_scale(volume[0, :, middle_slize, :]),
-                                                        min_max_scale(volume[0, :, :, middle_slize]))
-                        slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
-                        writer.add_images("Predicted volume (slices)", slices, dataformats="NHWC", global_step=i)
+                        with logger.section():
+                            # Example of predicted data for Tensorboard
+                            reconsiren, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
+                            volume = decode_volume(reconsiren)
+                            middle_slize = int(np.round(0.5 * volume.shape[-1]))
+                            slice_xy, slice_xz, slice_yz = (min_max_scale(volume[0, middle_slize, :, :]),
+                                                            min_max_scale(volume[0, :, middle_slize, :]),
+                                                            min_max_scale(volume[0, :, :, middle_slize]))
+                            slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
+                            volume = np.array(volume)
 
-                        # Plot angular distribution
-                        directions = np.array(reconsiren.memory_bank.get())
-                        x, y, z = directions[:, 0], directions[:, 1], directions[:, 2]
-                        beta = jnp.arccos(jnp.clip(z, -1.0, 1.0))
-                        alpha = jnp.arctan2(y, x)
-                        euler_angles = jnp.stack([alpha, beta], axis=-1)
-                        fig, _ = plot_angular_distribution(euler_angles)
-                        writer.add_figure("Angular distribution density", fig, global_step=i)
+                        logger.submit(write_volume, volume,
+                                      os.path.join(args.output_path, "reconsiren_map_intermediate.mrc"))
+                        logger.submit(writer.add_images, "Predicted volume (slices)", slices,
+                                      dataformats="NHWC", global_step=i)
 
-                        # Predict some heterogeneous volumes
-                        latents = []
-                        graphdef_aux, state_aux = nnx.split(reconsiren)
-                        for _ in range(steps_per_epoch):
-                            (x, labels) = next(iter_data_loader_train)
-                            _, _, latent = predict_angular_assignment_step_reconsiren(graphdef_aux, state_aux, x,
-                                                                                      labels, md_columns, rng)
-                            latents.append(np.array(latent))
-                        latents = np.concatenate(latents, axis=0)
-                        kmeans = KMeans(n_clusters=10).fit(latents)
-                        centers = kmeans.cluster_centers_
-                        idx = 1
-                        for center in centers:
-                            decoded = decode_het_volume(reconsiren, center[None, ...])
-                            ImageHandler().write(np.array(decoded),
-                                                 os.path.join(args.output_path, f"reconsiren_hetmap_{idx:02d}.mrc"),
-                                                 overwrite=True)
-                            idx += 1
+                    if logger.should("landscape", i):
+                        with logger.section():
+                            reconsiren, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
 
-                        # Save checkpoint model
-                        NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "ReconSIREN_CHECKPOINT"), epoch=i)
+                            # Plot angular distribution
+                            directions = np.array(reconsiren.memory_bank.get())
+                            dir_x, dir_y, dir_z = directions[:, 0], directions[:, 1], directions[:, 2]
+                            beta = jnp.arccos(jnp.clip(dir_z, -1.0, 1.0))
+                            alpha = jnp.arctan2(dir_y, dir_x)
+                            euler_angles = jnp.stack([alpha, beta], axis=-1)
+                            fig, _ = plot_angular_distribution(euler_angles)
+                            writer.add_figure("Angular distribution density", fig, global_step=i)
+
+                            # Predict some heterogeneous volumes
+                            n_latent_steps = int(min(steps_per_epoch,
+                                                     np.ceil(LATENTS_FOR_CLUSTERING / args.batch_size)))
+                            latents = []
+                            graphdef_aux, state_aux = nnx.split(reconsiren)
+                            for _ in range(n_latent_steps):
+                                (x_latent, labels_latent) = next(iter_data_loader_train)
+                                _, _, latent = predict_angular_assignment_step_reconsiren(graphdef_aux, state_aux,
+                                                                                          x_latent, labels_latent,
+                                                                                          md_columns, rng)
+                                latents.append(np.array(latent))
+                            latents = np.concatenate(latents, axis=0)
+                            n_clusters = int(min(10, latents.shape[0]))
+                            kmeans = KMeans(n_clusters=n_clusters).fit(latents)
+                            decoded_centers = [np.array(decode_het_volume(reconsiren, center[None, ...]))
+                                               for center in kmeans.cluster_centers_]
+
+                        logger.submit(write_het_volumes, decoded_centers, args.output_path)
+
+                    # Save checkpoint model
+                    if logger.should("checkpoint", i):
+                        with logger.section():
+                            NeuralNetworkCheckpointer.save_intermediate(graphdef, state,
+                                                                        os.path.join(args.output_path, "ReconSIREN_CHECKPOINT"),
+                                                                        epoch=i, wait=False)
 
                     i += 1
 
@@ -1408,18 +1443,21 @@ def main():
                 total_loss += loss
                 total_recon_loss += recon_loss
 
-                # Progress bar update  (TQDM)
-                pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss / step:.5f}")
-
                 # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * steps_per_epoch)) == 0:
+                if logger.should_log_scalars(step):
+                    mean_loss = float(total_loss) / step
+                    mean_recon_loss = float(total_recon_loss) / step
+
                     writer.add_scalar('Training loss (ReconSIREN)',
-                                      total_loss / step,
+                                      mean_loss,
                                       i * steps_per_epoch + step)
 
                     writer.add_scalars('Reconstruction loss (ReconSIREN)',
-                                       {"train": total_recon_loss / step},
+                                       {"train": mean_recon_loss},
                                        i * steps_per_epoch + step)
+
+                    # Progress bar update  (TQDM)
+                    pbar.set_postfix_str(f"loss={mean_loss:.5f} | recon_loss={mean_recon_loss:.5f}")
 
                 # # Summary writer (validation loss)  FIXME: This fails with StopIteration
                 # if step % int(np.ceil(0.5 * steps_per_epoch)) == 0:
@@ -1440,6 +1478,12 @@ def main():
                 step += 1
 
         reconsiren, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
+
+        # Let the background logging thread and the asynchronous checkpoint write finish
+        # before the process moves on -- in particular before the checkpoint folder is
+        # removed below.
+        logger.close()
+        NeuralNetworkCheckpointer.wait_for_pending()
 
         # Save model
         NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "ReconSIREN"))
