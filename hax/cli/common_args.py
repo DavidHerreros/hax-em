@@ -126,7 +126,7 @@ LOG_CHECKPOINT_EVERY_HELP = (
     f"This is deliberately independent from {bcolors.ITALIC}--log_landscape_every{bcolors.ENDC}: how often you can resume should not be tied to how often you want pictures")
 
 LOG_TIME_BUDGET_HELP = (
-    f"Self-tuning guard: the maximum fraction of the total wall clock that may be spent logging (e.g. {bcolors.ITALIC}0.05{bcolors.ENDC} for 5%). When the logging carried out so far "
+    f"Self-tuning guard: the maximum fraction of the total wall clock that may be spent logging (e.g. {bcolors.ITALIC}0.05{bcolors.ENDC} for 5%%). When the logging carried out so far "
     f"exceeds this share of the run, the expensive tiers are skipped until training catches up. This adapts to dataset and box size on its own, which a fixed number of epochs "
     f"cannot do (set by default to 0, i.e. disabled - the cadence flags alone decide)")
 
