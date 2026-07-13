@@ -385,11 +385,9 @@ def main():
       
         model, _, _ = fit_volume(vol, mask=mask, iterations=20000, learning_rate=0.001, n_init=args.num_gaussians, fixed_gaussians=True)
         
-        # Adjust to images
+        # Adjust to images (options are apply mode or wiener mode)
         model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
                                             num_epochs=5, is_global=True, ctf_type="wiener")
-
-        # think applying the wiener filter when adjusting the gray levels
 
         # Save model
         NeuralNetworkCheckpointer.save(model, fit_path)
@@ -480,7 +478,7 @@ def main():
         labels=jnp.concatenate([aligned_labels, misaligned_labels], axis=0)
 
 
-        # === PRINT VALUES RANGE (ONLY FOR THE FIRST BATCH) ===
+        ######## === PRINT VALUES RANGE (ONLY FOR THE FIRST BATCH) === ########
         if total_steps == 0:
             # Extract the first sample of the batch for debugging
             proj_sample = Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles, shifts=shifts, ctf=jnp.ones_like(ctf))[0]
@@ -493,7 +491,7 @@ def main():
             print(f"WIENER IMAGE  -> Min: {jnp.min(wiener_sample):.4f} | Max: {jnp.max(wiener_sample):.4f} | Mean: {jnp.mean(wiener_sample):.4f}")
             print(f"ALIGNED RESIDUAL  -> Min: {jnp.min(aligned_imgs[0]):.4f} | Max: {jnp.max(aligned_imgs[0]):.4f} | Mean: {jnp.mean(aligned_imgs[0]):.4f}")
             print("="*50 + "\n")
-        ##############################################################
+        #########################################################################
         
 
         loss, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs, labels=labels, train=True)
@@ -507,17 +505,17 @@ def main():
         #VALIDATION STEP at the end of each epoch  
         if (total_steps + 1) % steps_per_epoch == 0:    
 
+
+          ####
           t_score_epoch= jnp.concatenate(t_score, axis=0)
           t_labels_epoch = jnp.concatenate(t_labels, axis=0)
 
+          # Roc Curve and Confusion Matrix - Training
           optimal_threshold_t = writer.add_roc_curve(t_labels_epoch, t_score_epoch, global_step=i, tag="ROC Curve - Training step")
-
           t_score_heavy = t_score_epoch > optimal_threshold_t
           writer.add_confusion_matrix(t_labels_epoch, t_score_heavy, global_step=i, tag="Confusion Matrix - Training step")
             
-          ##########################################
 
-         
           # average training loss at the end of each epoch 
           avg_train_loss = total_loss / steps_per_epoch
           pbar.write(f"\n--- End of Training for Epoch {int((total_steps + 1) / steps_per_epoch)} ---")
@@ -526,7 +524,7 @@ def main():
           writer.add_scalars('Training loss (cryocheck)',
                                        {"train": avg_train_loss},
                                        total_steps + 1)
-        
+          ####
 
           total_loss = 0
           total_validation_loss = 0
@@ -572,9 +570,11 @@ def main():
             imgs_validation = jnp.concatenate([aligned_vimgs, misaligned_vimgs],axis=0)
             labels_validation = jnp.concatenate([aligned_vlabels, misaligned_vlabels], axis=0)
 
+
+            ##########################
+            # Debugging: save pure projection aligned and misaligned without ctf
             if _ == 0:
-              ##########################
-              # Debugging: save pure projection aligned and misaligned without ctf
+              
               pure_proj_aligned = jnp.squeeze(Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles, shifts=shifts, ctf=jnp.ones_like(ctf))[0])
               pure_proj_misaligned = jnp.squeeze(Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles_noisy, shifts=shifts, ctf=jnp.ones_like(ctf))[0])
               # wiener_img = jnp.squeeze(wiener2DFilter(x[..., 0], ctf[...])[0])
@@ -595,7 +595,7 @@ def main():
               ImageHandler().write(np.array(img_aligned), os.path.join(args.output_path, "aligned_residual_sample.mrcs"), overwrite=True)
               ImageHandler().write(np.array(img_misaligned), os.path.join(args.output_path, "misaligned_residual_sample.mrcs"), overwrite=True)
 
-              ############################
+            ############################
 
 
             loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels_validation, train=False)
@@ -610,7 +610,7 @@ def main():
 
           cryoCheck.train()
 
-          # Roc Curve and Confusion Matrix 
+          # Roc Curve and Confusion Matrix - Validation
           optimal_threshold = writer.add_roc_curve(val_labels_epoch, val_score_epoch, global_step=i, tag="ROC Curve - Validation step")
           
           # Save optimal threshold value 
@@ -618,10 +618,10 @@ def main():
           with open(threshold_path, "w") as f:
               f.write(str(optimal_threshold))
 
-
           val_score_heavy = val_score_epoch > optimal_threshold
           writer.add_confusion_matrix(val_labels_epoch, val_score_heavy, global_step=i, tag="Confusion Matrix - Validation step")
 
+          # Average validation loss at the end of each epoch
           avg_val_loss = total_validation_loss / steps_per_val
           pbar.write(f"\n--- End of Validation for Epoch {int((total_steps + 1) / steps_per_epoch)} ---")
           pbar.write(f" Loss validation: {avg_val_loss:.4f}")
