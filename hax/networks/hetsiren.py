@@ -1955,7 +1955,7 @@ def main():
 
                         model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr,
                                                             learning_rate=0.01,
-                                                            num_epochs=500, is_global=True, ctf_type=args.ctf_type)
+                                                            num_epochs=5, is_global=True, ctf_type=args.ctf_type)
 
                         # Save volume
                         vol_splatted = np.array(model())
