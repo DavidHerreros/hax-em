@@ -140,8 +140,9 @@ def scenarios(workdir, data):
         args=base + ["--ctf_type", "apply",
                      "--ssd_scratch_folder", out("recon_scratch_cache"),
                      "--output_path", out("recon_scratch")],
-        expect_files=maps("recon_scratch")
-                     + [os.path.join(out("recon_scratch_cache"), "images_mmap_grain")],
+        # The cache lands in <scratch>/images_mmap_grain_<dataset digest>, so the exact folder
+        # name is not known here -- the reuse scenario below is what proves it was written.
+        expect_files=maps("recon_scratch") + [out("recon_scratch_cache")],
         timeout=600))
 
     # 9) the cache is *reused*, not rebuilt: a second run against the same scratch folder must

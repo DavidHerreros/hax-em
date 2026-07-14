@@ -1572,5 +1572,5 @@ def main():
             idx += 1
 
     # If exists, clean MMAP
-    if not args.load_images_to_ram and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):
-        shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap_grain"))
+    # if not args.load_images_to_ram and os.path.isdir(generator.mmap_output_dir):
+    #     shutil.rmtree(generator.mmap_output_dir)
