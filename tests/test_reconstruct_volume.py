@@ -131,6 +131,31 @@ def scenarios(workdir, data):
         expect_files=maps("recon_streaming"),
         timeout=600))
 
+    # 8) SSD scratch: the stack is cached as a float16 array-record copy (the same one the
+    #    network programs build) and streamed from there instead of from the original stack.
+    scn.append(Scenario(
+        name="recon_scratch",
+        description="reconstruct | --ssd_scratch_folder (stream from the cached float16 copy)",
+        program="reconstruct_volume",
+        args=base + ["--ctf_type", "apply",
+                     "--ssd_scratch_folder", out("recon_scratch_cache"),
+                     "--output_path", out("recon_scratch")],
+        expect_files=maps("recon_scratch")
+                     + [os.path.join(out("recon_scratch_cache"), "images_mmap_grain")],
+        timeout=600))
+
+    # 9) the cache is *reused*, not rebuilt: a second run against the same scratch folder must
+    #    find the shards already there. This is the whole point of the flag.
+    scn.append(Scenario(
+        name="recon_scratch_reuse",
+        description="reconstruct | --ssd_scratch_folder reused by a second run (no rebuild)",
+        program="reconstruct_volume",
+        args=base + ["--ctf_type", "apply",
+                     "--ssd_scratch_folder", out("recon_scratch_cache"),
+                     "--output_path", out("recon_scratch_reuse")],
+        expect_files=maps("recon_scratch_reuse"),
+        timeout=600))
+
     return scn
 
 

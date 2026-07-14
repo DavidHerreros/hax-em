@@ -61,8 +61,21 @@ def main():
                              f"pool while the GPU accumulates, so peak RAM tracks this value rather than the number of particles - lower "
                              f"it if you run out of memory, raise it to read fewer, larger chunks.")
     parser.add_argument("--threads", required=False, type=int, default=8,
-                        help="Number of reader threads feeding the GPU with image chunks (set by default to 8)")
+                        help=f"Number of reader threads feeding the GPU with image chunks (set by default to 8). "
+                             f"{bcolors.WARNING}NOTE{bcolors.ENDC}: on a spinning disk (HDD) several threads read different "
+                             f"regions of the stack at once and the head seeks between them, so a lower value (1 or 2) can be "
+                             f"{bcolors.ITALIC}faster{bcolors.ENDC} there than the default.")
     ca.add_output_path(parser)
+    ca.add_ssd_scratch_folder(parser,
+                              help=f"Path to a folder on a fast (SSD/NVMe) disk. The reconstruction has to read every particle "
+                                   f"once, so on a slow disk the read {bcolors.ITALIC}is{bcolors.ENDC} the run: 1M particles at box 320 "
+                                   f"is 410 GB, which an HDD needs roughly an hour to deliver, and the GPU spends that hour idle. "
+                                   f"Given this parameter, the images are cached as a local {bcolors.ITALIC}float16{bcolors.ENDC} copy "
+                                   f"(half the bytes) and streamed from there. {bcolors.WARNING}NOTE{bcolors.ENDC}: building the cache "
+                                   f"still costs one full read of the original stack, so it does not make a single cold run faster - it "
+                                   f"pays off because the copy is {bcolors.UNDERLINE}reused{bcolors.ENDC}, both by later runs and by the "
+                                   f"other hax programs (HetSIREN, Zernike3Deep, MoDART...) pointed at the same scratch folder, which "
+                                   f"build and read exactly the same cache.")
     args = ca.parse_with_config(parser)
 
     os.makedirs(args.output_path, exist_ok=True)
@@ -70,6 +83,15 @@ def main():
     # Prepare metadata
     generator = MetaDataGenerator(args.md)
     md_columns = extract_columns(generator.md)
+
+    # Cache the stack on the fast disk, if one was given. This is the same array-record copy the
+    # network programs build, so pointing them all at one scratch folder pays for it once.
+    scratch_dir = None
+    if args.ssd_scratch_folder is not None:
+        generator.prepare_grain_array_record(mmap_output_dir=args.ssd_scratch_folder, preShuffle=False,
+                                             num_workers=4, precision=np.float16, group_size=1,
+                                             shard_size=10000)
+        scratch_dir = generator.mmap_output_dir
 
     # Reconstruct the consensus volume. Every CTF mode except None means the stored images
     # carry the CTF (precorrect only Wiener-filters them at train time, it does not alter
@@ -80,7 +102,8 @@ def main():
                                           threads=args.threads,
                                           use_ctf=args.ctf_type not in (None, "None"),
                                           denoise=not args.no_denoise,
-                                          calibrate_gray_scale=not args.no_gray_scale_calibration)
+                                          calibrate_gray_scale=not args.no_gray_scale_calibration,
+                                          scratch_dir=scratch_dir)
 
     volume_path = os.path.join(args.output_path, "consensus_reconstruction.mrc")
     ImageHandler().write(np.asarray(volume), volume_path, overwrite=True)

@@ -47,6 +47,7 @@ but *not* for a rotated one (the rotated ``k`` is not integral), which silently 
 every rotated slice while leaving the identity case looking perfect.
 """
 
+import os
 import sys
 from collections import deque
 from functools import partial
@@ -228,7 +229,7 @@ def _project(volume_ft, rotations, shifts, ctf, k_rot, box, f0, f1):
     return jnp.real(jnp.fft.fftshift(jnp.fft.ifft2(jnp.fft.ifftshift(ft, axes=(-2, -1))), axes=(-2, -1)))
 
 
-def _gray_scale(volume, md, columns, sr, box, has_ctf, k_rot, f0, f1, s, a, n_probe=2000,
+def _gray_scale(volume, reader, columns, sr, box, has_ctf, k_rot, f0, f1, s, a, n_probe=2000,
                 batch_size=256):
     """Global scale putting the map's projections on the gray scale of the input images.
 
@@ -242,11 +243,11 @@ def _gray_scale(volume, md, columns, sr, box, has_ctf, k_rot, f0, f1, s, a, n_pr
     the interpolation, and it matters: the reference's projections are compared directly
     against the images during training, where a systematic amplitude error cannot be undone.
     """
-    n = min(int(n_probe), len(md))
+    n = min(int(n_probe), reader.n)
     if n < 8:
         return 1.0
 
-    idx = np.linspace(0, len(md) - 1, n).astype(np.int64)
+    idx = np.linspace(0, reader.n - 1, n).astype(np.int64)
     volume_ft = jnp.asarray(np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(np.asarray(volume)))))
     angles = np.asarray(columns["euler_angles"], np.float32)
     shifts = np.asarray(columns["shifts"], np.float32)
@@ -256,7 +257,7 @@ def _gray_scale(volume, md, columns, sr, box, has_ctf, k_rot, f0, f1, s, a, n_pr
     energy = 0.0
     for start in range(0, n, batch_size):
         chunk = idx[start:start + batch_size]
-        images = np.asarray(md.getMetaDataImage(chunk), np.float32)
+        images = reader.read(chunk)
 
         ang = jnp.asarray(angles[chunk])
         rotations = euler_matrix_batch(ang[:, 0], ang[:, 1], ang[:, 2])
@@ -278,12 +279,63 @@ def _gray_scale(volume, md, columns, sr, box, has_ctf, k_rot, f0, f1, s, a, n_pr
     return cross / energy if energy > 0 else 1.0
 
 
-def _read_chunk(md, start, stop):
-    return np.asarray(md.getMetaDataImage(np.arange(start, stop, dtype=np.int64)), np.float32)
+class _StackReader:
+    """Where the particle images are read from: the original stack, or an SSD cache of it.
+
+    The reconstruction touches every image exactly once, so on a fast disk reading the stack
+    directly is optimal and the cache is pure overhead. On a slow one (an HDD sustains ~150
+    MB/s, and this program has to move ``n * box^2 * 4`` bytes -- 410 GB for 1M particles at
+    box 320) the read *is* the run, and it is worth paying once for a local float16 copy that
+    every later pass, and every other hax program pointed at the same scratch folder, reads
+    instead. That copy is exactly the ``images_mmap_grain`` array-record HetSIREN/MoDART already
+    build, so it is shared rather than duplicated -- whoever runs first pays for it.
+
+    Both back-ends expose the same two operations: read an arbitrary set of rows (for the
+    gray-scale probe) and stream the whole set in order (for the insertion pass).
+    """
+
+    def __init__(self, md, scratch_dir=None):
+        self.md = md
+        self.n = len(md)
+        self.source = None
+        if scratch_dir is not None:
+            from array_record.python.array_record_data_source import ArrayRecordDataSource
+            from glob import glob
+            shards = sorted(glob(os.path.join(scratch_dir, "dataset-*.arrayrecord")))
+            if shards:
+                self.source = ArrayRecordDataSource(
+                    shards, reader_options={"index_storage_option": "in_memory"})
+
+    @property
+    def cached(self):
+        return self.source is not None
+
+    def read(self, idx):
+        """Images for the metadata rows ``idx`` (arbitrary order), as float32."""
+        if self.source is None:
+            return np.asarray(self.md.getMetaDataImage(np.asarray(idx, np.int64)), np.float32)
+        from hax.generators.generator_metadata import parse_and_decompress
+        # __getitems__ (plural) is the batched read; __getitem__ takes a single key.
+        records = self.source.__getitems__([int(i) for i in np.asarray(idx, np.int64)])
+        return np.stack([parse_and_decompress(r)[0][..., 0] for r in records]).astype(np.float32)
+
+    def _read_chunk(self, start, stop):
+        """A contiguous run of rows -- plus the row ids, which the cache carries per record."""
+        idx = np.arange(start, stop, dtype=np.int64)
+        if self.source is None:
+            return idx, np.asarray(self.md.getMetaDataImage(idx), np.float32)
+        from hax.generators.generator_metadata import parse_and_decompress
+        records = self.source.__getitems__([int(i) for i in idx])
+        decoded = [parse_and_decompress(r) for r in records]
+        # The record's own label is the metadata row it came from: trust it rather than the
+        # record position, so a cache written in a shuffled order still lines up with the poses.
+        labels = np.asarray([lab for _, lab in decoded], np.int64)
+        images = np.stack([img[..., 0] for img, _ in decoded]).astype(np.float32)
+        return labels, images
 
 
-def _stream_chunks(md, n, batch_size, threads):
-    """Yield ``(start, images)`` chunks, reading ahead on a thread pool.
+def _stream_chunks(reader, n, batch_size, threads):
+    """Yield ``(labels, images)`` chunks, reading ahead on a thread pool.
 
     The read-ahead is deliberately *bounded*. Submitting every chunk up front and walking the
     resulting list of futures looks equivalent, but a ``Future`` owns its result until it is
@@ -302,22 +354,22 @@ def _stream_chunks(md, n, batch_size, threads):
         def submit_next():
             start = next(starts, None)
             if start is not None:
-                window.append((start, pool.submit(_read_chunk, md, start, min(start + batch_size, n))))
+                window.append(pool.submit(reader._read_chunk, start, min(start + batch_size, n)))
 
         for _ in range(2 * threads):
             submit_next()
 
         while window:
-            start, future = window.popleft()
-            images = future.result()
+            future = window.popleft()
+            labels, images = future.result()
             submit_next()          # refill only now, so the window stays bounded
-            yield start, images
-            del images             # drop the chunk before waiting on the next one
+            yield labels, images
+            del labels, images     # drop the chunk before waiting on the next one
 
 
 def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, threads=8,
                                  use_ctf=True, denoise=True, calibrate_gray_scale=True,
-                                 quiet=False):
+                                 scratch_dir=None, quiet=False):
     """Reconstruct a consensus volume from posed particles in a single streaming pass.
 
     ``md`` is an ``XmippMetaData``; ``columns`` the dict from ``extract_columns`` (it
@@ -331,12 +383,17 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
     is filtered so that shells carrying signal pass untouched and shells that are noise are
     removed.
 
+    ``scratch_dir`` is an ``images_mmap_grain`` folder (see ``_StackReader``): when it holds a
+    cached copy of the stack the images are streamed from there instead of from ``md``, which is
+    what makes this bearable when the particles live on a spinning disk.
+
     Returns the volume; when ``denoise`` it also prints the measured resolution.
     Images are read in chunks on a thread pool while the GPU accumulates, so peak RAM
     tracks ``batch_size`` rather than the particle count.
     """
     n = len(md)
     box = int(md.getMetaDataImage(0).shape[0])
+    reader = _StackReader(md, scratch_dir)
 
     s, a, k_rot, f0, f1 = _slice_geometry(box, sr)
     # Two independent half-sets: same total insertion work, but the FSC between them is what
@@ -356,23 +413,22 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
         print(f"{bcolors.OKCYAN}\n###### Reconstructing consensus volume from {n} posed particles... ######{bcolors.ENDC}")
 
     n_chunks = (n + batch_size - 1) // batch_size
-    for start, images in tqdm(_stream_chunks(md, n, batch_size, threads), total=n_chunks,
-                              file=sys.stdout, ascii=" >=", colour="green", disable=quiet):
-        stop = start + images.shape[0]
-        # One host->device transfer for the whole chunk. The halves are then a *stride* on the
-        # device, not a boolean mask on the host: `images[sel]` would fancy-index a fresh copy
-        # of half the chunk in single-threaded numpy (100+ MB per half at box 320) while the
-        # GPU sits idle, and then transfer each half separately.
+    for labels, images in tqdm(_stream_chunks(reader, n, batch_size, threads), total=n_chunks,
+                               file=sys.stdout, ascii=" >=", colour="green", disable=quiet):
+        # One host->device transfer for the whole chunk. The halves are then selected on the
+        # device: `images[sel]` would fancy-index a fresh copy of half the chunk in
+        # single-threaded numpy (100+ MB per half at box 320) while the GPU sits idle, and then
+        # transfer each half separately.
         images_dev = jnp.asarray(images)
 
         for half in (0, 1):
             # Interleave the halves so both see the same pose and defocus distribution.
-            # Particle `i` belongs to half `i % 2`, so within this chunk the half starts at
-            # `off` and takes every other image.
-            off = (half - start) % 2
-            idx = np.arange(start, stop)[off::2]
-            if idx.size == 0:
+            # Particle `i` belongs to half `i % 2` -- keyed off the metadata row, so the split
+            # is the same one no matter what order the images arrived in.
+            pos = np.flatnonzero(labels % 2 == half)
+            if pos.size == 0:
                 continue
+            idx = labels[pos]
 
             ang = jnp.asarray(angles[idx])
             rotations = euler_matrix_batch(ang[:, 0], ang[:, 1], ang[:, 2])
@@ -392,7 +448,7 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
                 ctf = jnp.ones((idx.shape[0], box, box), jnp.float32)
 
             num[half], den[half] = _insert_slices(
-                num[half], den[half], images_dev[off::2], rotations,
+                num[half], den[half], images_dev[jnp.asarray(pos)], rotations,
                 jnp.asarray(shifts[idx]), ctf, k_rot, box, f0, f1)
 
     # The Friedel mates of every slice, added in one pass rather than during the streaming.
@@ -419,7 +475,7 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
                   f"(Nyquist {2.0 * sr:.1f} A); the map is filtered to that limit.{bcolors.ENDC}")
 
     if calibrate_gray_scale:
-        scale = _gray_scale(volume, md, columns, sr, box, has_ctf, k_rot, f0, f1, s, a)
+        scale = _gray_scale(volume, reader, columns, sr, box, has_ctf, k_rot, f0, f1, s, a)
         volume = volume * scale
         if not quiet:
             print(f"{bcolors.OKGREEN}Gray-scale calibrated to the input images (x{scale:.3f}); "

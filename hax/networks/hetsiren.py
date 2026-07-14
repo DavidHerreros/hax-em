@@ -1876,12 +1876,24 @@ def main():
     # Check if TomoSIREN is needed
     isTomoSIREN = generator.mode == "tomo"
 
-    # Reconstruct a consensus volume if neither --vol nor --mask were provided
-    auto_reference = args.vol is None and args.mask is None
+    # Prepare grain dataset
+    if not args.load_images_to_ram and args.mode in ["train", "predict"]:
+        mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
+        generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4, precision=np.float16, group_size=1, shard_size=10000)
+        scratch_dir = generator.mmap_output_dir
+    else:
+        mmap_output_dir = None
+        scratch_dir = None
+
+    # Reconstruct a consensus volume if neither --vol nor --mask were provided -- but only when
+    # the model is actually going to be built from them
+    auto_reference = (args.vol is None and args.mask is None
+                      and args.reload is None and args.mode == "train")
     if auto_reference:
         os.makedirs(args.output_path, exist_ok=True)
         consensus = reconstruct_consensus_volume(generator.md, md_columns, args.sr,
-                                                 use_ctf=args.ctf_type not in (None, "None"))
+                                                 use_ctf=args.ctf_type not in (None, "None"),
+                                                 scratch_dir=scratch_dir)
         consensus_path = os.path.join(args.output_path, "consensus_reconstruction.mrc")
         ImageHandler().write(consensus, consensus_path, overwrite=True)
         args.vol = consensus_path
@@ -1902,7 +1914,7 @@ def main():
         # Derived from the map reconstructed
         mask = consensus_mask(vol)
         ImageHandler().write(mask, os.path.join(args.output_path, "consensus_mask.mrc"), overwrite=True)
-    elif args.transport_mass:
+    elif args.transport_mass and args.vol is not None:
         mask = ImageHandler(args.vol).generateMask(boxsize=64)
     else:
         volume_size = generator.md.getMetaDataImage(0).shape[0]
@@ -1919,13 +1931,6 @@ def main():
     # Reload network
     if args.reload is not None:
         hetsiren = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "HetSIREN"))
-
-    # Prepare grain dataset
-    if not args.load_images_to_ram and args.mode in ["train", "predict"]:
-        mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
-        generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4, precision=np.float16, group_size=1, shard_size=10000)
-    else:
-        mmap_output_dir = None
 
     # Train network
     if args.mode == "train":
