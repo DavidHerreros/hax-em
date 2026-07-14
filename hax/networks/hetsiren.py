@@ -1876,6 +1876,18 @@ def main():
     # Check if TomoSIREN is needed
     isTomoSIREN = generator.mode == "tomo"
 
+    # Reconstruct a consensus volume if neither --vol nor --mask were provided
+    auto_reference = args.vol is None and args.mask is None
+    if auto_reference:
+        os.makedirs(args.output_path, exist_ok=True)
+        consensus = reconstruct_consensus_volume(generator.md, md_columns, args.sr,
+                                                 use_ctf=args.ctf_type not in (None, "None"))
+        consensus_path = os.path.join(args.output_path, "consensus_reconstruction.mrc")
+        ImageHandler().write(consensus, consensus_path, overwrite=True)
+        args.vol = consensus_path
+        print(f"{bcolors.OKGREEN}Consensus volume reconstructed from the input poses -> {consensus_path}"
+              f"{bcolors.ENDC}")
+
     # Preprocess volume (and mask)
     if args.vol is not None:
         vol = ImageHandler(args.vol).getData()
@@ -1886,12 +1898,15 @@ def main():
 
     if args.mask is not None:
         mask = ImageHandler(args.mask).getData()
+    elif auto_reference:
+        # Derived from the map reconstructed
+        mask = consensus_mask(vol)
+        ImageHandler().write(mask, os.path.join(args.output_path, "consensus_mask.mrc"), overwrite=True)
+    elif args.transport_mass:
+        mask = ImageHandler(args.vol).generateMask(boxsize=64)
     else:
-        if args.transport_mass:
-            mask = ImageHandler(args.vol).generateMask(boxsize=64)
-        else:
-            volume_size = generator.md.getMetaDataImage(0).shape[0]
-            mask = ImageHandler().createCircularMask(boxSize=volume_size, is3D=True)
+        volume_size = generator.md.getMetaDataImage(0).shape[0]
+        mask = ImageHandler().createCircularMask(boxSize=volume_size, is3D=True)
 
     # If exists, clean MMAP
     # if os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):
@@ -1940,7 +1955,8 @@ def main():
         writer.add_text("Projector warning", legend_projector)
 
         if not "hetsiren" in locals():
-            if args.vol is not None:
+            fit_gaussians = args.vol is not None and (transport_mass or not auto_reference)
+            if fit_gaussians:
                 fit_path = os.path.join(args.output_path, "Gaussian_volume_fitting")
                 if not os.path.isdir(os.path.join(fit_path)):
                     # Mask preparation
@@ -1961,7 +1977,7 @@ def main():
                         vol_splatted = np.array(model())
                     else:
                         initial_num_gaussians = 5000 if args.num_gaussians is None else args.num_gaussians
-                        model = fit_gaussian_splat(vol, mask=mask, max_iterations=20_000, convergence_tol=1e-6, learning_rate=1e-4,
+                        model = fit_gaussian_splat(vol, mask=mask_fit, max_iterations=20_000, convergence_tol=1e-6, learning_rate=1e-4,
                                                    noise_std_multiplier=0.1, noise_amp_multiplier=0.1,
                                                    initial_num_gaussians=initial_num_gaussians, initial_sigma=0.5, min_sigma=0.3, quiet=True)
 
@@ -2004,6 +2020,9 @@ def main():
                 coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)
                 if args.vol is None:
                     values = jnp.zeros((inds.shape[0],))
+                    sigma = 1.0
+                elif not fit_gaussians:
+                    values = np.asarray(vol)[inds[:, 0], inds[:, 1], inds[:, 2]]
                     sigma = 1.0
                 else:
                     vol = np.array(model.render(grid_shape=vol.shape))

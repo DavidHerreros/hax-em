@@ -55,6 +55,7 @@ MODULES_DICT = {
     "reconsiren": ("hax.networks.reconsiren", "Ab initio estimation of particle pose, shifts and initial volume with neural networks"),
     "reconsiren_het_only": ("hax.networks.reconsiren_het_only", "Ab initio estimation of particle pose, shifts and initial volume with neural networks"),
     "modart": ("hax.programs.modart", "ART based volume reconstruction with motion correction to motion blurr artifacts"),
+    "reconstruct_volume": ("hax.programs.reconstruct_volume", "Consensus volume reconstruction from posed particles (single pass, with FSC denoising and gray scale calibration)"),
     "update": ("hax.cli.updater", "Check for and apply hax updates (PyPI release, or new commits for a devel/git install)")
 }
 
