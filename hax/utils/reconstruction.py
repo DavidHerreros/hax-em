@@ -76,9 +76,18 @@ def _slice_geometry(box, sr):
             jnp.asarray(f0), jnp.asarray(f1))
 
 
-@partial(jax.jit, static_argnums=(7,))
+@partial(jax.jit, static_argnums=(7,), donate_argnums=(0, 1))
 def _insert_slices(num, den, images, rotations, shifts, ctf, k_rot, box, f0, f1):
-    """Accumulate one batch of CTF-weighted central slices into the 3D transform."""
+    """Accumulate one batch of CTF-weighted central slices into the 3D transform.
+
+    The accumulators are **donated**, so the scatter lands in place. Without that, XLA has to
+    preserve the caller's buffers: every call allocates a fresh ``num`` (262 MB at box 320) and
+    ``den`` (131 MB), copies the running totals in, and frees the old pair afterwards. The copy
+    is wasted bandwidth, but the free is worse -- with preallocation disabled it is a
+    ``cudaFree``, which *synchronizes the device*, so the GPU drains and idles once per batch
+    instead of staying fed. Donation means the caller's ``num``/``den`` are invalid after the
+    call, which is exactly how the streaming loop uses them (it rebinds the result).
+    """
     ft = jnp.fft.fftshift(jnp.fft.fft2(jnp.fft.ifftshift(images, axes=(-2, -1))), axes=(-2, -1))
 
     # Re-centre each particle: the projector places its content at
@@ -330,12 +339,12 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
     box = int(md.getMetaDataImage(0).shape[0])
 
     s, a, k_rot, f0, f1 = _slice_geometry(box, sr)
-    zeros_c = jnp.zeros((box,) * 3, jnp.complex64)
-    zeros_f = jnp.zeros((box,) * 3, jnp.float32)
     # Two independent half-sets: same total insertion work, but the FSC between them is what
-    # tells us how far the data actually goes.
-    num = [zeros_c, zeros_c]
-    den = [zeros_f, zeros_f]
+    # tells us how far the data actually goes. Each half gets its OWN accumulator: sharing one
+    # zeros array between them would be fine without donation and fatal with it (the first
+    # insert would consume the buffer the second half still expects to read).
+    num = [jnp.zeros((box,) * 3, jnp.complex64) for _ in range(2)]
+    den = [jnp.zeros((box,) * 3, jnp.float32) for _ in range(2)]
 
     angles = np.asarray(columns["euler_angles"], np.float32)
     shifts = np.asarray(columns["shifts"], np.float32)
@@ -350,13 +359,20 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
     for start, images in tqdm(_stream_chunks(md, n, batch_size, threads), total=n_chunks,
                               file=sys.stdout, ascii=" >=", colour="green", disable=quiet):
         stop = start + images.shape[0]
+        # One host->device transfer for the whole chunk. The halves are then a *stride* on the
+        # device, not a boolean mask on the host: `images[sel]` would fancy-index a fresh copy
+        # of half the chunk in single-threaded numpy (100+ MB per half at box 320) while the
+        # GPU sits idle, and then transfer each half separately.
+        images_dev = jnp.asarray(images)
 
         for half in (0, 1):
             # Interleave the halves so both see the same pose and defocus distribution.
-            sel = np.arange(start, stop) % 2 == half
-            if not sel.any():
+            # Particle `i` belongs to half `i % 2`, so within this chunk the half starts at
+            # `off` and takes every other image.
+            off = (half - start) % 2
+            idx = np.arange(start, stop)[off::2]
+            if idx.size == 0:
                 continue
-            idx = np.arange(start, stop)[sel]
 
             ang = jnp.asarray(angles[idx])
             rotations = euler_matrix_batch(ang[:, 0], ang[:, 1], ang[:, 2])
@@ -376,7 +392,7 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
                 ctf = jnp.ones((idx.shape[0], box, box), jnp.float32)
 
             num[half], den[half] = _insert_slices(
-                num[half], den[half], jnp.asarray(images[sel]), rotations,
+                num[half], den[half], images_dev[off::2], rotations,
                 jnp.asarray(shifts[idx]), ctf, k_rot, box, f0, f1)
 
     # The Friedel mates of every slice, added in one pass rather than during the streaming.
