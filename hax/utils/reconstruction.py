@@ -48,6 +48,7 @@ every rotated slice while leaving the identity case looking perfect.
 """
 
 import sys
+from collections import deque
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 
@@ -109,10 +110,30 @@ def _insert_slices(num, den, images, rotations, shifts, ctf, k_rot, box, f0, f1)
                     den = den.at[z, y, x].add(weight * w)
         return num, den
 
-    num, den = scatter(num, den, k, data, weight)
-    # Friedel mate F(-k) = conj(F(k)): doubles the coverage and forces a real volume.
-    num, den = scatter(num, den, -k, jnp.conj(data), weight)
-    return num, den
+    # Only the slice itself is scattered here; its Friedel mate is added once at the end of
+    # the pass by ``_hermitian_symmetrize``, which is the same thing for half the atomics.
+    return scatter(num, den, k, data, weight)
+
+
+def _hermitian_symmetrize(num, den):
+    """Add the Friedel mate F(-k) = conj(F(k)) of everything accumulated so far.
+
+    Inserting each slice's mate as it streams by (the obvious way) doubles the scatter work
+    of every single particle, and the scatter is what this reconstruction spends its GPU time
+    on. It is also unnecessary: the trilinear neighbourhood of ``-k`` is the exact mirror of
+    the neighbourhood of ``+k``, with mirrored weights -- for a sample at ``pos = k + c``,
+    ``floor(2c - pos) = 2c - floor(pos) - 1``, so the two corner sets mirror into each other
+    and the interpolation weight ``1 - frac`` mirrors ``frac``. Mirroring the accumulators
+    once at the end therefore reproduces the double insertion exactly, at the cost of one pass
+    over the grid instead of doubling the cost of one pass over the *data*.
+
+    ``roll(flip(A), 1)`` maps voxel ``i`` to its mate ``box - i``. The wrap at ``i = 0`` is
+    not an accident: that plane is Nyquist, which under the DFT's periodicity is its own
+    Friedel mate and must come out real -- and ``A[0] + conj(A[0])`` is exactly what makes it so.
+    """
+    def mirror(a):
+        return jnp.roll(jnp.flip(a, axis=(0, 1, 2)), shift=(1, 1, 1), axis=(0, 1, 2))
+    return num + jnp.conj(mirror(num)), den + mirror(den)
 
 
 def _gridding_correction(box):
@@ -231,8 +252,7 @@ def _gray_scale(volume, md, columns, sr, box, has_ctf, k_rot, f0, f1, s, a, n_pr
         ang = jnp.asarray(angles[chunk])
         rotations = euler_matrix_batch(ang[:, 0], ang[:, 1], ang[:, 2])
         if has_ctf:
-            b = chunk.shape[0]
-            ctf = eval_ctf(jnp.tile(s[None], (b, 1, 1)), jnp.tile(a[None], (b, 1, 1)),
+            ctf = eval_ctf(s[None], a[None],
                            jnp.asarray(np.asarray(columns["ctfDefocusU"])[chunk]),
                            jnp.asarray(np.asarray(columns["ctfDefocusV"])[chunk]),
                            angast=jnp.asarray(np.asarray(columns["ctfDefocusAngle"])[chunk]),
@@ -251,6 +271,39 @@ def _gray_scale(volume, md, columns, sr, box, has_ctf, k_rot, f0, f1, s, a, n_pr
 
 def _read_chunk(md, start, stop):
     return np.asarray(md.getMetaDataImage(np.arange(start, stop, dtype=np.int64)), np.float32)
+
+
+def _stream_chunks(md, n, batch_size, threads):
+    """Yield ``(start, images)`` chunks, reading ahead on a thread pool.
+
+    The read-ahead is deliberately *bounded*. Submitting every chunk up front and walking the
+    resulting list of futures looks equivalent, but a ``Future`` owns its result until it is
+    garbage collected, and the list keeps every future alive for the whole run -- so each
+    chunk that has been read stays resident even after it has been inserted, and peak RAM
+    grows to the size of the entire stack (400+ GB for 1M particles at box 320). There is also
+    no back-pressure: the readers race ahead of the GPU as fast as the disk allows.
+
+    Here at most ``2 * threads`` chunks are ever in flight, and each is dropped as soon as it
+    has been consumed, so peak RAM tracks the window, not the particle count.
+    """
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        starts = iter(range(0, n, batch_size))
+        window = deque()
+
+        def submit_next():
+            start = next(starts, None)
+            if start is not None:
+                window.append((start, pool.submit(_read_chunk, md, start, min(start + batch_size, n))))
+
+        for _ in range(2 * threads):
+            submit_next()
+
+        while window:
+            start, future = window.popleft()
+            images = future.result()
+            submit_next()          # refill only now, so the window stays bounded
+            yield start, images
+            del images             # drop the chunk before waiting on the next one
 
 
 def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, threads=8,
@@ -293,37 +346,42 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
     if not quiet:
         print(f"{bcolors.OKCYAN}\n###### Reconstructing consensus volume from {n} posed particles... ######{bcolors.ENDC}")
 
-    with ThreadPoolExecutor(max_workers=threads) as pool:
-        futures = [(s0, pool.submit(_read_chunk, md, s0, min(s0 + batch_size, n)))
-                   for s0 in range(0, n, batch_size)]
-        for start, future in tqdm(futures, file=sys.stdout, ascii=" >=", colour="green", disable=quiet):
-            images = future.result()
-            stop = start + images.shape[0]
+    n_chunks = (n + batch_size - 1) // batch_size
+    for start, images in tqdm(_stream_chunks(md, n, batch_size, threads), total=n_chunks,
+                              file=sys.stdout, ascii=" >=", colour="green", disable=quiet):
+        stop = start + images.shape[0]
 
-            for half in (0, 1):
-                # Interleave the halves so both see the same pose and defocus distribution.
-                sel = np.arange(start, stop) % 2 == half
-                if not sel.any():
-                    continue
-                idx = np.arange(start, stop)[sel]
+        for half in (0, 1):
+            # Interleave the halves so both see the same pose and defocus distribution.
+            sel = np.arange(start, stop) % 2 == half
+            if not sel.any():
+                continue
+            idx = np.arange(start, stop)[sel]
 
-                ang = jnp.asarray(angles[idx])
-                rotations = euler_matrix_batch(ang[:, 0], ang[:, 1], ang[:, 2])
+            ang = jnp.asarray(angles[idx])
+            rotations = euler_matrix_batch(ang[:, 0], ang[:, 1], ang[:, 2])
 
-                if has_ctf:
-                    b = idx.shape[0]
-                    ctf = eval_ctf(jnp.tile(s[None], (b, 1, 1)), jnp.tile(a[None], (b, 1, 1)),
-                                   jnp.asarray(np.asarray(columns["ctfDefocusU"])[idx]),
-                                   jnp.asarray(np.asarray(columns["ctfDefocusV"])[idx]),
-                                   angast=jnp.asarray(np.asarray(columns["ctfDefocusAngle"])[idx]),
-                                   cs=jnp.asarray(np.asarray(columns["ctfSphericalAberration"])[idx]),
-                                   kv=kv)
-                else:
-                    ctf = jnp.ones((idx.shape[0], box, box), jnp.float32)
+            if has_ctf:
+                # eval_ctf indexes the per-particle parameters as [:, None, None], so the two
+                # frequency grids broadcast from (1, box, box). Tiling them to (b, box, box)
+                # first would materialize two copies per batch -- 840 MB at batch_size=1024,
+                # box=320 -- for values that are identical across the batch.
+                ctf = eval_ctf(s[None], a[None],
+                               jnp.asarray(np.asarray(columns["ctfDefocusU"])[idx]),
+                               jnp.asarray(np.asarray(columns["ctfDefocusV"])[idx]),
+                               angast=jnp.asarray(np.asarray(columns["ctfDefocusAngle"])[idx]),
+                               cs=jnp.asarray(np.asarray(columns["ctfSphericalAberration"])[idx]),
+                               kv=kv)
+            else:
+                ctf = jnp.ones((idx.shape[0], box, box), jnp.float32)
 
-                num[half], den[half] = _insert_slices(
-                    num[half], den[half], jnp.asarray(images[sel]), rotations,
-                    jnp.asarray(shifts[idx]), ctf, k_rot, box, f0, f1)
+            num[half], den[half] = _insert_slices(
+                num[half], den[half], jnp.asarray(images[sel]), rotations,
+                jnp.asarray(shifts[idx]), ctf, k_rot, box, f0, f1)
+
+    # The Friedel mates of every slice, added in one pass rather than during the streaming.
+    num[0], den[0] = _hermitian_symmetrize(num[0], den[0])
+    num[1], den[1] = _hermitian_symmetrize(num[1], den[1])
 
     total_num, total_den = num[0] + num[1], den[0] + den[1]
     volume = _invert(total_num, total_den, tau, box)
