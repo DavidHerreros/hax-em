@@ -19,6 +19,11 @@ from hax.layers import *
 # from hax.pretrained_models import CryoUni, CryoUniNNX, CryoUniHead
 
 
+# How many latents to encode before clustering them into the intermediate
+# heterogeneous volumes
+LATENTS_FOR_CLUSTERING = 2048
+
+
 def wrap_zyz_angles(angles):
     """
     Wraps ZYZ Euler angles to canonical ranges:
@@ -1132,7 +1137,7 @@ def main():
     from contextlib import closing
     from hax.checkpointer import NeuralNetworkCheckpointer
     from hax.generators import MetaDataGenerator, extract_columns
-    from hax.metrics import JaxSummaryWriter
+    from hax.metrics import JaxSummaryWriter, TrainingLogger
     from hax.networks import VolumeAdjustment, train_step_volume_adjustment
     # from hax.schedulers import CosineAnnealingScheduler
     # from hax.programs.gaussian_volume_fitting import get_cosine_reg_strength
@@ -1172,6 +1177,7 @@ def main():
     ca.add_learning_rate(parser)
     ca.add_dataset_split_fraction(parser)
     ca.add_output_path(parser)
+    ca.add_logging_args(parser)
     ca.add_reload(parser,
                   help="Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data).")
     ca.add_ssd_scratch_folder(parser)
@@ -1260,6 +1266,12 @@ def main():
         @nnx.jit
         def decode_het_volume(model, x):
             return model.decode_het_volume(x)
+
+        def write_het_volumes(volumes, out_dir):
+            """Write the per-cluster heterogeneous maps (runs on the logging thread)."""
+            for idx, volume in enumerate(volumes, start=1):
+                ImageHandler().write(volume, os.path.join(out_dir, f"reconsiren_hetmap_{idx:02d}.mrc"),
+                                     overwrite=True)
 
         # Prepare data loader
         data_loader_train, data_loader_val = generator.return_grain_dataset(batch_size=args.batch_size,
@@ -1364,6 +1376,14 @@ def main():
         else:
             resume_epoch = 0
 
+        # Logging cadence + background offload of the host-side logging work.
+        logger = TrainingLogger(image_every=args.log_images_every,
+                                landscape_every=args.log_landscape_every,
+                                checkpoint_every=args.log_checkpoint_every,
+                                steps_per_epoch=steps_per_epoch,
+                                time_budget=args.log_time_budget,
+                                background=not args.log_sync).start()
+
         # Training loop (ReconSIREN)
         training_volume_log = " / volume" if not args.do_not_learn_volume else ""
         print(f"{bcolors.OKCYAN}\n###### Training angular assignment / shifts{training_volume_log} / heterogeneity... ######")
@@ -1388,42 +1408,48 @@ def main():
                     step_validation = 1
                     pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
 
-                    if i > 0 and i % 1 == 0:
+                    if logger.should("landscape", i):
                         pbar.set_postfix_str(f"{bcolors.WARNING}Generating intermediate results...{bcolors.ENDC}")
 
-                        # Example of predicted data for Tensorboard
-                        reconsiren, optimizer_pose, optimizer_het, optimizer_warmup = nnx.merge(graphdef, state)
+                        with logger.section():
+                            # Example of predicted data for Tensorboard
+                            reconsiren, optimizer_pose, optimizer_het, optimizer_warmup = nnx.merge(graphdef, state)
 
-                        # Plot angular distribution
-                        directions = np.array(reconsiren.memory_bank.get())
-                        x, y, z = directions[:, 0], directions[:, 1], directions[:, 2]
-                        beta = jnp.arccos(jnp.clip(z, -1.0, 1.0))
-                        alpha = jnp.arctan2(y, x)
-                        euler_angles = jnp.stack([alpha, beta], axis=-1)
-                        fig, _ = plot_angular_distribution(euler_angles)
-                        writer.add_figure("Angular distribution density", fig, global_step=i)
+                            # Plot angular distribution
+                            directions = np.array(reconsiren.memory_bank.get())
+                            dir_x, dir_y, dir_z = directions[:, 0], directions[:, 1], directions[:, 2]
+                            beta = jnp.arccos(jnp.clip(dir_z, -1.0, 1.0))
+                            alpha = jnp.arctan2(dir_y, dir_x)
+                            euler_angles = jnp.stack([alpha, beta], axis=-1)
+                            fig, _ = plot_angular_distribution(euler_angles)
+                            writer.add_figure("Angular distribution density", fig, global_step=i)
 
-                        # Predict some heterogeneous volumes
-                        latents = []
-                        graphdef_aux, state_aux = nnx.split(reconsiren)
-                        for _ in range(steps_per_epoch):
-                            (x, labels) = next(iter_data_loader_train)
-                            _, _, latent = predict_angular_assignment_step_reconsiren_het_only(graphdef_aux, state_aux, x,
-                                                                                               labels, md_columns, rng)
-                            latents.append(np.array(latent))
-                        latents = np.concatenate(latents, axis=0)
-                        kmeans = KMeans(n_clusters=30).fit(latents)
-                        centers = kmeans.cluster_centers_
-                        idx = 1
-                        for center in centers:
-                            decoded = decode_het_volume(reconsiren, center[None, ...])
-                            ImageHandler().write(np.array(decoded),
-                                                 os.path.join(args.output_path, f"reconsiren_hetmap_{idx:02d}.mrc"),
-                                                 overwrite=True)
-                            idx += 1
+                            # Predict some heterogeneous volumes
+                            n_latent_steps = int(min(steps_per_epoch,
+                                                     np.ceil(LATENTS_FOR_CLUSTERING / args.batch_size)))
+                            latents = []
+                            graphdef_aux, state_aux = nnx.split(reconsiren)
+                            for _ in range(n_latent_steps):
+                                (x_latent, labels_latent) = next(iter_data_loader_train)
+                                _, _, latent = predict_angular_assignment_step_reconsiren_het_only(graphdef_aux, state_aux,
+                                                                                                   x_latent, labels_latent,
+                                                                                                   md_columns, rng)
+                                latents.append(np.array(latent))
+                            latents = np.concatenate(latents, axis=0)
+                            n_clusters = int(min(30, latents.shape[0]))
+                            kmeans = KMeans(n_clusters=n_clusters).fit(latents)
+                            decoded_centers = [np.array(decode_het_volume(reconsiren, center[None, ...]))
+                                               for center in kmeans.cluster_centers_]
 
-                        # Save checkpoint model
-                        NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "ReconSIREN_CHECKPOINT"), epoch=i)
+                        logger.submit(write_het_volumes, decoded_centers, args.output_path)
+
+                    # Save checkpoint model (own cadence: resuming should not be tied to how
+                    # often we want pictures)
+                    if logger.should("checkpoint", i):
+                        with logger.section():
+                            NeuralNetworkCheckpointer.save_intermediate(graphdef, state,
+                                                                        os.path.join(args.output_path, "ReconSIREN_CHECKPOINT"),
+                                                                        epoch=i, wait=False)
 
                     i += 1
 
@@ -1438,18 +1464,21 @@ def main():
                 total_loss += loss
                 total_recon_loss += recon_loss
 
-                # Progress bar update  (TQDM)
-                pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss / step:.5f}")
+                # Summary writer (training loss) + progress bar
+                if logger.should_log_scalars(step):
+                    mean_loss = float(total_loss) / step
+                    mean_recon_loss = float(total_recon_loss) / step
 
-                # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * steps_per_epoch)) == 0:
                     writer.add_scalar('Training loss (ReconSIREN)',
-                                      total_loss / step,
+                                      mean_loss,
                                       i * steps_per_epoch + step)
 
                     writer.add_scalars('Reconstruction loss (ReconSIREN)',
-                                       {"train": total_recon_loss / step},
+                                       {"train": mean_recon_loss},
                                        i * steps_per_epoch + step)
+
+                    # Progress bar update  (TQDM)
+                    pbar.set_postfix_str(f"loss={mean_loss:.5f} | recon_loss={mean_recon_loss:.5f}")
 
                 # Summary writer (validation loss)
                 # if step % int(np.ceil(0.5 * steps_per_epoch)) == 0:
@@ -1470,6 +1499,12 @@ def main():
                 step += 1
 
         reconsiren, optimizer_pose, optimizer_het, optimizer_warmup = nnx.merge(graphdef, state)
+
+        # Let the background logging thread and the asynchronous checkpoint write finish
+        # before the process moves on -- in particular before the checkpoint folder is
+        # removed below.
+        logger.close()
+        NeuralNetworkCheckpointer.wait_for_pending()
 
         # Save model
         NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "ReconSIREN"))
@@ -1537,5 +1572,5 @@ def main():
             idx += 1
 
     # If exists, clean MMAP
-    if not args.load_images_to_ram and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):
-        shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap_grain"))
+    # if not args.load_images_to_ram and os.path.isdir(generator.mmap_output_dir):
+    #     shutil.rmtree(generator.mmap_output_dir)

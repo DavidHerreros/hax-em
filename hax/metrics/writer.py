@@ -15,9 +15,88 @@ from jax.numpy import ndarray as JaxArray
 from hax.utils import min_max_scale, low_pass_3d
 
 
+def _gray_to_color(x):
+    x_flat = x.reshape(-1)
+
+    # Robust normalization to [0, 1]; if x is constant, map to mid (0.5 → white)
+    x_min = jnp.min(x_flat)
+    x_max = jnp.max(x_flat)
+    denom = x_max - x_min
+    t = jnp.where(denom > 0, (x_flat - x_min) / denom, jnp.full_like(x_flat, 0.5))
+
+    # bwr: blue (0,0,1) -> white (1,1,1) over [0,t_limit], then white -> red (1,0,0) over (t_limit,t_max]
+    blue = jnp.array([0.0, 0.0, 1.0])
+    white = jnp.array([1.0, 1.0, 1.0])
+    red = jnp.array([1.0, 0.0, 0.0])
+
+    # Interp weights for each half
+    t_limit = 0.25
+    t_max = 1.0
+    t_lo = jnp.clip(t / t_limit, 0.0, t_max)  # [0,t_limit] segment
+    t_hi = jnp.clip((t - t_limit) / t_limit, 0.0, t_max)  # (t_limit,t_max] segment
+
+    # Colors for each segment
+    color_lo = (1.0 - t_lo[:, None]) * blue + t_lo[:, None] * white
+    color_hi = (1.0 - t_hi[:, None]) * white + t_hi[:, None] * red
+
+    # Piecewise select
+    color = jnp.where((t[:, None] <= t_limit), color_lo, color_hi)
+
+    return color.reshape(x.shape + (3,))
+
+
+@jax.jit
+def prepare_volume_slices(volumes):
+    """Mean/variation central slices, in colour, ready for TensorBoard.
+
+    Must stay at module level: ``jax.jit`` caches on the wrapped function object,
+    so defining it inside the method below would build a fresh one on every call
+    and recompile the whole thing (~0.24 s per epoch) every single time.
+    """
+    # 1) Compute MAD and mean volume
+    volume_mad = volumes.std(axis=0)
+    volume_mean = volumes.mean(axis=0)
+
+    # 2) Filter volumes
+    volume_mad = low_pass_3d(volume_mad, std=1.)
+    volume_mean = low_pass_3d(volume_mean, std=1.)
+
+    # 3) Convert volumes to color
+    volume_mean_color = min_max_scale(volume_mean)[..., None]
+    volume_mad_color = _gray_to_color(min_max_scale(volume_mad))
+
+    # 4) Extract central slices
+    central_slice = int(0.5 * volume_mean.shape[-1])
+    slices_mean = [volume_mean_color[central_slice, :, :, :], volume_mean_color[:, central_slice, :, :], volume_mean_color[:, :, central_slice, :]]  # (Z, Y, X)
+    slices_mad = [volume_mad_color[central_slice, :, :, :], volume_mad_color[:, central_slice, :, :], volume_mad_color[:, :, central_slice, :]]  # (Z, Y, X)
+    return jnp.stack(slices_mean, axis=0), jnp.stack(slices_mad, axis=0)
+
+
+# The colour legends never change, so they are written once per run instead of
+# once per epoch.
+_LEGEND_MEAN = """
+<h3>Consensus volume color legend</h3>
+<ul>
+    <li>Consensus volume predicted by the network — White surface</li>
+</ul>
+"""
+_LEGEND_MAD = """
+<h3>Variation volume color legend</h3>
+<ul>
+    <li>No structural variation — Blue surface</li>
+    <li>Structural variation — White (medium)/Red (maximum) surface</li>
+</ul>
+"""
+
+
 class JaxSummaryWriter(SummaryWriter):
     def __init__(self, log_dir=None, **kwargs):
+        # tensorboardX defaults to flush_secs=120, and nothing in the training loops
+        # calls flush(), so the curves can trail the run by two minutes. 20s keeps a
+        # live run's scalars current without making the writes chatty.
+        kwargs.setdefault("flush_secs", 20)
         super(JaxSummaryWriter, self).__init__(log_dir=os.path.join(log_dir, datetime.now().strftime("%Y%m%d-%H%M%S")), **kwargs)
+        self._volume_legends_written = False
 
     def _to_numpy(self, x):
         # If it’s a JAX array, pull it to host and convert
@@ -30,79 +109,18 @@ class JaxSummaryWriter(SummaryWriter):
         return jax.tree_util.tree_map(self._to_numpy, tree)
 
     def add_volumes_slices(self, volumes):
-        @jax.jit
-        def prepare_slices(volumes):
-            # 0) From gray image to color
-            def gray_to_color(x):
-                x_flat = x.reshape(-1)
-
-                # Robust normalization to [0, 1]; if x is constant, map to mid (0.5 → white)
-                x_min = jnp.min(x_flat)
-                x_max = jnp.max(x_flat)
-                denom = x_max - x_min
-                t = jnp.where(denom > 0, (x_flat - x_min) / denom, jnp.full_like(x_flat, 0.5))
-
-                # bwr: blue (0,0,1) -> white (1,1,1) over [0,t_limit], then white -> red (1,0,0) over (t_limit,t_max]
-                blue = jnp.array([0.0, 0.0, 1.0])
-                white = jnp.array([1.0, 1.0, 1.0])
-                red = jnp.array([1.0, 0.0, 0.0])
-
-                # Interp weights for each half
-                t_limit = 0.25
-                t_max = 1.0
-                t_lo = jnp.clip(t / t_limit, 0.0, t_max)  # [0,t_limit] segment
-                t_hi = jnp.clip((t - t_limit) / t_limit, 0.0, t_max)  # (t_limit,t_max] segment
-
-                # Colors for each segment
-                color_lo = (1.0 - t_lo[:, None]) * blue + t_lo[:, None] * white
-                color_hi = (1.0 - t_hi[:, None]) * white + t_hi[:, None] * red
-
-                # Piecewise select
-                color = jnp.where((t[:, None] <= t_limit), color_lo, color_hi)
-
-                return color.reshape(x.shape + (3,))
-
-            # 1) Compute MAD and mean volume
-            volume_mad = volumes.std(axis=0)
-            volume_mean = volumes.mean(axis=0)
-
-            # 2) Filter volumes
-            volume_mad = low_pass_3d(volume_mad, std=1.)
-            volume_mean = low_pass_3d(volume_mean, std=1.)
-
-            # 3) Convert volumes to color
-            volume_mean_color = min_max_scale(volume_mean)[..., None]
-            volume_mad_color = gray_to_color(min_max_scale(volume_mad))
-
-            # 4) Extract central slices
-            central_slice = int(0.5 * volume_mean.shape[-1])
-            slices_mean = [volume_mean_color[central_slice, :, :, :], volume_mean_color[:, central_slice, :, :], volume_mean_color[:, :, central_slice, :]]  # (Z, Y, X)
-            slices_mad = [volume_mad_color[central_slice, :, :, :], volume_mad_color[:, central_slice, :, :], volume_mad_color[:, :, central_slice, :]]  # (Z, Y, X)
-            return jnp.stack(slices_mean, axis=0), jnp.stack(slices_mad, axis=0)
-
         # 1) Prepare slices from volumes
-        slices_mean, slices_mad = prepare_slices(volumes)
+        slices_mean, slices_mad = prepare_volume_slices(volumes)
 
         # 2) Log images in Tensorboard
         self.add_image("Consensus volume", slices_mean, dataformats="NHWC")
         self.add_image("Variation volume", slices_mad, dataformats="NHWC")
 
         # 3) Add text to explain colors in the visualizations
-        legend_mean = """
-        <h3>Consensus volume color legend</h3>
-        <ul>
-            <li>Consensus volume predicted by the network — White surface</li>
-        </ul>
-        """
-        legend_mad = """
-        <h3>Variation volume color legend</h3>
-        <ul>
-            <li>No structural variation — Blue surface</li>
-            <li>Structural variation — White (medium)/Red (maximum) surface</li>
-        </ul>
-        """
-        self.add_text("Consensus volume color legend", legend_mean)
-        self.add_text("Variation volume color legend", legend_mad)
+        if not self._volume_legends_written:
+            self.add_text("Consensus volume color legend", _LEGEND_MEAN)
+            self.add_text("Variation volume color legend", _LEGEND_MAD)
+            self._volume_legends_written = True
 
     def __getattribute__(self, name):
         # 1) Always let internal/private names through unwrapped:

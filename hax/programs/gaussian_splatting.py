@@ -1106,7 +1106,7 @@ def fit_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256, l
         load_to_ram = True
     data_loader = generator.return_grain_dataset(batch_size=batch_size, shuffle="global",
                                                  num_epochs=None, num_workers=8, num_threads=1, load_to_ram=load_to_ram)
-    steps_per_epoch = int(len(generator.md) / batch_size)
+    steps_per_epoch = max(1, int(len(generator.md) / batch_size))
 
     loss_history = []
 
