@@ -1,6 +1,8 @@
 import os
 import sys
+import json
 import struct
+import hashlib
 from glob import glob
 
 import numpy as np
@@ -402,16 +404,30 @@ class MetaDataGenerator:
         bytes_per_image = max(int(np.prod(box)) * np.dtype(np.float32).itemsize, 1)
         return int(max(1, min(shard_size, budget_bytes // bytes_per_image)))
 
+    def _cache_dir(self, root, prefix, precision):
+        """Name the on-disk image cache after the *dataset* it holds, not just the folder.
+
+        A ``manifest.json`` is written alongside so a cache directory says what it holds.
+        """
+        box = int(self.md.getMetaDataImage(0).shape[0])
+        identity = {"md": os.path.abspath(str(self.file)), "n": int(len(self.md)),
+                    "box": box, "precision": np.dtype(precision).name}
+        digest = hashlib.sha1("|".join(f"{k}={v}" for k, v in identity.items()).encode()).hexdigest()[:10]
+        path = os.path.join(root, f"{prefix}_{digest}")
+        os.makedirs(path, exist_ok=True)
+        manifest = os.path.join(path, "manifest.json")
+        if not os.path.exists(manifest):
+            with open(manifest, "w") as fh:
+                json.dump(identity, fh, indent=2)
+        return path
+
     def prepare_grain_array_record(self, mmap_output_dir=None, preShuffle=False, num_workers=16, precision=np.float16, group_size=1,
                                    shard_size=10000):
         self.grain_dataset_type = "ArrayRecord"
 
         # Prepare folder to save data
-        if mmap_output_dir is None:
-            self.mmap_output_dir = os.path.join(os.path.dirname(self.file), "images_mmap_grain")
-        else:
-            self.mmap_output_dir = os.path.join(mmap_output_dir, "images_mmap_grain")
-        os.makedirs(self.mmap_output_dir, exist_ok=True)
+        root = os.path.dirname(self.file) if mmap_output_dir is None else mmap_output_dir
+        self.mmap_output_dir = self._cache_dir(root, "images_mmap_grain", precision)
 
         # Pre shuffle data before writing
         file_idx = np.arange(len(self.md))
@@ -426,11 +442,8 @@ class MetaDataGenerator:
         self.grain_dataset_type = "MMAP"
 
         # Prepare folder to save data
-        if mmap_output_dir is None:
-            self.mmap_output_dir = os.path.join(os.path.dirname(self.file), "images_mmap")
-        else:
-            self.mmap_output_dir = os.path.join(mmap_output_dir, "images_mmap")
-        os.makedirs(self.mmap_output_dir, exist_ok=True)
+        root = os.path.dirname(self.file) if mmap_output_dir is None else mmap_output_dir
+        self.mmap_output_dir = self._cache_dir(root, "images_mmap", precision)
 
         # Pre shuffle data before writing
         images_order = np.arange(len(self.md))

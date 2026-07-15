@@ -13,6 +13,20 @@ from hax.utils import bcolors
 
 class NeuralNetworkCheckpointer:
 
+    # ``ocp.StandardCheckpointer`` is an ``AsyncCheckpointer``: ``save`` copies the
+    # state to host and then writes in the background. ``save_intermediate`` can
+    # therefore hand the disk write back to orbax and return, as long as the write
+    # has landed before the next one erases the directory (and before the process
+    # exits) -- that is what this pending handle is for.
+    _pending = None
+
+    @classmethod
+    def wait_for_pending(cls):
+        """Block until an in-flight ``save_intermediate(wait=False)`` has landed."""
+        if cls._pending is not None:
+            cls._pending.wait_until_finished()
+            cls._pending = None
+
     @classmethod
     def save(cls, model, checkpoint_path):
         os.makedirs(checkpoint_path, exist_ok=True)
@@ -54,7 +68,18 @@ class NeuralNetworkCheckpointer:
         return model
 
     @classmethod
-    def save_intermediate(cls, graphdef, state, checkpoint_path, epoch=None, ema_params=None):
+    def save_intermediate(cls, graphdef, state, checkpoint_path, epoch=None, ema_params=None, wait=True):
+        """Persist state (+ optimizer/EMA) so training can resume.
+
+        ``wait=False`` returns as soon as the state has been copied to host and lets
+        orbax write to disk in the background, so the next epoch does not sit behind
+        the I/O. The write is joined by the next ``save_intermediate`` (before it
+        erases the directory) and by ``wait_for_pending``, which callers must invoke
+        before the process exits.
+        """
+        # A previous async save must have landed before we erase the directory.
+        cls.wait_for_pending()
+
         os.makedirs(checkpoint_path, exist_ok=True)
 
         checkpoint_path = ocp.test_utils.erase_and_create_empty(os.path.abspath(os.path.join(checkpoint_path, 'checkpoints')))
@@ -76,7 +101,11 @@ class NeuralNetworkCheckpointer:
         # 'checkpoints' folder; absent for non-EMA runs, which stay fully legacy.
         if ema_params is not None:
             checkpointer.save(checkpoint_path / 'ema', ema_params)
-        checkpointer.wait_until_finished()
+
+        if wait:
+            checkpointer.wait_until_finished()
+        else:
+            cls._pending = checkpointer
 
     @classmethod
     def load_ema(cls, checkpoint_path, template):

@@ -1677,7 +1677,7 @@ def main():
     from hax.checkpointer import NeuralNetworkCheckpointer
     from hax.generators import MetaDataGenerator, extract_columns, NumpyGenerator
     from hax.networks import train_step_hetsiren
-    from hax.metrics import JaxSummaryWriter
+    from hax.metrics import JaxSummaryWriter, TrainingLogger
     from hax.programs import fit_gaussian_splat, fit_weights_to_images, fit_volume, adjust_weights_to_images
     from hax.schedulers import CosineAnnealingScheduler
 
@@ -1722,6 +1722,7 @@ def main():
     ca.add_learning_rate(parser)
     ca.add_dataset_split_fraction(parser)
     ca.add_output_path(parser)
+    ca.add_logging_args(parser)
     ca.add_reload(parser,
                   help=f"Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data - "
                        f"{bcolors.WARNING}NOTE{bcolors.ENDC}: If a reference volume was provided, HetSIREN also learns a gray level adjustment. In this case, "
@@ -1875,6 +1876,30 @@ def main():
     # Check if TomoSIREN is needed
     isTomoSIREN = generator.mode == "tomo"
 
+    # Prepare grain dataset
+    if not args.load_images_to_ram and args.mode in ["train", "predict"]:
+        mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
+        generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4, precision=np.float16, group_size=1, shard_size=10000)
+        scratch_dir = generator.mmap_output_dir
+    else:
+        mmap_output_dir = None
+        scratch_dir = None
+
+    # Reconstruct a consensus volume if neither --vol nor --mask were provided -- but only when
+    # the model is actually going to be built from them
+    auto_reference = (args.vol is None and args.mask is None
+                      and args.reload is None and args.mode == "train")
+    if auto_reference:
+        os.makedirs(args.output_path, exist_ok=True)
+        consensus = reconstruct_consensus_volume(generator.md, md_columns, args.sr,
+                                                 use_ctf=args.ctf_type not in (None, "None"),
+                                                 scratch_dir=scratch_dir)
+        consensus_path = os.path.join(args.output_path, "consensus_reconstruction.mrc")
+        ImageHandler().write(consensus, consensus_path, overwrite=True)
+        args.vol = consensus_path
+        print(f"{bcolors.OKGREEN}Consensus volume reconstructed from the input poses -> {consensus_path}"
+              f"{bcolors.ENDC}")
+
     # Preprocess volume (and mask)
     if args.vol is not None:
         vol = ImageHandler(args.vol).getData()
@@ -1885,12 +1910,15 @@ def main():
 
     if args.mask is not None:
         mask = ImageHandler(args.mask).getData()
+    elif auto_reference:
+        # Derived from the map reconstructed
+        mask = consensus_mask(vol)
+        ImageHandler().write(mask, os.path.join(args.output_path, "consensus_mask.mrc"), overwrite=True)
+    elif args.transport_mass and args.vol is not None:
+        mask = ImageHandler(args.vol).generateMask(boxsize=64)
     else:
-        if args.transport_mass:
-            mask = ImageHandler(args.vol).generateMask(boxsize=64)
-        else:
-            volume_size = generator.md.getMetaDataImage(0).shape[0]
-            mask = ImageHandler().createCircularMask(boxSize=volume_size, is3D=True)
+        volume_size = generator.md.getMetaDataImage(0).shape[0]
+        mask = ImageHandler().createCircularMask(boxSize=volume_size, is3D=True)
 
     # If exists, clean MMAP
     # if os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):
@@ -1903,13 +1931,6 @@ def main():
     # Reload network
     if args.reload is not None:
         hetsiren = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "HetSIREN"))
-
-    # Prepare grain dataset
-    if not args.load_images_to_ram and args.mode in ["train", "predict"]:
-        mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
-        generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4, precision=np.float16, group_size=1, shard_size=10000)
-    else:
-        mmap_output_dir = None
 
     # Train network
     if args.mode == "train":
@@ -1939,7 +1960,8 @@ def main():
         writer.add_text("Projector warning", legend_projector)
 
         if not "hetsiren" in locals():
-            if args.vol is not None:
+            fit_gaussians = args.vol is not None and (transport_mass or not auto_reference)
+            if fit_gaussians:
                 fit_path = os.path.join(args.output_path, "Gaussian_volume_fitting")
                 if not os.path.isdir(os.path.join(fit_path)):
                     # Mask preparation
@@ -1960,7 +1982,7 @@ def main():
                         vol_splatted = np.array(model())
                     else:
                         initial_num_gaussians = 5000 if args.num_gaussians is None else args.num_gaussians
-                        model = fit_gaussian_splat(vol, mask=mask, max_iterations=20_000, convergence_tol=1e-6, learning_rate=1e-4,
+                        model = fit_gaussian_splat(vol, mask=mask_fit, max_iterations=20_000, convergence_tol=1e-6, learning_rate=1e-4,
                                                    noise_std_multiplier=0.1, noise_amp_multiplier=0.1,
                                                    initial_num_gaussians=initial_num_gaussians, initial_sigma=0.5, min_sigma=0.3, quiet=True)
 
@@ -2003,6 +2025,9 @@ def main():
                 coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)
                 if args.vol is None:
                     values = jnp.zeros((inds.shape[0],))
+                    sigma = 1.0
+                elif not fit_gaussians:
+                    values = np.asarray(vol)[inds[:, 0], inds[:, 1], inds[:, 2]]
                     sigma = 1.0
                 else:
                     vol = np.array(model.render(grid_shape=vol.shape))
@@ -2166,6 +2191,20 @@ def main():
 
         image_resize = jax.jit(jax.image.resize, static_argnames=("shape", "method"))
 
+        def write_intermediate_volumes(volumes, out_dir, prefix):
+            """Write the per-cluster intermediate volumes (runs on the logging thread)."""
+            os.makedirs(out_dir, exist_ok=True)
+            for idx, volume in enumerate(volumes, start=1):
+                ImageHandler().write(volume, os.path.join(out_dir, f"{prefix}_{idx:02d}.mrc"), overwrite=True)
+
+        # Logging cadence + background offload of the host-side logging work.
+        logger = TrainingLogger(image_every=args.log_images_every,
+                                landscape_every=args.log_landscape_every,
+                                checkpoint_every=args.log_checkpoint_every,
+                                steps_per_epoch=steps_per_epoch,
+                                time_budget=args.log_time_budget,
+                                background=not args.log_sync).start()
+
         # Training loop (HetSIREN)
         iter_data_loader_train = iter(data_loader_train)
 
@@ -2208,80 +2247,77 @@ def main():
                     step_validation = 1
                     pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
 
-                    # Log intermediate results at the begining of the epoch
-                    # Get first 5 images from batch
-                    if hetsiren.isTomoSIREN:
-                        x_for_tb = x[0][:5]
-                    else:
-                        x_for_tb = x[:5]
-                    labels_for_tb = labels[:5]
+                    # Log intermediate results at the begining of the epoch.
+                    if logger.should("images", i):
+                        with logger.section():
+                            # Get first 5 images from batch
+                            if hetsiren.isTomoSIREN:
+                                x_for_tb = x[0][:5]
+                            else:
+                                x_for_tb = x[:5]
+                            labels_for_tb = labels[:5]
 
-                    # Decode some images and show them in Tensorboard
-                    x_pred_intermediate, latents_intermediate = hetsiren_decode_image(graphdef, state, x_for_tb,
-                                                                                      labels_for_tb, md_columns,
-                                                                                      ctf_type=args.ctf_type,
-                                                                                      return_latent=True,
-                                                                                      corrupt_projection_with_ctf=True)
-                    x_pred_intermediate = jax.vmap(min_max_scale)(x_pred_intermediate[..., None])
-                    writer.add_images("Predicted images batch", x_pred_intermediate, dataformats="NHWC")
+                            # Decode some images and some states
+                            x_pred_intermediate, latents_intermediate = hetsiren_decode_image(graphdef, state, x_for_tb,
+                                                                                              labels_for_tb, md_columns,
+                                                                                              ctf_type=args.ctf_type,
+                                                                                              return_latent=True,
+                                                                                              corrupt_projection_with_ctf=True)
+                            x_pred_intermediate = jax.vmap(min_max_scale)(x_pred_intermediate[..., None])
+                            volumes_intermediate = hetsiren_decode_volume(graphdef, state, latents_intermediate)
 
-                    # Decode some states and show them in Tensorboard
-                    volumes_intermediate = hetsiren_decode_volume(graphdef, state, latents_intermediate)
-                    writer.add_volumes_slices(volumes_intermediate)
+                        logger.submit(writer.add_images, "Predicted images batch", x_pred_intermediate,
+                                      dataformats="NHWC")
+                        logger.submit(writer.add_volumes_slices, volumes_intermediate)
 
-                    if i > 0 and i % 5 == 0:
-                        # Predict some heterogeneous volumes
-                        latents = []
-                        for _ in range(steps_per_epoch):
-                            (x, labels) = next(iter_data_loader_train)
-                            latent = predict_latent(graphdef, state, x)
-                            latents.append(np.array(latent))
-                        latents = np.concatenate(latents, axis=0)
-                        kmeans = KMeans(n_clusters=20).fit(latents)
-                        centers = kmeans.cluster_centers_
-                        idx = 1
-                        for center in centers:
-                            decoded = hetsiren_decode_volume(graphdef, state, center[None, ...])
-                            ImageHandler().write(np.array(decoded),
-                                                 os.path.join(args.output_path, "Intermediate_volumes", f"hetsiren_{idx:02d}.mrc"),
-                                                 overwrite=True)
-                            idx += 1
+                    if logger.should("landscape", i):
+                        with logger.section():
+                            choice_key_use, choice_key = jax.random.split(choice_key, 2)
+                            hetsiren_intermediate, _ = nnx.merge(graphdef, state)
+                            latents_intermediate = sample_bank(hetsiren_intermediate.memory_bank.get(),
+                                                               choice_key_use,
+                                                               hetsiren_intermediate.subset_size,
+                                                               n_valid=total_steps * args.batch_size)
 
-                    # Log landscape stored in memory bank
-                    if i > 0 and i % 5 == 0:
-                        choice_key_use, choice_key = jax.random.split(rng, 2)
-                        hetsiren_intermediate, _ = nnx.merge(graphdef, state)
-                        random_indices = jnr.choice(choice_key_use,
-                                                    a=jnp.arange(hetsiren_intermediate.bank_size),
-                                                    shape=(hetsiren_intermediate.subset_size,), replace=False)
-                        latents_intermediate = hetsiren_intermediate.memory_bank.get()[random_indices]
-                        latents_data_loader = NumpyGenerator(latents_intermediate).return_grain_dataset(
-                            preShuffle=False, shuffle=False, batch_size=args.batch_size,
-                            num_epochs=1, num_workers=0)
-                        latents_images = []
-                        for (latents, _) in latents_data_loader:
-                            random_labels = jnp.asarray(
-                                np.random.randint(low=0, high=len(generator.md), size=(latents.shape[0],)),
-                                dtype=jnp.int32)
-                            x_pred_intermediate = hetsiren_decode_image(graphdef, state, latents, random_labels,
-                                                                        md_columns, ctf_type=None, return_latent=False,
-                                                                        corrupt_projection_with_ctf=False)
-                            x_pred_intermediate = \
-                            image_resize(x_pred_intermediate[..., None], (latents.shape[0], 128, 128, 1),
-                                         method="bilinear")[..., 0]
-                            latents_images.append(np.asarray(x_pred_intermediate))
-                        latents_images = np.concatenate(latents_images, axis=0)
-                        latent_images_min = latents_images.min(axis=(1, 2), keepdims=True)
-                        latent_images_max = latents_images.max(axis=(1, 2), keepdims=True)
-                        latents_images = (latents_images - latent_images_min) / (latent_images_max - latent_images_min)
-                        writer.add_embedding(latents_intermediate, label_img=latents_images[:, None, ...],
-                                             tag="HetSIREN latent space", global_step=i)
+                            # Predict some heterogeneous volumes (one per cluster centre)
+                            n_clusters = int(min(20, latents_intermediate.shape[0]))
+                            kmeans = KMeans(n_clusters=n_clusters).fit(np.asarray(latents_intermediate))
+                            decoded_centers = [np.array(hetsiren_decode_volume(graphdef, state, center[None, ...]))
+                                               for center in kmeans.cluster_centers_]
 
-                        # Save checkpoint model (+ EMA buffer when enabled, so a
-                        # resume restores the average exactly).
-                        NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path,
-                                                                                                  "HetSIREN_CHECKPOINT"),
-                                                                    epoch=i, ema_params=ema_params)
+                            # Sprite images for the Tensorboard projector
+                            latents_images = []
+                            for start in range(0, latents_intermediate.shape[0], args.batch_size):
+                                latents = latents_intermediate[start:start + args.batch_size]
+                                random_labels = jnp.asarray(
+                                    np.random.randint(low=0, high=len(generator.md), size=(latents.shape[0],)),
+                                    dtype=jnp.int32)
+                                x_pred_intermediate = hetsiren_decode_image(graphdef, state, latents, random_labels,
+                                                                            md_columns, ctf_type=None, return_latent=False,
+                                                                            corrupt_projection_with_ctf=False)
+                                x_pred_intermediate = \
+                                image_resize(x_pred_intermediate[..., None], (latents.shape[0], 128, 128, 1),
+                                             method="bilinear")[..., 0]
+                                latents_images.append(np.asarray(x_pred_intermediate))
+                            latents_images = np.concatenate(latents_images, axis=0)
+                            latent_images_min = latents_images.min(axis=(1, 2), keepdims=True)
+                            latent_images_max = latents_images.max(axis=(1, 2), keepdims=True)
+                            latents_images = (latents_images - latent_images_min) / (latent_images_max - latent_images_min)
+                            latents_intermediate = np.asarray(latents_intermediate)
+
+                        logger.submit(write_intermediate_volumes, decoded_centers,
+                                      os.path.join(args.output_path, "Intermediate_volumes"), "hetsiren")
+                        logger.submit(writer.add_embedding, latents_intermediate,
+                                      label_img=latents_images[:, None, ...],
+                                      tag="HetSIREN latent space", global_step=i)
+
+                    # Save checkpoint model (+ EMA buffer when enabled, so a
+                    # resume restores the average exactly).
+                    if logger.should("checkpoint", i):
+                        with logger.section():
+                            NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path,
+                                                                                                      "HetSIREN_CHECKPOINT"),
+                                                                        epoch=i, ema_params=ema_params, wait=False)
 
                     i += 1
 
@@ -2349,15 +2385,24 @@ def main():
                 if ema_params is not None:
                     ema_params = ema_update(graphdef, state, ema_params)
 
-                # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * steps_per_epoch)) == 0:
+                # Summary writer (training loss) + progress bar.
+                if logger.should_log_scalars(step):
+                    mean_loss = float(total_loss) / step
+                    mean_recon_loss = float(total_recon_loss) / step
+
                     writer.add_scalar('Training loss (HetSIREN)',
-                                      total_loss / step,
+                                      mean_loss,
                                       i * steps_per_epoch + step)
 
                     writer.add_scalars('Reconstruction loss (HetSIREN)',
-                                       {"train": total_recon_loss / step},
+                                       {"train": mean_recon_loss},
                                         i * steps_per_epoch + step)
+
+                    # Progress bar update  (TQDM)
+                    if args.transport_mass:
+                        pbar.set_postfix_str(f"loss={mean_loss:.5f} | recon_loss={mean_recon_loss:.5f} | graph_lambda={graph_lambda:.5f}")
+                    else:
+                        pbar.set_postfix_str(f"loss={mean_loss:.5f} | recon_loss={mean_recon_loss:.5f}")
 
                 # # Summary writer (validation loss)
                 # if step % int(np.ceil(0.9 * steps_per_epoch)) == 0:
@@ -2370,12 +2415,6 @@ def main():
                 #     writer.add_scalars('Reconstruction loss (HetSIREN)',
                 #                        {"validation": total_validation_loss / step_validation},
                 #                        i * steps_per_epoch + step)
-
-                # Progress bar update  (TQDM)
-                if args.transport_mass:
-                    pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss / step:.5f} | graph_lambda={graph_lambda:.5f}")
-                else:
-                    pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss / step:.5f}")
 
                 step += 1
 
@@ -2410,11 +2449,12 @@ def main():
                     step_validation = 1
                     pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
 
-
                     # Save checkpoint model
-                    NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path,
-                                                                                              "HetSIREN_CHECKPOINT"),
-                                                                epoch=i)
+                    if logger.should("checkpoint", i):
+                        with logger.section():
+                            NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path,
+                                                                                                      "HetSIREN_CHECKPOINT"),
+                                                                        epoch=i, wait=False)
 
                     i += 1
 
@@ -2422,16 +2462,14 @@ def main():
                 total_loss += loss
 
                 # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * steps_per_epoch)) == 0:
+                if logger.should_log_scalars(step):
+                    mean_loss = float(total_loss) / step
                     writer.add_scalar('Inverse training loss (HetSIREN)',
-                                      total_loss / step,
+                                      mean_loss,
                                       i * steps_per_epoch + step)
 
-                # Progress bar update  (TQDM)
-                if args.transport_mass:
-                    pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
-                else:
-                    pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
+                    # Progress bar update  (TQDM)
+                    pbar.set_postfix_str(f"loss={mean_loss:.5f}")
 
                 step += 1
 
@@ -2441,6 +2479,11 @@ def main():
         x_pred_example = hetsiren_decode_image(graphdef, state, x_example, labels_example, md_columns, ctf_type=args.ctf_type, return_latent=False, corrupt_projection_with_ctf=True)
         x_pred_example = jax.vmap(min_max_scale)(x_pred_example[..., None])
         writer.add_images("Predicted images batch", x_pred_example, dataformats="NHWC")
+
+        # Let the background logging thread and the asynchronous checkpoint write finish
+        # before the process moves on.
+        logger.close()
+        NeuralNetworkCheckpointer.wait_for_pending()
 
         # Save model
         NeuralNetworkCheckpointer.save(hetsiren, os.path.join(args.output_path, "HetSIREN"))
