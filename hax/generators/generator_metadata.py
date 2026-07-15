@@ -5,8 +5,8 @@ from glob import glob
 
 import numpy as np
 import random
-from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
-from multiprocessing import get_context
+import threading
+from concurrent.futures import as_completed, ThreadPoolExecutor
 from tqdm import tqdm
 from jax import numpy as jnp
 from jax.tree_util import tree_map
@@ -14,49 +14,47 @@ from xmipp_metadata.metadata import XmippMetaData
 from hax.utils.loggers import bcolors
 
 
-def _write_one_shard_array_record(path, image_indices, getImage_fn, dtype=np.float16):
+def _write_one_shard_array_record(path, image_indices, getImage_fn, dtype=np.float16,
+                                  group_size=1, chunk_size=1024, on_written=None):
     """
     Worker: loads images for a shard and writes a single ArrayRecord file.
+
+    The shard is streamed in chunks instead of being materialised whole, so peak memory
+    tracks ``chunk_size`` rather than the shard size, and the reads of one chunk overlap
+    the writes of the previous one.
     """
     from array_record.python.array_record_module import ArrayRecordWriter
 
-    # Load images for this shard
-    imgs = getImage_fn(image_indices)
-    imgs = np.ascontiguousarray(imgs.astype(dtype, copy=False))
-
-    # Precompute dtype bytes once per shard
-    dtype_str = imgs.dtype.str.encode("utf-8")
     label_struct = struct.Struct("<I")  # unsigned int label prefix
+    writer = ArrayRecordWriter(path, f"group_size:{group_size},uncompressed")
 
-    # If all images share shape (typical), precompute header too
-    first_shape = imgs[0].shape
-    same_shape = True
-    for k in range(1, len(imgs)):
-        if imgs[k].shape != first_shape:
-            same_shape = False
-            break
-
-    if same_shape:
-        shape = first_shape
-        header = struct.pack(
-            f"<I{len(dtype_str)}sI{len(shape)}I",
-            len(dtype_str), dtype_str, len(shape), *shape
-        )
-
-    writer = ArrayRecordWriter(path, "group_size:1,uncompressed")
+    header, header_shape = None, None
     try:
-        for img, label in zip(imgs, image_indices):
-            raw = img.tobytes()
+        for start in range(0, len(image_indices), chunk_size):
+            idxs = image_indices[start:start + chunk_size]
 
-            if not same_shape:
-                shape = img.shape
-                header = struct.pack(
-                    f"<I{len(dtype_str)}sI{len(shape)}I",
-                    len(dtype_str), dtype_str, len(shape), *shape
-                )
+            # dtype= casts the images as they are read, so the full precision batch is
+            # never materialised alongside the converted one
+            imgs = np.ascontiguousarray(getImage_fn(idxs, dtype=dtype))
+            if imgs.ndim == 2:  # a chunk holding a single image comes back squeezed
+                imgs = imgs[None, ...]
 
-            record_bytes = label_struct.pack(int(label)) + header + raw
-            writer.write(record_bytes)
+            dtype_str = imgs.dtype.str.encode("utf-8")
+
+            for img, label in zip(imgs, idxs):
+                # Images in a stack share a shape, so the header is only rebuilt if one
+                # actually differs
+                if img.shape != header_shape:
+                    header_shape = img.shape
+                    header = struct.pack(
+                        f"<I{len(dtype_str)}sI{len(header_shape)}I",
+                        len(dtype_str), dtype_str, len(header_shape), *header_shape
+                    )
+
+                writer.write(label_struct.pack(int(label)) + header + img.tobytes())
+
+            if on_written is not None:
+                on_written(len(idxs))
     finally:
         writer.close()
 
@@ -109,7 +107,7 @@ def _write_one_shard_mmap(path, image_indices, getImage_fn, dtype=np.float16):
 
     def getImage_dtype():
         for idx in image_indices:
-            yield getImage_fn(idx).astype(dtype)
+            yield getImage_fn(idx, dtype=dtype)
 
     np_ninja.from_generator(
         out_dir=path,
@@ -183,32 +181,12 @@ class MetaDataGenerator:
                 # Single file.
                 shard_name = "dataset-00000.arrayrecord"
                 path = os.path.join(mmap_output_dir, shard_name)
-                from array_record.python.array_record_module import ArrayRecordWriter
-                import struct
 
-                writer = ArrayRecordWriter(path, f"group_size:{group_size},uncompressed")
-                try:
-                    label_struct = struct.Struct("<I")
-                    with tqdm(total=len(images_order), file=sys.stdout, ascii=" >=", colour="green") as pbar:
-                        for i in range(0, len(images_order), batch_reading_size):
-                            idxs = images_order[i:i + batch_reading_size]
-                            imgs = self.md.getMetaDataImage(idxs)
-                            imgs = np.ascontiguousarray(imgs.astype(precision, copy=False))
+                chunk_size = min(batch_reading_size, self._read_chunk_size(len(images_order)))
 
-                            dtype_str = imgs.dtype.str.encode("utf-8")
-                            # assume same shape in batch; recompute header per batch
-                            shape = imgs[0].shape
-                            header = struct.pack(
-                                f"<I{len(dtype_str)}sI{len(shape)}I",
-                                len(dtype_str), dtype_str, len(shape), *shape
-                            )
-
-                            for img, label in zip(imgs, idxs):
-                                record_bytes = label_struct.pack(int(label)) + header + img.tobytes()
-                                writer.write(record_bytes)
-                                pbar.update(1)
-                finally:
-                    writer.close()
+                with tqdm(total=len(images_order), file=sys.stdout, ascii=" >=", colour="green") as pbar:
+                    _write_one_shard_array_record(path, images_order, self.md.getMetaDataImage,
+                                                  precision, group_size, chunk_size, pbar.update)
 
             else:
                 # Multiple files: write shards in parallel
@@ -227,18 +205,30 @@ class MetaDataGenerator:
                     shards.append((path, idxs))
                     shard_idx += 1
 
-                # Submit processes
+                chunk_size = self._read_chunk_size(shard_size)
+
+                # Threads, not processes: the shard writer spends nearly all of its time
+                # inside mrcfile, numpy and the ArrayRecord C++ writer, which all release
+                # the GIL. A process pool would instead re-import this module -- and so
+                # the whole of JAX -- in every worker, which costs seconds per worker and
+                # dwarfs the work itself.
+                lock = threading.Lock()
                 with tqdm(total=n, file=sys.stdout, ascii=" >=", colour="green") as pbar:
-                    with ProcessPoolExecutor(max_workers=num_workers, mp_context=get_context('forkserver')) as ex:
+
+                    def on_written(written):
+                        with lock:
+                            pbar.update(written)
+
+                    with ThreadPoolExecutor(max_workers=num_workers) as ex:
                         futures = [
-                            ex.submit(_write_one_shard_array_record, path, idxs, self.md.getMetaDataImage)
+                            ex.submit(_write_one_shard_array_record, path, idxs,
+                                      self.md.getMetaDataImage, precision, group_size,
+                                      chunk_size, on_written)
                             for (path, idxs) in shards
                         ]
 
-                        # Update progress by shard completion (exact per-record progress would require IPC)
-                        for fut, (_, idxs) in zip(as_completed(futures), shards):
+                        for fut in as_completed(futures):
                             fut.result()  # raise if any error
-                            pbar.update(len(idxs))
 
     def load_images_to_mmap(self, mmap_output_dir=None, images_order=None, shard_size=10000, num_workers=None,
                             precision=np.float16, multiple_files=True):
@@ -266,18 +256,20 @@ class MetaDataGenerator:
                     shards.append((path, idxs))
                     shard_idx += 1
 
-                # Submit processes
+                # Threads, not processes: see load_images_to_array_record -- a process pool
+                # re-imports this module (and so JAX) in every worker
                 with tqdm(total=n, file=sys.stdout, ascii=" >=", colour="green") as pbar:
-                    with ProcessPoolExecutor(max_workers=num_workers) as ex:
-                        futures = [
-                            ex.submit(_write_one_shard_mmap, path, idxs, self.md.getMetaDataImage, precision)
+                    with ThreadPoolExecutor(max_workers=num_workers) as ex:
+                        futures = {
+                            ex.submit(_write_one_shard_mmap, path, idxs,
+                                      self.md.getMetaDataImage, precision): idxs
                             for (path, idxs) in shards
-                        ]
+                        }
 
-                        # Update progress by shard completion (exact per-record progress would require IPC)
-                        for fut, (_, idxs) in zip(as_completed(futures), shards):
+                        # Progress by shard completion (mmap_ninja writes the shard whole)
+                        for fut in as_completed(futures):
                             fut.result()  # raise if any error
-                            pbar.update(len(idxs))
+                            pbar.update(len(futures[fut]))
 
             else:
                 if not os.path.isdir(mmap_output_dir):
@@ -397,6 +389,18 @@ class MetaDataGenerator:
 
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=16, collate_fn=numpy_collate, persistent_workers=True,
                           pin_memory=True)
+
+    def _read_chunk_size(self, shard_size, budget_bytes=128 << 20):
+        """How many images a shard worker should read at a time.
+
+        A whole shard is far too big to hold: at box 256 a 10k-image shard is 2.6 GB of
+        float32 per worker. Sizing the chunk on the *source* dtype (the stack is read at
+        full precision before the cast lands) keeps peak memory at roughly
+        ``num_workers x budget_bytes`` regardless of box size and shard size.
+        """
+        box = self.md.getMetaDataImage(0).shape
+        bytes_per_image = max(int(np.prod(box)) * np.dtype(np.float32).itemsize, 1)
+        return int(max(1, min(shard_size, budget_bytes // bytes_per_image)))
 
     def prepare_grain_array_record(self, mmap_output_dir=None, preShuffle=False, num_workers=16, precision=np.float16, group_size=1,
                                    shard_size=10000):
