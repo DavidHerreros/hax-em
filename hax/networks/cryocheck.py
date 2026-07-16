@@ -20,6 +20,7 @@ from hax.utils.fourier_filters import ctfFilter
 from hax.utils.euler import euler_matrix_batch
 from hax.utils.decorators import save_config
 from hax.utils.fourier_filters import wiener2DFilter
+from hax.utils.normalizers import min_max_scale
 
 from hax.programs.gaussian_volume_fitting import fit_volume, adjust_weights_to_images
 
@@ -88,8 +89,8 @@ class CryoCheck(nnx.Module):
     self.layers = layers
     self.num_classes = num_classes
 
-    # Initial adaptating convolution 
-    self.conv1 = nnx.Conv(1, 64, kernel_size=(7,7), strides=2, padding=3, use_bias=False, rngs=rngs)
+    # Initial adaptating convolution - 3 channels for the pyramid input (3 levels) 
+    self.conv1 = nnx.Conv(3, 64, kernel_size=(7,7), strides=2, padding=3, use_bias=False, rngs=rngs) #(n_levels pyramid,64)
     self.bn1 = nnx.BatchNorm(self.in_channels, rngs=rngs)  #perchè solo conv1 ha bisogno della bn
 
     self.conv2 = nnx.Conv(64, 128, kernel_size=(1,1), strides=1, padding='SAME', use_bias=False, rngs=rngs)
@@ -128,9 +129,9 @@ class CryoCheck(nnx.Module):
       # if x is (N,D), reshape to (N,H,W,1)
       x=x.reshape(x.shape[0],int(jnp.sqrt(x.shape[1])), int(jnp.sqrt(x.shape[1])), 1)
     elif x.ndim == 4:
-      # if x is already a (N,H,W,C), ensure C=1
-      if x.shape[-1] != 1:                  #50?
-        raise ValueError("Expected input with 1 channel, but got {} channels.".format(x.shape[-1]))
+      # if x is already a (N,H,W,C), ensure C=3
+      if x.shape[-1] != 3:                  #50?
+        raise ValueError("Expected input with 3 channels, but got {} channels.".format(x.shape[-1]))
     else:
       raise ValueError("Unsupported input dimensions: {}.".format(x.shape[-1]))
 
@@ -273,6 +274,30 @@ def Preprocessing(vol, mask, euler_angles, shifts, ctf):
     return images[..., None] 
 
 
+# Pyramid Filter
+def pyramid_filter(x, pyramid_levels=3):  # pyramid_leveld=4 for the ribosome dataset 
+    
+    # Normalize each image in the batch to [0, 1] range 
+    x_norm = jax.vmap(min_max_scale)
+    x = x_norm(x)
+
+    # Pyramid filter
+    pyramid_levels_imgs = []
+    for i in range(pyramid_levels):
+        scale_factor = 2 ** i
+        if scale_factor == 1:
+            processed_level = x
+        else:
+            new_size = max(1, x.shape[1] // scale_factor)
+            downsampled = jax.image.resize(x, (x.shape[0], new_size, new_size, 1), method='bilinear')
+            upsampled = jax.image.resize(downsampled, (x.shape[0], x.shape[1], x.shape[1], 1), method='bilinear')
+            processed_level = upsampled
+        
+        pyramid_levels_imgs.append(processed_level)
+      
+    out = jnp.concat(pyramid_levels_imgs, axis=-1)
+    return out
+    
 
 def main():
 
@@ -459,7 +484,9 @@ def main():
                                 euler_angles=euler_angles,
                                 shifts=shifts,
                                 ctf=jnp.ones_like(ctf)) - wiener2DFilter(x[..., 0], ctf)[..., None])
+        aligned_imgs = pyramid_filter(aligned_imgs, pyramid_levels=3)
         aligned_labels = jnp.ones((batch_size,1)) #label for aligned imgs is 1
+
 
         # Misaligned images - Data Augmentation
         rngs, subkey = jax.random.split(rngs)
@@ -471,6 +498,7 @@ def main():
                                  euler_angles=euler_angles_noisy,
                                  shifts=shifts,
                                  ctf=jnp.ones_like(ctf)) - wiener2DFilter(x[..., 0], ctf)[..., None])
+        misaligned_imgs = pyramid_filter(misaligned_imgs, pyramid_levels=3)
         misaligned_labels = jnp.zeros((batch_size,1)) #label for misaligned imgs is 0
       
        
@@ -552,6 +580,7 @@ def main():
                               euler_angles=euler_angles,
                               shifts=shifts,
                               ctf=jnp.ones_like(ctf)) - wiener2DFilter(x_validation[..., 0], ctf)[..., None])
+            aligned_vimgs = pyramid_filter(aligned_vimgs, pyramid_levels=3)
             aligned_vlabels = jnp.ones((batch_size_v,1))
         
     
@@ -565,6 +594,7 @@ def main():
                               euler_angles=euler_angles_noisy,
                               shifts=shifts,
                               ctf=jnp.ones_like(ctf)) - wiener2DFilter(x_validation[..., 0], ctf)[..., None])
+            misaligned_vimgs = pyramid_filter(misaligned_vimgs, pyramid_levels=3)
             misaligned_vlabels = jnp.zeros((batch_size_v,1))
           
             imgs_validation = jnp.concatenate([aligned_vimgs, misaligned_vimgs],axis=0)
@@ -589,8 +619,8 @@ def main():
               img_aligned = jnp.squeeze(aligned_imgs[0])
               img_misaligned = jnp.squeeze(misaligned_imgs[0])
 
-              writer.add_image("Residual_Visual/Aligned_Sample", img_aligned, global_step=i, dataformats='HW')
-              writer.add_image("Residual_Visual/Misaligned_Sample", img_misaligned, global_step=i, dataformats='HW')
+              writer.add_image("Residual_Visual/Aligned_Sample", img_aligned, global_step=i, dataformats='HWC')
+              writer.add_image("Residual_Visual/Misaligned_Sample", img_misaligned, global_step=i, dataformats='HWC')
 
               ImageHandler().write(np.array(img_aligned), os.path.join(args.output_path, "aligned_residual_sample.mrcs"), overwrite=True)
               ImageHandler().write(np.array(img_misaligned), os.path.join(args.output_path, "misaligned_residual_sample.mrcs"), overwrite=True)
@@ -685,6 +715,7 @@ def main():
                                  euler_angles=euler_angles,
                                  shifts=shifts,
                                  ctf=jnp.ones_like(ctf)) - wiener2DFilter(x[..., 0], ctf)[..., None])
+      prediction_imgs = pyramid_filter(prediction_imgs, pyramid_levels=3)
       
     
       #predictions = predict_fn(prediction_imgs,eval=True)
