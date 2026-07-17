@@ -208,19 +208,23 @@ def add_reload(parser, required=False, help=None):
     return parser.add_argument("--reload", required=required, type=str, help=help)
 
 
-def add_logging_args(parser, image_every=1, landscape_every=5, checkpoint_every=5):
+def add_logging_args(parser, image_every=1, landscape_every=5, checkpoint_every=5,
+                     images=True, landscape=True, checkpoint=True):
     """Cadence of the intermediate logging, shared by the training programs.
 
     The tiers differ in cost by orders of magnitude (a loss scalar is free, volume
     slices are ~0.07 s, a latent embedding is several seconds), so each gets its own
     period instead of a single global one. See ``hax.metrics.TrainingLogger``.
     """
-    parser.add_argument("--log_images_every", required=False, type=int, default=image_every,
-                        help=LOG_IMAGES_EVERY_HELP)
-    parser.add_argument("--log_landscape_every", required=False, type=int, default=landscape_every,
-                        help=LOG_LANDSCAPE_EVERY_HELP)
-    parser.add_argument("--log_checkpoint_every", required=False, type=int, default=checkpoint_every,
-                        help=LOG_CHECKPOINT_EVERY_HELP)
+    if images:
+        parser.add_argument("--log_images_every", required=False, type=int, default=image_every,
+                            help=LOG_IMAGES_EVERY_HELP)
+    if landscape:
+        parser.add_argument("--log_landscape_every", required=False, type=int, default=landscape_every,
+                            help=LOG_LANDSCAPE_EVERY_HELP)
+    if checkpoint:
+        parser.add_argument("--log_checkpoint_every", required=False, type=int, default=checkpoint_every,
+                            help=LOG_CHECKPOINT_EVERY_HELP)
     parser.add_argument("--log_time_budget", required=False, type=float, default=0.0,
                         help=LOG_TIME_BUDGET_HELP)
     parser.add_argument("--log_sync", action='store_true', help=LOG_SYNC_HELP)

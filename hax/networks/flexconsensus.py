@@ -273,7 +273,7 @@ def main():
     from contextlib import closing
     from hax.checkpointer import NeuralNetworkCheckpointer
     from hax.generators import ArrayListGenerator, NumpyGenerator
-    from hax.metrics import JaxSummaryWriter
+    from hax.metrics import JaxSummaryWriter, TrainingLogger
     from hax.cli import common_args as ca
 
     parser = argparse.ArgumentParser()
@@ -295,6 +295,7 @@ def main():
     ca.add_learning_rate(parser, default=1e-5)
     ca.add_output_path(parser, help="Path to save the results (trained neural network, consensus spaces...)")
     ca.add_reload(parser, help=ca.RELOAD_HELP_BASIC)
+    ca.add_logging_args(parser, images=False, checkpoint=False)
     args = ca.parse_with_config(parser)
 
     # If NAME:path convention, split both
@@ -372,6 +373,12 @@ def main():
         optimizer = nnx.Optimizer(flexconsensus, optax.adam(args.learning_rate), wrt=nnx.Param)
         graphdef, state = nnx.split((flexconsensus, optimizer))
 
+        # Logging cadence + background offload of the host-side logging work.
+        logger = TrainingLogger(landscape_every=args.log_landscape_every,
+                                steps_per_epoch=steps_per_epoch,
+                                time_budget=args.log_time_budget,
+                                background=not args.log_sync).start()
+
         # Training loop (FlexConsensus)
         print(f"{bcolors.OKCYAN}\n###### Training consensus... ######")
         i = 0
@@ -389,20 +396,21 @@ def main():
                     step = 1
                     pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{args.epochs}")
 
-                    if i % 5 == 0:
-                        tensorboard_latents = []
-                        labels_tensorboard = []
-                        for input_space, input_space_name in zip(input_spaces, input_spaces_name):
-                            max_idx = min(2048, input_space.shape[0])
-                            input_space = input_space[:max_idx]
-                            encoded = predict_flexconsensus(graphdef, state, input_space,
-                                                            space_name_encoder=input_space_name,
-                                                            space_name_decoder=None)
-                            tensorboard_latents.append(np.array(encoded))
-                            labels_tensorboard += [f"{input_space_name}" for _ in range(max_idx)]
-                        tensorboard_latents = np.concatenate(tensorboard_latents, axis=0)
-                        writer.add_embedding(tensorboard_latents, metadata=labels_tensorboard,
-                                             tag="FlexConsensus latent space", global_step=i)
+                    if logger.should("landscape", i):
+                        with logger.section():
+                            tensorboard_latents = []
+                            labels_tensorboard = []
+                            for input_space, input_space_name in zip(input_spaces, input_spaces_name):
+                                max_idx = min(2048, input_space.shape[0])
+                                input_space = input_space[:max_idx]
+                                encoded = predict_flexconsensus(graphdef, state, input_space,
+                                                                space_name_encoder=input_space_name,
+                                                                space_name_decoder=None)
+                                tensorboard_latents.append(np.array(encoded))
+                                labels_tensorboard += [f"{input_space_name}" for _ in range(max_idx)]
+                            tensorboard_latents = np.concatenate(tensorboard_latents, axis=0)
+                        logger.submit(writer.add_embedding, tensorboard_latents, metadata=labels_tensorboard,
+                                      tag="FlexConsensus latent space", global_step=i)
 
                     i += 1
 
@@ -428,6 +436,9 @@ def main():
                                           value / step,
                                           i * steps_per_epoch + step)
                 step += 1
+
+        # Let the background logging thread finish before the process moves on.
+        logger.close()
 
         flexconsensus, optimizer = nnx.merge(graphdef, state)
 
