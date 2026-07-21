@@ -48,17 +48,20 @@ def low_pass_3d(x, std=1.0, kernel_size=9):
 
     # Calculate how much padding is needed on each side to reach target_shape
     pad_width = []
+    centers = []
     for i in range(3):
         total_pad = size[i] - kernel.shape[i]
         pad_before = total_pad // 2
         pad_after = total_pad - pad_before
         pad_width.append((pad_before, pad_after))
+        centers.append(pad_before + (kernel_size - 1) // 2)
 
     # Pad the small kernel with zeros to match the image size (e.g., 128^3)
     padded_kernel = jnp.pad(kernel, pad_width)
 
     # Shift the kernel center to [0, 0, 0] to prevent spatial translation
-    shifted_kernel = jnp.fft.ifftshift(padded_kernel)
+    shifted_kernel = jnp.roll(padded_kernel, shift=(-centers[0], -centers[1], -centers[2]),
+                              axis=(0, 1, 2))
 
     # Compute the 3D FFT (The kernel will be complex numbers)
     ft_kernel = jnp.fft.fftn(shifted_kernel)
