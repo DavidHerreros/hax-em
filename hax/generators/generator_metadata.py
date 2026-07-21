@@ -104,6 +104,37 @@ class _RecordRangeSource:
         return self._source[self._start + idx]
 
 
+class _RecordParitySource:
+    """Every other record: the even (``parity=0``) or odd (``parity=1``) half of a source.
+
+    For half-map reconstruction the two halves must be *statistically equivalent*, and a
+    contiguous split (``_RecordRangeSource``) is not: particle stacks are written in
+    micrograph order, so the first half and the second half differ in defocus, ice thickness
+    and acquisition time, and the FSC between them reports that difference as if it were
+    resolution. Interleaving by parity gives both halves the same pose and defocus
+    distribution -- and it is the same split
+    ``hax.utils.reconstruction.reconstruct_consensus_volume`` uses (``labels % 2 == half``),
+    so a half-map FSC measured here is directly comparable to the consensus's own.
+    """
+    def __init__(self, source, parity):
+        self._source = source
+        self._parity = int(parity)
+        self._len = (len(source) - self._parity + 1) // 2
+
+    def __len__(self):
+        return self._len
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            start, stop, step = idx.indices(len(self))
+            return [self[i] for i in range(start, stop, step)]
+        if idx < 0:
+            idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+        return self._source[2 * idx + self._parity]
+
+
 def _write_one_shard_mmap(path, image_indices, getImage_fn, dtype=np.float16):
     from mmap_ninja import numpy as np_ninja
 
@@ -454,11 +485,27 @@ class MetaDataGenerator:
                                  shard_size=shard_size, precision=precision, multiple_files=multiple_files)
 
     def return_grain_dataset(self, shuffle="global", batch_size=8, num_epochs=1, num_threads=1, num_workers=16,
-                             split_fraction=None, load_to_ram=False):
+                             split_fraction=None, load_to_ram=False, split_mode="contiguous"):
+        """``split_mode`` selects how ``split_fraction`` cuts the dataset in two.
+
+        ``"contiguous"`` (default, unchanged) takes a leading and a trailing record range --
+        right for a train/validation split, where the validation set only has to be held out.
+        ``"parity"`` interleaves instead (even records / odd records), ignoring the actual
+        fractions, which is what half-map reconstruction needs: a contiguous cut of a stack
+        written in micrograph order gives two halves with different defocus and ice, and their
+        FSC reports that as resolution. See ``_RecordParitySource``.
+        """
         import grain
         from array_record.python.array_record_data_source import ArrayRecordDataSource
 
         self.grain_dataset_type = "RAM" if load_to_ram else self.grain_dataset_type
+
+        def _split_sources(sources):
+            if split_mode == "parity":
+                return _RecordParitySource(sources, 0), _RecordParitySource(sources, 1)
+            split_point = int(split_fraction[0] * len(sources))
+            return (_RecordRangeSource(sources, 0, split_point),
+                    _RecordRangeSource(sources, split_point, len(sources)))
 
         # Get sources
         if self.grain_dataset_type == "ArrayRecord":
@@ -467,9 +514,7 @@ class MetaDataGenerator:
 
             sources = ArrayRecordDataSource(shard_files, reader_options={"index_storage_option": "in_memory"})
             if split_fraction is not None:
-                split_point = int(split_fraction[0] * len(sources))
-                sources_train = _RecordRangeSource(sources, 0, split_point)
-                sources_val = _RecordRangeSource(sources, split_point, len(sources))
+                sources_train, sources_val = _split_sources(sources)
                 dataset_train = grain.MapDataset.source(sources_train)
                 dataset_val = grain.MapDataset.source(sources_val)
             else:
@@ -522,9 +567,7 @@ class MetaDataGenerator:
 
             sources = LazyNinjaGrainSource(shard_paths)
             if split_fraction is not None:
-                split_point = int(split_fraction[0] * len(sources))
-                sources_train = _RecordRangeSource(sources, 0, split_point)
-                sources_val = _RecordRangeSource(sources, split_point, len(sources))
+                sources_train, sources_val = _split_sources(sources)
                 dataset_train = grain.MapDataset.source(sources_train)
                 dataset_val = grain.MapDataset.source(sources_val)
             else:
@@ -548,9 +591,13 @@ class MetaDataGenerator:
                     return self._data[idx], self._labels[idx]
 
             if split_fraction is not None:
-                split_point = int(split_fraction[0] * len(images))
-                sources_train = NumpyDataSource(images[:split_point], labels[:split_point])
-                sources_val = NumpyDataSource(images[split_point:], labels[split_point:])
+                if split_mode == "parity":
+                    sources_train = NumpyDataSource(images[0::2], labels[0::2])
+                    sources_val = NumpyDataSource(images[1::2], labels[1::2])
+                else:
+                    split_point = int(split_fraction[0] * len(images))
+                    sources_train = NumpyDataSource(images[:split_point], labels[:split_point])
+                    sources_val = NumpyDataSource(images[split_point:], labels[split_point:])
                 dataset_train = grain.MapDataset.source(sources_train)
                 dataset_val = grain.MapDataset.source(sources_val)
             else:
