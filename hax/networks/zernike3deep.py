@@ -1430,7 +1430,8 @@ def main():
             md_pred[labels, 'latent_space'] = np.asarray([",".join(np.char.mod('%f', item)) for item in latents_batch])
 
         # Save latents in metadata
-        md_pred.write(os.path.join(args.output_path, "predicted_latents" +  os.path.splitext(args.md)[1]))
+        md_pred.write(os.path.join(args.output_path, "predicted_latents" +  os.path.splitext(args.md)[1]),
+                      updateImagePaths=True)
 
     # If exists, clean MMAP
     # if not args.load_images_to_ram and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):
