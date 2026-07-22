@@ -12,6 +12,9 @@ import jax.numpy as jnp
 from jax import device_get
 from jax.numpy import ndarray as JaxArray
 
+import matplotlib.pyplot as plt
+from sklearn.metrics import roc_curve, auc, confusion_matrix, ConfusionMatrixDisplay
+
 from hax.utils import min_max_scale, low_pass_3d
 
 
@@ -135,6 +138,44 @@ class JaxSummaryWriter(SummaryWriter):
         return wrapped
 
 
+    def add_roc_curve(self, y_true, y_scores, global_step, tag="ROC Curve"):
+        
+        fpr, tpr, threshold = roc_curve(y_true, y_scores)
+        roc_auc = auc(fpr, tpr)
+        youden_index = np.argmax(tpr - fpr)
+        optimal_threshold = threshold[youden_index]
+        
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.plot(fpr, tpr, color="royalblue", lw=2, label=f"ROC curve (AUC = {roc_auc:.2f})")
+        ax.plot([0, 1], [0, 1], color="black", lw=2, linestyle="--")
+        
+        ax.set_xlim([0.0, 1.0])
+        ax.set_ylim([0.0, 1.05])
+        ax.set_xlabel("False Positive Rate (1 - Specificity)")
+        ax.set_ylabel("True Positive Rate (Sensitivity)")
+        ax.set_title(tag)
+        ax.legend(loc="lower right")
+        ax.grid(True, linestyle="--", alpha=0.6)
+        
+        self.add_figure(tag, fig, global_step=global_step)
+        
+        plt.close(fig)
+
+        return optimal_threshold
+
+    def add_confusion_matrix(self, y_true, y_pred, global_step, tag="Confusion Matrix"):
+        cm = confusion_matrix(y_true, y_pred)
+        disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+        
+        fig, ax = plt.subplots(figsize=(6, 6))
+        disp.plot(ax=ax, cmap="Blues", colorbar=True)
+        
+        ax.set_title(tag)
+        ax.grid(False)
+        
+        self.add_figure(tag, fig, global_step=global_step)
+        
+        plt.close(fig)
 
 
 def main():
