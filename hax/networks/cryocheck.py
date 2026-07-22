@@ -290,6 +290,7 @@ def main():
   from hax.checkpointer import NeuralNetworkCheckpointer
   from hax.generators import MetaDataGenerator, extract_columns
   from hax.metrics import JaxSummaryWriter
+  from hax.utils.frc import compute_fourier_residual
 
   def list_of_floats(arg):
         return list(map(float, arg.split(',')))
@@ -387,7 +388,7 @@ def main():
         
         # Adjust to images (options are apply mode or wiener mode)
         model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
-                                            num_epochs=5, is_global=True, ctf_type="wiener")
+                                            num_epochs=500, is_global=True, ctf_type="apply")
 
         # Save model
         NeuralNetworkCheckpointer.save(model, fit_path)
@@ -449,56 +450,72 @@ def main():
         batch_size = len(index)
         
         # Aligned images
-        #aligned_imgs = jnp.abs(Preprocessing(vol=vol,
-         #                         mask=mask,
-          #                        euler_angles=euler_angles,
-           #                      shifts=shifts,
-            #                     ctf=ctf) - x)
-        aligned_imgs = jnp.abs(Preprocessing(vol=vol,
-                                mask=mask,
-                                euler_angles=euler_angles,
-                                shifts=shifts,
-                                ctf=jnp.ones_like(ctf)) - wiener2DFilter(x[..., 0], ctf)[..., None])
-        aligned_labels = jnp.ones((batch_size,1)) #label for aligned imgs is 1
+        # aligned_res = jnp.abs(Preprocessing(vol=vol,
+        #                           mask=mask,
+        #                           euler_angles=euler_angles,
+        #                           shifts=shifts,
+        #                           ctf=ctf) - x)
+        #APPLY WIENER
+        # aligned_res = jnp.abs(Preprocessing(vol=vol,
+        #                         mask=mask,
+        #                         euler_angles=euler_angles,
+        #                         shifts=shifts,
+        #                         ctf=jnp.ones_like(ctf)) - wiener2DFilter(x[..., 0], ctf)[..., None])
+
+        projection = Preprocessing(vol=vol,
+                                 mask=mask,
+                                 euler_angles=euler_angles,
+                                 shifts=shifts,
+                                 ctf=ctf)
+        result = compute_fourier_residual(projection, x)
+        aligned_res = result.residual_map
+        aligned_labels = jnp.ones((batch_size,1)) #label for aligned res is 1
 
         # Misaligned images - Data Augmentation
         rngs, subkey = jax.random.split(rngs)
         noise = (jax.random.normal(subkey, shape=euler_angles.shape) * 2) + 20
         euler_angles_noisy = euler_angles + noise
 
-        misaligned_imgs = jnp.abs(Preprocessing(vol=vol,
+        # misaligned_res = jnp.abs(Preprocessing(vol=vol,
+        #                          mask=mask,
+        #                          euler_angles=euler_angles_noisy,
+        #                          shifts=shifts,
+        #                          ctf=ctf) - x)
+        projection_imgs_noisy = Preprocessing(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles_noisy,
                                  shifts=shifts,
-                                 ctf=jnp.ones_like(ctf)) - wiener2DFilter(x[..., 0], ctf)[..., None])
-        misaligned_labels = jnp.zeros((batch_size,1)) #label for misaligned imgs is 0
+                                 ctf=ctf)
+        result = compute_fourier_residual(projection_imgs_noisy, x)
+        misaligned_res = result.residual_map
+        misaligned_labels = jnp.zeros((batch_size,1)) #label for misaligned res is 0
       
        
-        imgs=jnp.concatenate([aligned_imgs, misaligned_imgs], axis=0)
+        res=jnp.concatenate([aligned_res, misaligned_res], axis=0)
         labels=jnp.concatenate([aligned_labels, misaligned_labels], axis=0)
 
 
         ######## === PRINT VALUES RANGE (ONLY FOR THE FIRST BATCH) === ########
         if total_steps == 0:
             # Extract the first sample of the batch for debugging
-            proj_sample = Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles, shifts=shifts, ctf=jnp.ones_like(ctf))[0]
-            wiener_sample = wiener2DFilter(x[..., 0], ctf)[0]
+            proj_sample = Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles, shifts=shifts, ctf=ctf)[0]
+            #wiener_sample = wiener2DFilter(x[..., 0], ctf)[0]
             
             print("\n" + "="*50)
             print("[VALUES RANGE - FIRST SAMPLE ]")
             print(f"EXP PROJECTION  -> Min: {jnp.min(x[0]):.4f} | Max: {jnp.max(x[0]):.4f} | Mean: {jnp.mean(x[0]):.4f}")
             print(f"PURE PROJECTION  -> Min: {jnp.min(proj_sample):.4f} | Max: {jnp.max(proj_sample):.4f} | Mean: {jnp.mean(proj_sample):.4f}")
-            print(f"WIENER IMAGE  -> Min: {jnp.min(wiener_sample):.4f} | Max: {jnp.max(wiener_sample):.4f} | Mean: {jnp.mean(wiener_sample):.4f}")
-            print(f"ALIGNED RESIDUAL  -> Min: {jnp.min(aligned_imgs[0]):.4f} | Max: {jnp.max(aligned_imgs[0]):.4f} | Mean: {jnp.mean(aligned_imgs[0]):.4f}")
+            #print(f"WIENER IMAGE  -> Min: {jnp.min(wiener_sample):.4f} | Max: {jnp.max(wiener_sample):.4f} | Mean: {jnp.mean(wiener_sample):.4f}")
+            print(f"ALIGNED RESIDUAL  -> Min: {jnp.min(aligned_res[0]):.4f} | Max: {jnp.max(aligned_res[0]):.4f} | Mean: {jnp.mean(aligned_res[0]):.4f}")
             print("="*50 + "\n")
         #########################################################################
         
 
-        loss, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs, labels=labels, train=True)
+        loss, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=res, labels=labels, train=True)
         total_loss += loss
         
         ######## roc and confusion matrix #######
-        t_score.append(cryoCheck(imgs, eval=True)) 
+        t_score.append(cryoCheck(res, eval=True)) 
         t_labels.append(labels)
 
 
@@ -547,11 +564,18 @@ def main():
 
 
             # Aligned images
-            aligned_vimgs = jnp.abs(Preprocessing(vol=vol,
-                              mask=mask,
-                              euler_angles=euler_angles,
-                              shifts=shifts,
-                              ctf=jnp.ones_like(ctf)) - wiener2DFilter(x_validation[..., 0], ctf)[..., None])
+            # aligned_vimgs = jnp.abs(Preprocessing(vol=vol,
+            #                   mask=mask,
+            #                   euler_angles=euler_angles,
+            #                   shifts=shifts,
+            #                   ctf=ctf) - x_validation)
+            projection_vimgs = Preprocessing(vol=vol,
+                                 mask=mask,
+                                 euler_angles=euler_angles,
+                                 shifts=shifts,
+                                 ctf=ctf)
+            result = compute_fourier_residual(projection_vimgs, x_validation)
+            aligned_vimgs = result.residual_map
             aligned_vlabels = jnp.ones((batch_size_v,1))
         
     
@@ -560,23 +584,30 @@ def main():
             noise = (jax.random.normal(subkey_v, shape=euler_angles.shape) * 2) + 20
             euler_angles_noisy = euler_angles + noise
 
-            misaligned_vimgs = jnp.abs(Preprocessing(vol=vol,
-                              mask=mask,
-                              euler_angles=euler_angles_noisy,
-                              shifts=shifts,
-                              ctf=jnp.ones_like(ctf)) - wiener2DFilter(x_validation[..., 0], ctf)[..., None])
+            # misaligned_vimgs = jnp.abs(Preprocessing(vol=vol,
+            #                   mask=mask,
+            #                   euler_angles=euler_angles_noisy,
+            #                   shifts=shifts,
+            #                   ctf=ctf) - x_validation)
+            projection_vimgs_noisy = Preprocessing(vol=vol,
+                                 mask=mask,
+                                 euler_angles=euler_angles_noisy,
+                                 shifts=shifts,
+                                 ctf=ctf)
+            result = compute_fourier_residual(projection_vimgs_noisy, x_validation)
+            misaligned_vimgs = result.residual_map
             misaligned_vlabels = jnp.zeros((batch_size_v,1))
           
-            imgs_validation = jnp.concatenate([aligned_vimgs, misaligned_vimgs],axis=0)
+            res_validation = jnp.concatenate([aligned_vimgs, misaligned_vimgs],axis=0)
             labels_validation = jnp.concatenate([aligned_vlabels, misaligned_vlabels], axis=0)
 
 
             ##########################
-            # Debugging: save pure projection aligned and misaligned without ctf
+            # Debugging: save pure projection aligned and misaligned
             if _ == 0:
               
-              pure_proj_aligned = jnp.squeeze(Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles, shifts=shifts, ctf=jnp.ones_like(ctf))[0])
-              pure_proj_misaligned = jnp.squeeze(Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles_noisy, shifts=shifts, ctf=jnp.ones_like(ctf))[0])
+              pure_proj_aligned = jnp.squeeze(Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles, shifts=shifts, ctf=ctf)[0])
+              pure_proj_misaligned = jnp.squeeze(Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles_noisy, shifts=shifts, ctf=ctf)[0])
               # wiener_img = jnp.squeeze(wiener2DFilter(x[..., 0], ctf[...])[0])
 
               writer.add_image("Pure_Projection/Aligned", pure_proj_aligned, global_step=i, dataformats='HW')
@@ -586,22 +617,22 @@ def main():
               ImageHandler().write(np.array(pure_proj_misaligned), os.path.join(args.output_path, "pure_projection_misaligned.mrcs"), overwrite=True)
 
               # Debugging: save aligned and misaligned residuals to TensorBoard
-              img_aligned = jnp.squeeze(aligned_imgs[0])
-              img_misaligned = jnp.squeeze(misaligned_imgs[0])
+              res_aligned = jnp.squeeze(aligned_res[0])
+              res_misaligned = jnp.squeeze(misaligned_res[0])
 
-              writer.add_image("Residual_Visual/Aligned_Sample", img_aligned, global_step=i, dataformats='HW')
-              writer.add_image("Residual_Visual/Misaligned_Sample", img_misaligned, global_step=i, dataformats='HW')
+              writer.add_image("Residual_Visual/Aligned_Sample", res_aligned, global_step=i, dataformats='HW')
+              writer.add_image("Residual_Visual/Misaligned_Sample", res_misaligned, global_step=i, dataformats='HW')
 
-              ImageHandler().write(np.array(img_aligned), os.path.join(args.output_path, "aligned_residual_sample.mrcs"), overwrite=True)
-              ImageHandler().write(np.array(img_misaligned), os.path.join(args.output_path, "misaligned_residual_sample.mrcs"), overwrite=True)
+              ImageHandler().write(np.array(res_aligned), os.path.join(args.output_path, "aligned_residual_sample.mrcs"), overwrite=True)
+              ImageHandler().write(np.array(res_misaligned), os.path.join(args.output_path, "misaligned_residual_sample.mrcs"), overwrite=True)
 
             ############################
 
 
-            loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=imgs_validation, labels=labels_validation, train=False)
+            loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=res_validation, labels=labels_validation, train=False)
             total_validation_loss += loss_validation
             
-            val_score.append(cryoCheck(imgs_validation, eval=True)) #predictions for the validation step
+            val_score.append(cryoCheck(res_validation, eval=True)) #predictions for the validation step
             val_labels.append(labels_validation)
             
 
@@ -680,15 +711,21 @@ def main():
       euler_angles, shifts, ctf = md_extraction (md_columns, index, vol, args)
       
 
-      prediction_imgs = jnp.abs(Preprocessing(vol=vol,
+      # prediction_res = jnp.abs(Preprocessing(vol=vol,
+      #                            mask=mask,
+      #                            euler_angles=euler_angles,
+      #                            shifts=shifts,
+      #                            ctf=ctf) - x)
+
+      projection_pred = Preprocessing(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles,
                                  shifts=shifts,
-                                 ctf=jnp.ones_like(ctf)) - wiener2DFilter(x[..., 0], ctf)[..., None])
-      
-    
-      #predictions = predict_fn(prediction_imgs,eval=True)
-      predictions = cryoCheck(prediction_imgs, eval=True)
+                                 ctf=ctf)
+      result = compute_fourier_residual(projection_pred, x)
+      prediction_res = result.residual_map
+      #predictions = predict_fn(prediction_res,eval=True)
+      predictions = cryoCheck(prediction_res, eval=True)
 
       labels_prediction.append(np.array(predictions))
 
