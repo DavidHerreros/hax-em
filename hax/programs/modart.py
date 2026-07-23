@@ -1,17 +1,17 @@
 #!/usr/bin/env python
 
 
+from functools import partial
+
+import numpy as np
 import jax
 from jax import numpy as jnp
-from jax.scipy.ndimage import map_coordinates
 from flax import nnx
-import dm_pix
 
 from einops import rearrange
 
 from hax.utils import *
 from hax.layers import *
-from hax.programs.gaussian_volume_fitting import FastVariableBlur3D
 
 
 def mse(a, b):
@@ -19,78 +19,60 @@ def mse(a, b):
 
 
 class DeltaVolume(nnx.Module):
-    def __init__(self, total_voxels, volume_size, inds, reference_values, num_maps=1, *, rngs: nnx.Rngs):
+    """The reconstruction: a per-voxel amplitude (and optionally position) correction to a
+    reference map, over the voxels the mask selects.
+    """
+
+    def __init__(self, total_voxels, volume_size, inds, reference_values, num_maps=1,
+                 refine_positions=False, max_shift_voxels=0.5, *, rngs: nnx.Rngs):
         self.volume_size = volume_size
         self.inds = inds
         self.reference_values = reference_values
         self.total_voxels = total_voxels
         self.num_maps = num_maps
-        # initializer = jax.nn.initializers.glorot_uniform()
+        self.refine_positions = refine_positions
 
         # Indices to (normalized) coords
         self.factor = 0.5 * volume_size
         coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)[None, ...]
         self.coords = (coords - self.factor) / self.factor
 
-        if jnp.all(reference_values) == 0:
-            self.lambda_parameter = 1.0
-        else:
-            self.lambda_parameter = nnx.Param(1e-4)
+        # Scale of the amplitude correction
+        ref = np.asarray(reference_values, np.float32)
+        rms = float(np.sqrt(np.mean(ref ** 2)))
+        self.value_scale = rms if rms > 1e-12 else 1.0
 
-        # Learnable parameters (keep this in case it is useful in the future)
-        # if self.num_maps == 1:
-        #     self.params = nnx.Param(initializer(jax.random.key(0), (1, total_voxels * 4,), jnp.float32))
-        # else:
-        #     self.params = [nnx.Param(initializer(jax.random.key(0), (1, total_voxels * 4,), jnp.float32)),
-        #                              nnx.Param(initializer(jax.random.key(1), (1, total_voxels * 4,), jnp.float32))]
+        # Half-voxel cap, expressed in the normalized coordinate units used internally
+        self.max_shift = float(max_shift_voxels) / self.factor
 
-        hidden_linear = [Linear(in_features=total_voxels * 3, out_features=8, rngs=rngs, dtype=jnp.bfloat16,
-                                     kernel_init=siren_init_first(c=1.))]
-        for _ in range(4):
-            hidden_linear.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=1.)))
-        self.hidden_linear = nnx.List(hidden_linear)
-
-        if self.num_maps == 1:
-            self.params = Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs)
-        else:
-            params = [Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs),
-                      Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs)]
-            self.params = nnx.List(params)
+        self.delta_values = nnx.Param(jnp.zeros((num_maps, total_voxels), jnp.float32))
+        if refine_positions:
+            self.delta_coords = nnx.Param(jnp.zeros((num_maps, total_voxels, 3), jnp.float32))
 
     def __call__(self):
-        # (keep this in case it is useful in the future)
-        # if self.num_maps == 2:
-        #     params = jnp.concatenate(self.params, axis=0)
-        # else:
-        #     params = self.params
+        """Returns ``(coords, values, delta_values, delta_coords)``.
 
-        coords = self.coords.flatten()[None, ...]
-
-        # Decode voxel values
-        x = jnp.sin(1.0 * self.hidden_linear[0](coords))
-        for layer in self.hidden_linear[1:]:
-            x = jnp.sin(x + 1.0 * layer(x))
-
-        if self.num_maps == 1:
-            params = self.params(x)
-        else:
-            params = jnp.concatenate([self.params[0](x), self.params[1](x)], axis=0)
-
-        # Extract delta_coords and values
-        x = jnp.reshape(self.lambda_parameter * params, (self.num_maps, self.total_voxels, 4))
-        delta_coords, delta_values = x[..., :3], x[..., 3]
-
-        # Recover volume values (TODO: Check if applying ReLu is really needed)
+        The two deltas come back so the training step can penalise the *correction* rather
+        than the total density -- an L1 on ``values`` shrinks the reference map itself, which
+        shows up as a flat low-frequency contrast loss.
+        """
+        delta_values = self.value_scale * self.delta_values.value
         values = nnx.relu(self.reference_values + delta_values)
+
+        if self.refine_positions:
+            delta_coords = self.max_shift * jnp.tanh(self.delta_coords.value)
+        else:
+            delta_coords = jnp.zeros((self.num_maps, self.total_voxels, 3), jnp.float32)
 
         # Recover coords (non-normalized)
         coords = self.factor * (self.coords + delta_coords)
 
-        return coords, values
+        return coords, values, delta_values, delta_coords
 
-    def decode_volume(self, filter=True):
+    def decode_volume(self, filter=False):
+        """Render the reconstruction onto the voxel grid."""
         # Decode volume values
-        coords, values = self.__call__()
+        coords, values, _, _ = self.__call__()
 
         # Displace coordinates
         coords = coords + self.factor
@@ -118,6 +100,11 @@ class DeltaVolume(nnx.Module):
              bposi + jnp.array((0, 1, 1)), bposi + jnp.array((1, 0, 1)), bposi + jnp.array((1, 1, 0)),
              bposi + jnp.array((1, 1, 1))], axis=1)
 
+        # Zero the weight of any corner that falls outside the box, then clip the index
+        bamp = bamp * jnp.all((bposi >= 0) & (bposi <= self.volume_size - 1), axis=-1)
+        bposi = jnp.clip(bposi, 0, self.volume_size - 1)
+        bamp = jnp.nan_to_num(bamp)
+
         def scatter_volume(vol, bpos_i, bamp_i):
             return vol.at[bpos_i[..., 2], bpos_i[..., 1], bpos_i[..., 0]].add(bamp_i)
 
@@ -136,7 +123,7 @@ class PhysDecoder:
     def __init__(self, xsize):
         self.xsize = xsize
 
-    def __call__(self, x, values, coords, xsize, rotations, shifts, ctf, ctf_type, filter=True):
+    def __call__(self, x, values, coords, xsize, rotations, shifts, ctf, ctf_type):
         # Volume factor
         factor = 0.5 * xsize
 
@@ -162,14 +149,16 @@ class PhysDecoder:
         bamp = jnp.concat([bamp0, bamp1, bamp2, bamp3], axis=1)
         bposi = jnp.concat([bposi, bposi + jnp.array((1, 0)), bposi + jnp.array((1, 1)), bposi + jnp.array((0, 1))], axis=1)
 
+        # Same guard as the volume scatter: mask out-of-box corners before clipping, so a
+        # voxel projected off one edge is dropped rather than wrapped onto the other
+        bamp = bamp * jnp.all((bposi >= 0) & (bposi <= xsize - 1), axis=-1)
+        bposi = jnp.clip(bposi, 0, xsize - 1)
+        bamp = jnp.nan_to_num(bamp)
+
         def scatter_img(image, bpos_i, bamp_i):
             return image.at[bpos_i[..., 0], bpos_i[..., 1]].add(bamp_i)
 
         images = jax.vmap(scatter_img)(images, bposi, bamp)
-
-        # Gaussian filter (needed by forward interpolation)
-        if filter:
-            images = dm_pix.gaussian_blur(images[..., None], 1.0, kernel_size=3)[..., 0]
 
         # Apply CTF
         if ctf_type in ["apply", "wiener", "squared"]:
@@ -179,7 +168,8 @@ class PhysDecoder:
 
 class MoDART(nnx.Module):
     def __init__(self, reference_volume, reconstruction_mask, xsize, sr, ctf_type="apply",
-                 symmetry_group="c1", reconstruct_halves=False, *, rngs: nnx.Rngs):
+                 symmetry_group="c1", reconstruct_halves=False, refine_positions=False,
+                 *, rngs: nnx.Rngs):
         super(MoDART, self).__init__()
         self.xsize = xsize
         self.ctf_type = ctf_type
@@ -191,15 +181,17 @@ class MoDART(nnx.Module):
         self.num_maps = 2 if reconstruct_halves else 1
         reference_values = reference_volume[self.inds[..., 0], self.inds[..., 1], self.inds[..., 2]][None, ...]
         self.delta_volume_decoder = DeltaVolume(self.inds.shape[0], self.xsize, self.inds, reference_values,
-                                                num_maps=self.num_maps, rngs=rngs)
+                                                num_maps=self.num_maps, refine_positions=refine_positions,
+                                                rngs=rngs)
         self.phys_decoder = PhysDecoder(self.xsize)
 
     def __call__(self, **kwargs):
         return self.delta_volume_decoder.decode_volume(**kwargs)
 
 
-@jax.jit
-def single_step_modart(graphdef, state, x, labels, md, fields_modart, key):
+@partial(jax.jit, static_argnames=("l1_delta", "tv_lambda", "coord_reg"))
+def single_step_modart(graphdef, state, x, labels, md, fields_modart, key,
+                       l1_delta=1e-3, tv_lambda=1e-3, coord_reg=1e-2):
     model, optimizer = nnx.merge(graphdef, state)
 
     # Random keys
@@ -212,7 +204,7 @@ def single_step_modart(graphdef, state, x, labels, md, fields_modart, key):
 
     def loss_fn(model, x):
         # Decode volume
-        coords, values = model.delta_volume_decoder()
+        coords, values, delta_values, delta_coords = model.delta_volume_decoder()
 
         # Random symmetry matrices
         random_indices = jax.random.choice(choice_key, jnp.arange(model.symmetry_matrices.shape[0]), shape=(rotations.shape[0],))
@@ -235,15 +227,20 @@ def single_step_modart(graphdef, state, x, labels, md, fields_modart, key):
 
         recon_loss = mse(images_corrected_loss[..., None], x_loss[..., None])
 
-        # L1 based denoising
-        l1_loss = jnp.mean(jnp.abs(values))
+        # Sparsity on the correction
+        scale = model.delta_volume_decoder.value_scale
+        l1_loss = jnp.mean(jnp.abs(delta_values)) / scale
 
-        # L1 and L2 total variation
+        # L1 and L2 total variation on the density
         diff_x, diff_y, diff_z = sparse_finite_3D_differences(values, model.inds, model.xsize)
         l1_grad_loss = jnp.abs(diff_x).mean() + jnp.abs(diff_z).mean() + jnp.abs(diff_y).mean()
         l2_grad_loss = jnp.square(diff_x).mean() + jnp.square(diff_z).mean() + jnp.square(diff_y).mean()
 
-        loss = recon_loss.mean() + 0.001 * l1_loss + 0.001 * (l1_grad_loss + l2_grad_loss)
+        # Keep the position refinement honest
+        coord_loss = jnp.mean(jnp.square(model.delta_volume_decoder.factor * delta_coords))
+
+        loss = (recon_loss.mean() + l1_delta * l1_loss + tv_lambda * (l1_grad_loss + l2_grad_loss)
+                + coord_reg * coord_loss)
         return loss, recon_loss.mean(axis=0)
 
     # Labels to single batch size
@@ -286,45 +283,26 @@ def single_step_modart(graphdef, state, x, labels, md, fields_modart, key):
     return loss, recon_loss, state
 
 
-@jax.jit
-def interpolate_image_field(graphdef, state, images, initial_inds_modart):
-    xsize = images.shape[1]
+@partial(jax.jit, static_argnames=("chunk_size",))
+def decode_field_modart(graphdef, state, images, coords_vox, chunk_size=None):
+    """The per-particle displacement field, evaluated directly at MoDART's own voxels"""
     model = nnx.merge(graphdef, state)
-    map_coordinates_vmap = jax.vmap(map_coordinates, in_axes=(-1, None, None), out_axes=-1)
-    factor = xsize / model.xsize
-    initial_scale = 0.5 * model.xsize
-    scale = 0.5 * xsize
+    if images.shape[1] != model.xsize:
+        images = jax.image.resize(images, (images.shape[0], model.xsize, model.xsize, 1),
+                                  method="bilinear")
+    return model.decode_field_at(images, coords_vox, chunk_size=chunk_size)
 
-    # Get coordinates and field
-    images_resized = jax.image.resize(images, (images.shape[0], model.xsize, model.xsize, 1), method='bilinear')
-    fields, initial_coords = model.decode_field(images_resized)
-    # fields_values = jnp.concatenate((fields, values[..., None]), axis=-1)
-    initial_coords = jnp.round(initial_scale * initial_coords + initial_scale).astype(jnp.int32)
-    fields = scale * fields
-    initial_inds_modart = initial_inds_modart / factor
 
-    # Empty grids
-    grids = jnp.zeros((images.shape[0], model.xsize, model.xsize, model.xsize, 3))
-
-    # Place values on grid
-    def place_on_single_grid(grid, inds, values):
-        grid = grid.at[inds[..., 2], inds[..., 1], inds[..., 0], 0].set(values[..., 0])
-        grid = grid.at[inds[..., 2], inds[..., 1], inds[..., 0], 1].set(values[..., 1])
-        grid = grid.at[inds[..., 2], inds[..., 1], inds[..., 0], 2].set(values[..., 2])
-        # grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2], 0].set(values[..., 3])
-        return grid
-    place_on_grids = jax.vmap(place_on_single_grid, in_axes=(0, None, 0))
-    grids = place_on_grids(grids, initial_coords, fields)
-
-    # Low pass filter grids
-    gaussian_filter = FastVariableBlur3D((model.xsize, model.xsize, model.xsize))
-    grids = gaussian_filter(grids, sigma=1.0)
-    fields_modart = []
-    for grid in grids:
-        fields_modart.append(map_coordinates_vmap(grid, initial_inds_modart.T, 1))
-    fields_modart = jnp.stack(fields_modart, axis=0)
-
-    return fields_modart
+@jax.jit
+def decode_field_sparse(graphdef, state, images):
+    """The model's field on its own points, plus those points, both in voxel units."""
+    model = nnx.merge(graphdef, state)
+    if images.shape[1] != model.xsize:
+        images = jax.image.resize(images, (images.shape[0], model.xsize, model.xsize, 1),
+                                  method="bilinear")
+    field, source_coords = model.decode_field(images)
+    scale = 0.5 * model.xsize
+    return field * scale, source_coords * scale + scale
 
 
 def main():
@@ -359,11 +337,29 @@ def main():
     ca.add_ctf_type(parser)
     ca.add_batch_size(parser)
     parser.add_argument("--reconstruct_halves", action="store_true",
-                        help="If not provided, MoDART will reconstruct a single volume. Otherwise, MoDART will reconstruct two half maps by splitting the dataset into even/odd parts.")
+                        help="If not provided, MoDART will reconstruct a single volume. Otherwise, MoDART will reconstruct two half maps by splitting the dataset into even/odd parts, "
+                             f"and report the half-map FSC. {bcolors.WARNING}NOTE{bcolors.ENDC}: without this there is no FSC and therefore no way to tell whether the reconstruction improved anything.")
     parser.add_argument("--motion_correction", type=str,
                         help=f"If provided, MoDART will perform a motion correction while reconstructing the volume to reduce motion blurring. Otherwise, a standard reconstruction is performed. "
                              f"{bcolors.WARNING} NOTE {bcolors.ENDC}: When providing this parameter, you MUST give the path to a trained {bcolors.UNDERLINE} HetSIREN (with transport of mass) "
                              f"{bcolors.ENDC} or {bcolors.UNDERLINE} Zernike3Deep {bcolors.ENDC} neural network.")
+    parser.add_argument("--epochs", required=False, type=int, default=20,
+                        help=f"Number of reconstruction epochs (default {bcolors.ITALIC}20{bcolors.ENDC}). The learning-rate schedule is annealed over exactly this many, so the "
+                             f"fit settles at the end instead of being cut off at full step size.")
+    parser.add_argument("--refine_positions", action="store_true",
+                        help=f"Let MoDART move the mass as well as re-weight it. Each voxel gets a displacement bounded to half a voxel and penalised by {bcolors.ITALIC}--coord_reg{bcolors.ENDC}. "
+                             f"{bcolors.WARNING}NOTE{bcolors.ENDC}: off by default. A free per-voxel displacement lets the model match any image by moving mass rather than by getting the "
+                             f"density right, and sub-voxel jitter over every voxel is itself a blur kernel.")
+    parser.add_argument("--l1_delta", required=False, type=float, default=1e-3,
+                        help=f"Weight of the L1 sparsity prior on the amplitude CORRECTION (default {bcolors.ITALIC}1e-3{bcolors.ENDC}), normalised by the reference RMS. It penalises the "
+                             f"departure from the reference map, not the map itself -- an L1 on the total density shrinks the reference and costs a flat slice of low-frequency contrast.")
+    parser.add_argument("--tv_lambda", required=False, type=float, default=1e-3,
+                        help=f"Weight of the total-variation (spatial smoothness) prior on the density (default {bcolors.ITALIC}1e-3{bcolors.ENDC}).")
+    parser.add_argument("--coord_reg", required=False, type=float, default=1e-2,
+                        help=f"Weight of the quadratic penalty on the per-voxel displacement (default {bcolors.ITALIC}1e-2{bcolors.ENDC}). Only used with {bcolors.ITALIC}--refine_positions{bcolors.ENDC}.")
+    parser.add_argument("--field_chunk", required=False, type=int, default=131072,
+                        help=f"Number of reconstruction voxels evaluated per chunk when querying the motion field (default {bcolors.ITALIC}131072{bcolors.ENDC}). Lower it if the field "
+                             f"query runs out of memory; it only trades speed for peak VRAM and does not change the result.")
     ca.add_output_path(parser)
     ca.add_ssd_scratch_folder(parser)
     ca.add_logging_args(parser, landscape=False, checkpoint=False)
@@ -381,6 +377,21 @@ def main():
 
     # Preprocess volume (and mask)
     xsize = generator.md.getMetaDataImage(0).shape[0]
+
+    # When neither a reference volume nor a mask is given, reconstruct a consensus volume from
+    # the posed particles and take the reconstruction support from it
+    auto_reference = args.vol is None and args.mask is None
+    if auto_reference:
+        os.makedirs(args.output_path, exist_ok=True)
+        consensus = reconstruct_consensus_volume(generator.md, md_columns, args.sr,
+                                                 use_ctf=args.ctf_type not in (None, "None"),
+                                                 scratch_dir=(args.ssd_scratch_folder or args.output_path))
+        consensus_path = os.path.join(args.output_path, "consensus_reconstruction.mrc")
+        ImageHandler().write(consensus, consensus_path, overwrite=True)
+        args.vol = consensus_path
+        print(f"{bcolors.OKGREEN}Consensus volume reconstructed from the input poses -> {consensus_path}"
+              f"{bcolors.ENDC}")
+
     if args.vol is not None:
         vol = ImageHandler(args.vol).getData()
     else:
@@ -388,6 +399,9 @@ def main():
 
     if args.mask is not None:
         mask = ImageHandler(args.mask).getData()
+    elif auto_reference:
+        mask = consensus_mask(vol, dilate=4)
+        ImageHandler().write(mask, os.path.join(args.output_path, "consensus_mask.mrc"), overwrite=True)
     else:
         mask = ImageHandler().createCircularMask(boxSize=xsize, radius=int(0.25 * xsize), is3D=True)
 
@@ -401,10 +415,16 @@ def main():
 
     # MoDART model
     modart = MoDART(vol, mask, xsize, args.sr, ctf_type=args.ctf_type, symmetry_group=args.symmetry_group,
-                  reconstruct_halves=args.reconstruct_halves, rngs=nnx.Rngs(model_key))
+                  reconstruct_halves=args.reconstruct_halves, refine_positions=args.refine_positions,
+                  rngs=nnx.Rngs(model_key))
+
+    # Query points for the motion field
+    field_query_coords = jnp.stack([modart.inds[:, 2], modart.inds[:, 1], modart.inds[:, 0]],
+                                   axis=1).astype(jnp.float32)
 
     # Volume adjustment (only if reference volume is provided)
-    if args.vol is not None:
+    adjust_volume = args.vol is not None and not auto_reference
+    if adjust_volume:
         # Extract mask coords
         inds = np.asarray(np.where(mask > 0.0)).T
         values = vol[inds[:, 0], inds[:, 1], inds[:, 2]]
@@ -415,19 +435,45 @@ def main():
         # Define volume adjustment network
         volumeAdjustment = VolumeAdjustment(lat_dim=3, coords=coords, values=values, predicts_value=True, rngs=nnx.Rngs(model_key))
 
+    knn_field_op = None
     if args.motion_correction is not None:
         # Reload network to perform motion correction
         model = NeuralNetworkCheckpointer.load(args.motion_correction)
         graphdef_motion_correction, state_motion_correction = nnx.split(model)
 
+        # Two ways to get the field onto the reconstruction voxels. An implicit
+        # mass-transport HetSIREN is a continuous function of (latent, coordinate), so it can
+        # simply be evaluated where we need it -- exact, and no interpolation stage to get
+        # wrong. Anything else (Zernike3Deep, a fixed-grid HetSIREN) only defines the field on
+        # its own points, so it needs an interpolator; that one is a normalised k-NN average,
+        # which is bounded by construction
+        dvd = getattr(model, "delta_volume_decoder", None)
+        direct_field = bool(getattr(dvd, "transport_mass", False)
+                            and getattr(dvd, "is_implicit", False)
+                            and not getattr(dvd, "point_transformer", False))
+        if direct_field:
+            print(f"{bcolors.OKGREEN}Motion field evaluated directly at the {modart.inds.shape[0]} "
+                  f"reconstruction voxels.{bcolors.ENDC}")
+        else:
+            probe = jnp.zeros((1, xsize, xsize, 1), jnp.float32)
+            _, source_coords = decode_field_sparse(graphdef_motion_correction,
+                                                   state_motion_correction, probe)
+            knn_field_op = build_knn_field_operator(np.asarray(source_coords[0]),
+                                                    np.asarray(field_query_coords))
+            print(f"{bcolors.OKGREEN}Motion field interpolated from {source_coords.shape[1]} model "
+                  f"points onto {modart.inds.shape[0]} reconstruction voxels (normalised k-NN)."
+                  f"{bcolors.ENDC}")
+
     # Prepare summary writer
     writer = JaxSummaryWriter(os.path.join(args.output_path, "MoDART_metrics"))
 
-    # Jitted functions for volume prediction
+    # Jitted volume prediction
     @jax.jit
     def get_modart_volume(graphdef, state):
         model, _ = nnx.merge(graphdef, state)
-        return model(filter=True)
+        return model(filter=False)
+
+    get_modart_volume_full = get_modart_volume
 
     def write_intermediate_modart(volumes, step_idx):
         """Write the intermediate map(s) to disk and log their central slices.
@@ -454,13 +500,14 @@ def main():
                                                                            shuffle="global", num_epochs=None,
                                                                            num_workers=-1, num_threads=1,
                                                                            split_fraction=[0.5, 0.5],
+                                                                           split_mode="parity",
                                                                            load_to_ram=args.load_images_to_ram)
-        steps_per_epoch_even = int(int(0.5 * len(generator.md)) / args.batch_size)
     else:
         data_loader = generator.return_grain_dataset(batch_size=args.batch_size,  shuffle="global", num_epochs=None,
                                                      num_workers=-1, num_threads=1, split_fraction=None,
                                                      load_to_ram=args.load_images_to_ram)
-    steps_per_epoch = int(len(generator.md) / args.batch_size)
+    steps_per_epoch = max(1, int(len(generator.md) / args.batch_size))
+    total_steps_per_epoch = steps_per_epoch
 
     # Example of training data for Tensorboard
     example_loader = data_loader_even if args.reconstruct_halves else data_loader
@@ -469,7 +516,7 @@ def main():
         x_example = jax.vmap(min_max_scale)(x_example)
         writer.add_images("Example of data batch", x_example, dataformats="NHWC")
 
-    if args.vol is not None:
+    if adjust_volume:
         checkpoint_volume_adjustment = os.path.join(args.output_path, "VolumeAdjustment")
         if not os.path.isdir(checkpoint_volume_adjustment):
             # Optimizers (Volume Adjustment)
@@ -534,14 +581,16 @@ def main():
         grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2]].set(values)
         modart.reference_volume = grid
         modart.delta_volume_decoder.reference_values = values
+        rms_adj = float(np.sqrt(np.mean(np.asarray(values, np.float32) ** 2)))
+        modart.delta_volume_decoder.value_scale = rms_adj if rms_adj > 1e-12 else 1.0
 
-    # Learning rate scheduler
-    total_steps_per_epoch =  steps_per_epoch if not args.reconstruct_halves else steps_per_epoch_even
-    total_steps = 20 * total_steps_per_epoch
-    lr_schedule = CosineAnnealingScheduler.getScheduler(peak_value=1e-3, total_steps=total_steps, warmup_frac=0.1, init_value=0.0, end_value=0.0)
+    # Learning rate scheduler, annealed over exactly the epochs that will be run.
+    total_schedule_steps = args.epochs * total_steps_per_epoch
+    lr_schedule = CosineAnnealingScheduler.getScheduler(peak_value=1e-3, total_steps=total_schedule_steps,
+                                                        warmup_frac=0.1, init_value=0.0, end_value=0.0)
 
     # Early stopping
-    early_stop = EarlyStopping(min_delta=1e-6, patience=2. * total_steps_per_epoch)
+    early_stop = EarlyStopping(min_delta=1e-5, patience=3)
 
     # Optimizers (MoDART)
     optimizer = nnx.Optimizer(modart, optax.adam(lr_schedule), wrt=nnx.Param)
@@ -558,8 +607,34 @@ def main():
 
     i = 0
     total_steps = 0
-    pbar = tqdm(range(steps_per_epoch), file=sys.stdout, ascii=" >=", colour="green",
+    epoch = 0
+    log_every = max(1, int(np.ceil(0.1 * total_steps_per_epoch)))
+    pbar = tqdm(range(total_steps_per_epoch), file=sys.stdout, ascii=" >=", colour="green",
                 bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
+
+    def fetch_batch():
+        """One training batch as (images, labels), both with an explicit map axis."""
+        if args.reconstruct_halves:
+            x_even, labels_even = next(iter_data_loader_even)
+            x_odd, labels_odd = next(iter_data_loader_odd)
+            return (jnp.stack([x_even, x_odd], axis=1),
+                    jnp.stack([labels_even, labels_odd], axis=1))
+        x_b, labels_b = next(iter_data_loader)
+        return x_b[:, None, ...], labels_b[:, None, ...]
+
+    def motion_field(x_b):
+        """The per-particle displacement at the reconstruction voxels, (B, maps, P, 3)."""
+        if args.motion_correction is None:
+            return jnp.zeros((x_b.shape[0], x_b.shape[1], modart.inds.shape[0], 3), jnp.float32)
+        flat = jnp.reshape(x_b, (-1, x_b.shape[2], x_b.shape[3], 1))
+        if knn_field_op is None:
+            field = decode_field_modart(graphdef_motion_correction, state_motion_correction,
+                                        flat, field_query_coords, chunk_size=args.field_chunk)
+        else:
+            sparse, _ = decode_field_sparse(graphdef_motion_correction,
+                                            state_motion_correction, flat)
+            field = apply_knn_field(sparse, *knn_field_op)
+        return jnp.reshape(field, (x_b.shape[0], x_b.shape[1], field.shape[-2], 3))
 
     with ExitStack() as stack:
         if args.reconstruct_halves:
@@ -568,119 +643,87 @@ def main():
         else:
             iter_data_loader = stack.enter_context(closing(iter(data_loader)))
 
-        while not early_stop.should_stop:
+        while epoch < args.epochs and not early_stop.should_stop:
+            total_loss = 0.0
+            total_recon_loss = jnp.zeros((modart.num_maps,))
+            step = 0
+            pbar.reset()
+            pbar.set_description(f"Epoch {epoch + 1}/{args.epochs}")
 
-            if total_steps % steps_per_epoch == 0:
+            # Intermediate volume
+            if logger.should("images", epoch):
+                with logger.section():
+                    modart_volume = get_modart_volume(graphdef, state)
+                    if args.reconstruct_halves:
+                        volumes = (np.array(modart_volume[0]), np.array(modart_volume[1]))
+                    else:
+                        volumes = (np.array(modart_volume),)
+                logger.submit(write_intermediate_modart, volumes, epoch)
 
-                total_loss = 0
-                total_recon_loss = 0 if not args.reconstruct_halves else jnp.zeros((2, ))
+            for _ in range(total_steps_per_epoch):
+                x, labels = fetch_batch()
+                field_modart = motion_field(x)
 
-                # For progress bar (TQDM)
-                step = 1
-                pbar.reset()
-                pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}")
+                rng, step_key = jax.random.split(rng)
 
-                # Intermediate volume
-                if logger.should("images", i):
-                    with logger.section():
-                        modart_volume = get_modart_volume(graphdef, state)
-                        if args.reconstruct_halves:
-                            volumes = (np.array(modart_volume[0]), np.array(modart_volume[1]))
-                        else:
-                            volumes = (np.array(modart_volume),)
-                    logger.submit(write_intermediate_modart, volumes, i)
+                loss, recon_loss, state = single_step_modart(
+                    graphdef, state, x, labels, md_columns, field_modart, step_key,
+                    l1_delta=args.l1_delta, tv_lambda=args.tv_lambda, coord_reg=args.coord_reg)
 
-                i += 1
-
-            # For progress bar (TQDM)
-            if args.reconstruct_halves:
-                (x_even, labels_even) = next(iter_data_loader_even)
-                (x_odd, labels_odd) = next(iter_data_loader_odd)
-                x = jnp.stack([x_even, x_odd], axis=1)
-                labels = jnp.stack([labels_even, labels_odd], axis=1)
-
-                if args.motion_correction is not None:
-                    x_interpolation = jnp.reshape(x, (-1, x.shape[2], x.shape[3], 1))
-                    field_modart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x_interpolation, modart.inds)
-                    field_modart = jnp.reshape(x, (x.shape[0], x.shape[1], field_modart.shape[1], field_modart.shape[2]))
-                else:
-                    field_modart = jnp.zeros((x.shape[0], modart.inds.shape[0], 3))[:, None, ...]
-
-                loss, recon_loss, state = single_step_modart(graphdef, state, x, labels, md_columns, field_modart, rng)
                 total_loss += loss
                 total_recon_loss += recon_loss
-
-                # Progress bar update  (TQDM)
-                pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss.mean() / step:.5f}")
-
-                # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * steps_per_epoch_even)) == 0:
-                    writer.add_scalar('Training loss (MoDART)',
-                                      total_loss / step,
-                                      i * steps_per_epoch_even + step)
-
-                    writer.add_scalars('Reconstruction loss (MoDART)',
-                                       {"First half": total_recon_loss[0] / step, "Second half": total_recon_loss[1] / step},
-                                       i * steps_per_epoch_even + step)
-
-                # Update early stopping criteria
-                early_stop = early_stop.update(total_loss / step)
-                if early_stop.should_stop:
-                    print(
-                        f"{bcolors.WARNING}End of reconstruction detected. Finishing reconstruction epochs...{bcolors.ENDC}")
-                    break
-
                 step += 1
-            else:
-                (x, labels) = next(iter_data_loader)
-                if args.motion_correction is not None:
-                    field_modart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x, modart.inds)
-                else:
-                    field_modart = jnp.zeros((x.shape[0], modart.inds.shape[0], 3))
+                total_steps += 1
 
-                x = x[:, None, ...]
-                labels = labels[:, None, ...]
-                field_modart = field_modart[:, None, ...]
+                pbar.set_postfix_str(f"loss={total_loss / step:.5f} | "
+                                     f"recon_loss={total_recon_loss.mean() / step:.5f}")
 
-                loss, recon_loss, state = single_step_modart(graphdef, state, x, labels, md_columns, field_modart, rng)
-                total_loss += loss
-                total_recon_loss += recon_loss[0]
+                if step % log_every == 0:
+                    writer.add_scalar('Training loss (MoDART)', total_loss / step,
+                                      epoch * total_steps_per_epoch + step)
+                    if args.reconstruct_halves:
+                        writer.add_scalars('Reconstruction loss (MoDART)',
+                                           {"First half": total_recon_loss[0] / step,
+                                            "Second half": total_recon_loss[1] / step},
+                                           epoch * total_steps_per_epoch + step)
+                    else:
+                        writer.add_scalar('Reconstruction loss (MoDART)',
+                                          total_recon_loss[0] / step,
+                                          epoch * total_steps_per_epoch + step)
+                pbar.update()
 
-                # Progress bar update  (TQDM)
-                pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss / step:.5f}")
-
-                # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * steps_per_epoch)) == 0:
-                    writer.add_scalar('Training loss (MoDART)',
-                                      total_loss / step,
-                                      i * steps_per_epoch + step)
-
-                    writer.add_scalar('Reconstruction loss (MoDART)',
-                                      total_recon_loss / step,
-                                      i * steps_per_epoch + step)
-
-                # Update early stopping criteria
-                early_stop = early_stop.update(total_loss / step)
-                if early_stop.should_stop:
-                    print(f"{bcolors.WARNING}End of reconstruction detected. Finishing reconstruction epochs...{bcolors.ENDC}")
-                    break
-
-                step += 1
-
-            pbar.update()
-            total_steps += 1
+            # One early-stopping update per epoch, on the completed epoch's mean.
+            epoch_loss = float(total_loss / max(step, 1))
+            epoch += 1
+            i = epoch
+            early_stop = early_stop.update(epoch_loss)
+            if early_stop.should_stop:
+                print(f"{bcolors.WARNING}Reconstruction loss stopped improving after {epoch} "
+                      f"epochs; finishing.{bcolors.ENDC}")
 
     # Let the background logging thread finish before writing the final map.
     logger.close()
 
-    # Save final MoDART volume
-    modart_volume = get_modart_volume(graphdef, state)
+    # Save final MoDART volume. Same rendering as the previews, no extra filtering: the
+    # amplitudes were fitted through this renderer, so this is the map that was actually fitted.
+    modart_volume = get_modart_volume_full(graphdef, state)
     if args.reconstruct_halves:
-        ImageHandler().write(np.array(modart_volume[0]), os.path.join(args.output_path, "modart_first_half.mrc"), overwrite=True)
-        ImageHandler().write(np.array(modart_volume[1]), os.path.join(args.output_path, "modart_second_half.mrc"), overwrite=True)
-        ImageHandler().write(np.array(0.5 * (modart_volume[0] + modart_volume[1])), os.path.join(args.output_path, "modart_map.mrc"), overwrite=True)
+        half_a, half_b = np.array(modart_volume[0]), np.array(modart_volume[1])
+        ImageHandler().write(half_a, os.path.join(args.output_path, "modart_first_half.mrc"), overwrite=True)
+        ImageHandler().write(half_b, os.path.join(args.output_path, "modart_second_half.mrc"), overwrite=True)
+        ImageHandler().write(np.array(0.5 * (half_a + half_b)), os.path.join(args.output_path, "modart_map.mrc"), overwrite=True)
+
+        # The point of reconstructing halves is to be able to answer "did this improve
+        # anything?". Report the FSC, and the consensus's own resolution next to it so the
+        # ceiling set by the box is visible rather than implied.
+        report_half_map_resolution(half_a, half_b, args.sr,
+                                   label="MoDART", reference=vol if args.vol is not None else None)
     else:
         ImageHandler().write(np.array(modart_volume), os.path.join(args.output_path, "modart_map.mrc"), overwrite=True)
+        print(f"{bcolors.WARNING}No half maps were reconstructed, so there is no FSC and no way to "
+              f"tell whether this map is better than its reference. Re-run with "
+              f"{bcolors.ITALIC}--reconstruct_halves{bcolors.ENDC}{bcolors.WARNING} to measure it."
+              f"{bcolors.ENDC}")
 
     # If exists, clean MMAP
     # if not args.load_images_to_ram and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):

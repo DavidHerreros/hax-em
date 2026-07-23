@@ -51,7 +51,7 @@ PROGRAMS = ["preprocess_particles", "preprocess_volumes",
             "hetsiren", "reconsiren", "reconsiren_het_only", "zernike3deep",
             "estimate_latent_covariances", "latent_space_deconvolution",
             "filter_latents", "flexconsensus", "decode_states_from_latents",
-            "modart", "reconstruct_volume", "annotate_space",
+            "modart", "reconstruct_volume", "reconstruct_motion_corrected", "annotate_space",
             "image_gray_scale_adjustment", "volume_gray_scale_adjustment",
             "display_metrics"]
 

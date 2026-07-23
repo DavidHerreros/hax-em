@@ -260,7 +260,7 @@ class MultiEncoder(nnx.Module):
 
 class DeltaVolumeDecoder(nnx.Module):
     def __init__(self, total_voxels, lat_dim, volume_size, coords, reference_values, transport_mass=False, is_implicit=True, hybrid_pe=False,
-                 point_transformer=False, *, rngs: nnx.Rngs):
+                 point_transformer=False, rigid_gauge=True, rigid_gauge_irls=1, *, rngs: nnx.Rngs):
         self.volume_size = volume_size
         self.reference_values = reference_values[None, ...]
         self.total_voxels = total_voxels
@@ -274,6 +274,27 @@ class DeltaVolumeDecoder(nnx.Module):
         self.scale = 0.5 * max(maxs[0] - mins[0], maxs[1] - mins[1], maxs[2] - mins[2])
         self.centering = jnp.array((0.5 * volume_size, 0.5 * volume_size, 0.5 * volume_size))[None, None, ...]
         self.coords = ((coords[None, ...] - self.centering) / self.scale)
+
+        # Pin the decoder's output to a canonical frame to  leave the pose head as the only thing that can explain a pose error
+        self.rigid_gauge = rigid_gauge
+        self.rigid_gauge_irls = int(rigid_gauge_irls)
+
+        gauge_weights = np.asarray(reference_values, dtype=np.float32)
+        if not np.any(gauge_weights != 0.0):
+            gauge_weights = np.ones_like(gauge_weights)
+        gauge_weights = np.maximum(gauge_weights, 0.0)
+        gauge_weights = gauge_weights / max(float(gauge_weights.mean()), 1e-8)
+
+        if transport_mass:
+            self.gauge = nnx.static(RigidGauge(mode="displacement",
+                                               rest_coords=np.asarray(self.coords[0]),
+                                               weights=gauge_weights))
+        else:
+            self.gauge = nnx.static(RigidGauge(mode="density",
+                                               basis=build_density_rigid_basis(np.asarray(coords),
+                                                                               np.asarray(reference_values),
+                                                                               volume_size),
+                                               weights=gauge_weights))
 
         # Scale value for SIREN2
         inds = jnp.stack([coords[:, 2], coords[:, 1], coords[:, 0]], axis=1)
@@ -290,8 +311,20 @@ class DeltaVolumeDecoder(nnx.Module):
         # Graph from coordinates
         if not jnp.all(reference_values == 0) and transport_mass:
             # Graph from reference
-            self.edge_index, self.edge_weights, self.consensus_distances, self.tau, _, _ = build_graph_from_coordinates(self.coords[0], k_spacing=2, k_knn=6, radius_factor=1.5)
-            self.edge_weights = jnp.ones_like(self.edge_weights)
+            self.edge_index, geom_weights, self.consensus_distances, tau_edge, _, _ = build_graph_from_coordinates(self.coords[0], k_spacing=2, k_knn=6, radius_factor=1.5)
+
+            # Mass-weight the graph
+            i_e, j_e = self.edge_index
+            node_mass = jnp.asarray(reference_values, dtype=jnp.float32)
+            node_mass = jnp.maximum(node_mass, 0.0)
+            self.node_mass = node_mass
+            edge_mass = jnp.sqrt(node_mass[i_e] * node_mass[j_e] + 1e-12)
+            self.edge_weights = geom_weights * edge_mass
+
+            # Repulsion cutoff from the mass-carrying points only, so padding with low-mass
+            # Gaussians cannot retune the collision scale inside the protein.
+            self.tau = (jnp.sum(self.edge_weights * self.consensus_distances)
+                        / (jnp.sum(self.edge_weights) + 1e-8))
 
         # Delta volume decoder (TODO: Check and fix hypernetwork - compare with TF implementation)
         # self.hidden_linear = [HyperLinear(in_features=lat_dim, out_features=8, in_hyper_features=lat_dim, hidden_hyper_features=8, rngs=rngs, dtype=jnp.bfloat16)]
@@ -303,13 +336,19 @@ class DeltaVolumeDecoder(nnx.Module):
             if self.point_transformer:
                 self.geom = nnx.data(build_geometry(self.coords[0], gauss_scale="auto", hierarchical_sizes=(32, 128, 512), compute_local_frames=True))
 
-                # self.point_transformer_net = PointTransformerDecoder(out_channels=4, latent_dim=lat_dim, rngs=rngs)
+                # Motion head based on PT
+                self.point_transformer_net = PointTransformerDecoder(out_channels=3, feat_dim=32, nk=256, input_bottleneck=64,
+                                                                     hierarchical_sizes=(32, 128, 512), latent_dim=lat_dim // 2,
+                                                                     final_init_std=0.0, rngs=rngs)
 
-                self.point_transformer_net = PointTransformerDecoder(out_channels=(3, 1), feat_dim=32, nk=256, input_bottleneck=64,
-                                                                     hierarchical_sizes=(32, 128, 512), latent_dim=lat_dim, rngs=rngs)
+                # Occupancy head
+                hidden_values = [Siren2Linear(in_features=lat_dim // 2 + 3, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=True, w0=30.0, s=s0, use_bias=False)]
+                hidden_values.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=False, w0=1.0, s=s1, use_bias=False))
+                for _ in range(7):
+                    hidden_values.append(Siren2Linear(in_features=32, out_features=32, rngs=rngs, dtype=jnp.float32, is_first=False, w0=1.0, s=0.0, use_bias=False))
+                hidden_values.append(nnx.Linear(in_features=32, out_features=1, rngs=rngs, use_bias=False, kernel_init=nnx.initializers.zeros_init()))
 
-                # self.point_transformer_coords = PointTransformerDecoder(out_channels=3, feat_dim=256, latent_dim=lat_dim, rngs=rngs)
-                # self.point_transformer_values = PointTransformerDecoder(out_channels=1, feat_dim=64, latent_dim=lat_dim, rngs=rngs)  # Or 128
+                self.hidden_values = nnx.List(hidden_values)
 
             elif self.is_implicit:
                 if not self.hybrid_pe:
@@ -372,20 +411,85 @@ class DeltaVolumeDecoder(nnx.Module):
 
             self.hidden_values = nnx.List(hidden_values)
 
-    def __call__(self, x, c=None, freq_alpha=1.0):
+    def graph_terms(self):
+        """Graph quantities for the elastic priors, relative to the consensus.
+
+        Returns ``(edge_index, edge_weights, consensus_distances, consensus_positions,
+        node_mass)``. All of these are fixed buffers built once in ``__init__``.
+        """
+        return (self.edge_index, self.edge_weights, self.consensus_distances,
+                self.coords[0], self.node_mass)
+
+    def apply_rigid_gauge(self, field, rest_override=None, weight_override=None):
+        """Pin a per-particle decoder field to the canonical (rigid-gauge) frame.
+
+        ``field`` is ``(B, N, 3)`` -- the displacement of the rest points, in
+        normalized units -- with mass transport, and ``(B, N, 1)`` -- the density
+        change on the fixed points -- without. Returns the gauged field and the
+        fraction of it that was rigid, i.e. how much of what the decoder just
+        produced was pose rather than conformation.
+
+        ``rest_override`` / ``weight_override`` let the caller superpose against the
+        *corrected* consensus (learnable Δc0 / Δw0) rather than the static original, so
+        the per-particle deformation is gauged relative to where the consensus actually
+        is. They are detached: the frame is chosen by the consensus, not optimised through.
+
+        The fraction is measured even when the gauge is switched off, so a run can be
+        checked for pose absorption without changing its behaviour. When the gauge is
+        unavailable (a density gauge with no reference volume) both are skipped.
+        """
+        if not self.gauge.available:
+            return field, jnp.zeros((), dtype=jnp.float32)
+
+        if weight_override is not None:
+            weights = jnp.maximum(jax.lax.stop_gradient(weight_override), 0.0)
+            weights = jnp.where(jnp.sum(weights) > 1e-8, weights, jnp.ones_like(weights))
+        else:
+            weights = jnp.asarray(self.gauge.weights)
+
+        if self.gauge.mode == "displacement":
+            rest = (jax.lax.stop_gradient(rest_override) if rest_override is not None
+                    else jnp.asarray(self.gauge.rest_coords))
+            gauged, rigid_fraction = gauge_displacement_field(field.astype(jnp.float32),
+                                                              rest, weights, irls_iters=self.rigid_gauge_irls)
+        else:
+            gauged, rigid_fraction = gauge_density_field(field.astype(jnp.float32),
+                                                         jnp.asarray(self.gauge.basis),
+                                                         weights, irls_iters=self.rigid_gauge_irls)
+
+        if not self.rigid_gauge:
+            return field, rigid_fraction
+
+        return gauged.astype(field.dtype), rigid_fraction
+
+    def __call__(self, x, c=None, freq_alpha=1.0, occ_alpha=1.0, return_diagnostics=False):
         # freq_alpha in (0, 1] anneals the effective frequency (w0) of the first
         # SIREN layer for coarse-to-fine training; 1.0 = no change. It only
         # applies to the SIREN-based decoders (not point transformer / hybrid PE).
+        #
+        # occ_alpha in [0, 1] ramps the per-particle occupancy change into the density.
+        # At 0 the amplitudes are exactly the (consensus) reference, so every particle
+        # renders the same density and the reconstruction is explained purely by
+        # transport -- large motions organise first. As it ramps to 1 the occupancy is
+        # released to explain the residual that motion cannot (compositional change).
         if self.transport_mass:
             if self.point_transformer:
-                # x = self.point_transformer_net(x, self.geom)
-                # x_coords, x_map = x[..., :-1], x[..., -1]
+                # Disjoint latent subspaces for the two pathways
+                x_pt, x_val = jnp.split(x, indices_or_sections=2, axis=-1)
 
-                x_coords, x_map = self.point_transformer_net(x, self.geom)
-                x_map = x_map[..., 0]
+                # Displacement
+                x_coords = self.point_transformer_net(x_pt, self.geom)
 
-                # x_coords = self.point_transformer_coords(x, self.geom)
-                # x_map = self.point_transformer_values(x, self.geom)[..., 0]
+                # Occupancy
+                if c is None:
+                    c = self.coords[0]
+                c_tiled = jnp.tile(c[None, ...], (x.shape[0], 1, 1))
+                x_map = jnp.concatenate([c_tiled,
+                                         jnp.tile(x_val[:, None, ...], (1, c_tiled.shape[1], 1))], axis=-1)
+                x_map = self.hidden_values[0](x_map, freq_alpha)
+                for layer in self.hidden_values[1:-1]:
+                    x_map = layer(x_map)
+                x_map = self.hidden_values[-1](x_map)[..., 0]
 
             elif self.is_implicit:
                 # Positional encoding of coords
@@ -396,6 +500,7 @@ class DeltaVolumeDecoder(nnx.Module):
                 # Adjust latents
                 x = jnp.tile(x[:, None, ...], (1, c.shape[1], 1))
 
+                # Disjoint latent subspaces for the two pathways
                 x_coords, x_map = jnp.split(x, indices_or_sections=2, axis=-1)
 
                 # Join coords and latents
@@ -434,6 +539,7 @@ class DeltaVolumeDecoder(nnx.Module):
                     x_map = self.hidden_values[-1](x_map)[..., 0]
 
             else:
+                # Disjoint latent subspaces for the two pathways
                 x_coords, x_map = jnp.split(x, indices_or_sections=2, axis=1)
 
                 # Decode values
@@ -452,11 +558,20 @@ class DeltaVolumeDecoder(nnx.Module):
 
             delta_coords, delta_values = x_coords, x_map
 
-            # Recover volume values
-            values = nnx.relu(self.reference_values + delta_values)
+            # TODO: Leaving this to consider a corrected (possibly learnable) consensus
+            c0, w0 = self.coords, self.reference_values
+
+            # The deformation is where a rigid motion is cheapest to express here, so that
+            # is the field the gauge acts on -- superposed against the corrected consensus
+            delta_coords, rigid_fraction = self.apply_rigid_gauge(delta_coords,
+                                                                  rest_override=c0[0], weight_override=w0[0])
+
+            # Occupancy
+            occ_change = occ_alpha * delta_values
+            values = nnx.relu(w0 + occ_change)
 
             # Recover coords (non-normalized)
-            coords = self.scale * (self.coords + delta_coords)
+            coords = self.scale * (c0 + delta_coords)
         else:
             # Decode voxel values
             x_map = self.hidden_values[0](x, freq_alpha)
@@ -464,23 +579,105 @@ class DeltaVolumeDecoder(nnx.Module):
                 x_map = layer(x_map)
             x_map = self.hidden_values[-1](x_map)
 
+            # The positions are fixed in this mode, so the only field that can carry
+            # a pose refinement is the density itself.
+            x_map, rigid_fraction = self.apply_rigid_gauge(x_map[..., None])
+            x_map = x_map[..., 0]
+
             # Recover volume values
             values = self.reference_values + x_map
+
+            # Fixed-grid mode has no transport, so no occupancy/motion split to make.
+            occ_change = jnp.zeros_like(x_map)
 
             # Recover coords (non-normalized)
             coords = self.scale * self.coords.repeat(x.shape[0], axis=0)
 
+        if return_diagnostics:
+            return coords, values, rigid_fraction, occ_change
+
         return coords, values
+
+    def _raw_delta_coords(self, x, c, freq_alpha=1.0):
+        """The coordinate head's un-gauged output at query points ``c``.
+
+        ``c`` is ``(M, 3)`` in the decoder's normalized units, ``x`` is ``(B, lat_dim)``.
+        Returns ``(B, M, 3)``. This is the piece of ``__call__``'s implicit branch that is a
+        genuine function of (latent, coordinate), factored out so it can be evaluated at
+        points other than the decoder's own Gaussians -- which is what makes the field
+        transferable to a dense reconstruction grid without any splat/interpolate round trip.
+        """
+        c_t = jnp.tile(c[None, ...], (x.shape[0], 1, 1))
+        x_t = jnp.tile(x[:, None, ...], (1, c_t.shape[1], 1))
+        # Only the first half of the latent drives the coordinate head (__call__ splits it).
+        x_coords, _ = jnp.split(x_t, indices_or_sections=2, axis=-1)
+
+        if self.hybrid_pe:
+            c_pe = positional_encoding(c_t[0], 10, self.scale)
+            c_pe = jnp.tile(c_pe[None, ...], (x.shape[0], 1, 1))
+            h = jnp.concatenate([c_pe, x_coords], axis=-1)
+            h = nnx.elu(self.hidden_coords[0](h))
+            for layer in self.hidden_coords[1:-1]:
+                h = nnx.elu(layer(h))
+            return self.hidden_coords[-1](h)
+
+        h = jnp.concatenate([c_t, x_coords], axis=-1)
+        h = self.hidden_coords[0](h, freq_alpha)
+        for layer in self.hidden_coords[1:-1]:
+            h = layer(h)
+        return self.hidden_coords[-1](h)
+
+    def decode_field_at(self, x, c_query, freq_alpha=1.0, chunk_size=None):
+        """The gauged deformation field evaluated at arbitrary query coordinates.
+
+        ``c_query`` is ``(M, 3)`` in the decoder's normalized units (i.e. the same frame as
+        ``self.coords``); ``x`` is ``(B, lat_dim)``. Returns ``(B, M, 3)``, the displacement
+        of those query points, in normalized units.
+
+        The gauge is fitted on the decoder's own Gaussians and then applied to the query
+        points, rather than refitted on the query set. Refitting would place the dense field
+        in a different frame than the one the network was trained in -- the robust
+        reweighting is driven by the point distribution, and a dense grid has a different one
+        -- so the two fields would differ by an unaccounted rigid motion.
+
+        ``chunk_size`` splits the query points so the ``(B, M, 32)`` hidden activations stay
+        bounded; at M ~ 3e5 and B = 8 a single pass is ~700 MB per layer.
+        """
+        if not (self.transport_mass and self.is_implicit and not self.point_transformer):
+            raise UserWarning("decode_field_at requires an implicit mass-transport decoder "
+                              "(--transport_mass, --implicit_network, no point transformer).")
+
+        c0, w0 = self.coords, self.reference_values
+
+        # Fit the rigid gauge once, on the Gaussians, exactly as __call__ does.
+        delta_ref = self._raw_delta_coords(x, c0[0], freq_alpha)
+        if self.gauge.available and self.rigid_gauge:
+            w = jnp.maximum(jax.lax.stop_gradient(w0[0]), 0.0)
+            w = jnp.where(jnp.sum(w) > 1e-8, w, jnp.ones_like(w))
+            transform = gauge_displacement_transform(delta_ref.astype(jnp.float32),
+                                                     jax.lax.stop_gradient(c0[0]), w,
+                                                     irls_iters=self.rigid_gauge_irls)
+        else:
+            transform = None
+
+        def one_chunk(cq):
+            d = self._raw_delta_coords(x, cq, freq_alpha)
+            if transform is None:
+                return d
+            return apply_gauge_to_points(cq, d.astype(jnp.float32), transform)
+
+        if chunk_size is None or chunk_size >= c_query.shape[0]:
+            return one_chunk(c_query)
+
+        return jnp.concatenate([one_chunk(c_query[i:i + chunk_size])
+                                for i in range(0, c_query.shape[0], chunk_size)], axis=1)
 
     def decode_coords_only(self, x, c=None):
         if self.transport_mass:
             if self.point_transformer:
-                # x = self.point_transformer_net(x, self.geom)
-                # x_coords = x[..., :-1]
-
-                x_coords, _ = self.point_transformer_net(x, self.geom)
-
-                # x_coords = self.point_transformer_coords(x, self.geom)
+                # `x` is already the coords half of the latent here (the inverse decoder
+                # is built with lat_dim // 2), exactly as in the implicit branch
+                x_coords = self.point_transformer_net(x, self.geom)
 
             elif self.is_implicit:
                 # Positional encoding of coords
@@ -521,13 +718,24 @@ class DeltaVolumeDecoder(nnx.Module):
 
                 x_coords = jnp.reshape(x_coords, (x.shape[0], self.total_voxels, 3))
 
+            # Same gauge as __call__, or the inverse decoder would be trained against
+            # a different frame than the forward one.
+            c0, w0 = self.coords, self.reference_values
+            x_coords, _ = self.apply_rigid_gauge(x_coords, rest_override=c0[0],
+                                                 weight_override=w0[0])
+
             # Recover coords (non-normalized)
-            coords = self.scale * (self.coords + x_coords)
+            coords = self.scale * (c0 + x_coords)
         else:
             # Recover coords (non-normalized)
             coords = self.scale * self.coords.repeat(x.shape[0], axis=0)
 
         return coords
+
+    def decode_consensus_volume(self, filter=True, sigma=1.0):
+        """Render the consensus map itself (the input reference)."""
+        c0, w0 = self.coords, self.reference_values
+        return self.decode_volume(coords_values=(self.scale * c0, w0), filter=filter, sigma=sigma)
 
     def decode_volume(self, x=None, coords_values=None, filter=True, sigma=1.0):
         if x is not None:
@@ -673,7 +881,7 @@ class HetSIREN(nnx.Module):
     def __init__(self, lat_dim, reference_volume, reconstruction_mask, coords, values, xsize, sr, bank_size=1024, ctf_type="apply",
                  sigma=1.0, decoupling=False, isVae=False, transport_mass=False, local_reconstruction=False, architecture="convnn",
                  is_implicit=True, isTomoSIREN=False, train_inverse=False, point_transformer=False,
-                 loss_type=None, *, rngs: nnx.Rngs, **kwargs):
+                 loss_type=None, rigid_gauge=True, rigid_gauge_irls=1, *, rngs: nnx.Rngs, **kwargs):
         super(HetSIREN, self).__init__()
         self.xsize = xsize
         self.ctf_type = ctf_type
@@ -690,9 +898,11 @@ class HetSIREN(nnx.Module):
         self.has_reference_volume = not bool(np.all(reference_volume == 0.0))
         self.encoder = MultiEncoder(self.xsize, lat_dim, n_layers=3, isVae=isVae, architecture=architecture, isTomoSIREN=isTomoSIREN, rngs=rngs) \
             if decoupling or isTomoSIREN else Encoder(self.xsize, lat_dim, isVae=isVae, architecture=architecture, rngs=rngs)
-        self.delta_volume_decoder = DeltaVolumeDecoder(self.coords.shape[0], lat_dim, self.xsize, self.coords, values, transport_mass=transport_mass, is_implicit=is_implicit, point_transformer=point_transformer, rngs=rngs)
+        self.delta_volume_decoder = DeltaVolumeDecoder(self.coords.shape[0], lat_dim, self.xsize, self.coords, values, transport_mass=transport_mass, is_implicit=is_implicit, point_transformer=point_transformer, rigid_gauge=rigid_gauge, rigid_gauge_irls=rigid_gauge_irls, rngs=rngs)
         if self.train_inverse:
-            inv_lat_dim = lat_dim if self.delta_volume_decoder.point_transformer else lat_dim // 2
+            # The inverse decoder recovers the latent that produced a point cloud, so it can
+            # only recover the half that drives the coordinates
+            inv_lat_dim = lat_dim // 2
             self.inverse_volume_decoder = PointCloudEncoder(latent_dim=inv_lat_dim, hidden=64, n_blocks=4, dtype=jnp.float32, scale_multiplier=1.0, rngs=rngs)
 
         self.phys_decoder = PhysDecoder(self.xsize, sr, transport_mass=transport_mass)
@@ -712,8 +922,6 @@ class HetSIREN(nnx.Module):
         #   transformer decoder, which needs a Fourier-space loss).
         if loss_type is None:
             loss_type = "mse"
-        if self.delta_volume_decoder.point_transformer and loss_type == "mse":
-            loss_type = "frc"
         self.loss_type = loss_type
 
         if loss_type == "frc":
@@ -802,11 +1010,22 @@ class HetSIREN(nnx.Module):
         else:
             return images_corrected
 
-    def decode_volume(self, x):
+    def decode_volume(self, x, motion=True, occupancy=True):
+        """Decode a volume from latents, optionally ablating either pathway"""
         if x.ndim == 1:
             x = x[None, ...]
 
-        return self.delta_volume_decoder.decode_volume(x=x, filter=True, sigma=self.sigma)
+        if motion and occupancy:
+            return self.delta_volume_decoder.decode_volume(x=x, filter=True, sigma=self.sigma)
+
+        dec = self.delta_volume_decoder
+        coords, values = dec(x)
+        if not motion:
+            coords = jnp.broadcast_to(dec.scale * dec.coords, coords.shape)
+        if not occupancy:
+            values = jnp.broadcast_to(dec.reference_values, values.shape)
+
+        return dec.decode_volume(coords_values=(coords, values), filter=True, sigma=self.sigma)
 
     def decode_field(self, x):
         if x.ndim == 4:
@@ -814,10 +1033,29 @@ class HetSIREN(nnx.Module):
 
         coords, values = self.delta_volume_decoder(x)
 
-        inital_coords = self.delta_volume_decoder.scale * self.delta_volume_decoder.coords
+        c0 = self.delta_volume_decoder.coords
+        inital_coords = self.delta_volume_decoder.scale * c0
         field = coords - inital_coords
 
         return (field / (0.5 * self.xsize), inital_coords / (0.5 * self.xsize))
+
+    def decode_field_at(self, x, coords_vox, chunk_size=None):
+        """The deformation field sampled at arbitrary voxel coordinates.
+
+        ``coords_vox`` is ``(M, 3)`` in (x, y, z) voxel index units of the model's own box --
+        i.e. what ``numpy.where`` on a mask gives after reversing the axis order. ``x`` is a
+        latent batch ``(B, lat_dim)``, or a batch of images ``(B, H, W, 1)``.
+
+        Returns the displacement in voxels, ``(B, M, 3)``, component order (x, y, z) so it
+        adds directly to ``coords_vox``.
+        """
+        if x.ndim == 4:
+            x, _ = self(x)
+
+        dvd = self.delta_volume_decoder
+        c_query = (jnp.asarray(coords_vox, jnp.float32) - dvd.centering[0, 0]) / dvd.scale
+        field = dvd.decode_field_at(x, c_query, chunk_size=chunk_size)
+        return dvd.scale * field
 
     def cloud_to_latent(self, cloud):
         if self.train_inverse:
@@ -833,11 +1071,17 @@ class HetSIREN(nnx.Module):
 
 @partial(jax.jit, static_argnames=("do_update", "l1_lambda", "graph_lambda", "pose_refine_reg",
                                    "decoupling_lambda", "distance_preservation_lambda", "kl_lambda", "arap_lambda",
-                                   "geometric_lambda", "arap_rotation"))
+                                   "geometric_lambda", "arap_rotation", "pose_refine_max_angle",
+                                   "shift_refine_reg", "shift_refine_max",
+                                   "occupancy_reg", "occupancy_tv", "occupancy_kappa"))
 def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_lambda=1e-4, graph_lambda=1e-4,
                         warmup_alpha=1.0, pose_refine_reg=0.1, decoupling_lambda=1e-4, distance_preservation_lambda=1e-4,
                         kl_lambda=1e-3, freq_alpha=1.0, arap_lambda=0.0, geometric_lambda=0.0, render_sigma=None,
-                        amp_recon_weight=0.1, arap_rotation="polar"):
+                        arap_rotation="polar", latent_alpha=1.0,
+                        pose_refine_max_angle=8.0, shift_refine_reg=0.1, shift_refine_max=4.0,
+                        occ_alpha=1.0, occupancy_reg=0.0, occupancy_tv=1.0, occupancy_kappa=0.05,
+                        amp_recon_weight=0.1,
+                        ):
     model, optimizer = nnx.merge(graphdef, state)
     distributions_key, rot_sample_key, choice_key, key = jnr.split(key, 4)
 
@@ -854,10 +1098,12 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         wiener2DFilter_vmap = wiener2DFilter
         ctfFilter_vmap = ctfFilter
 
-    # sparse_finite_3D_differences_field = jax.vmap(sparse_finite_3D_differences, in_axes=(-1, None, None), out_axes=-1)
-    calculate_deformation_regularity_loss_batch = jax.vmap(calculate_deformation_regularity_loss, in_axes=(0, None, None, None))
-    calculate_repulsion_loss_batch = jax.vmap(calculate_repulsion_loss, in_axes=(0, None, None))
-    calculate_arap_loss_batch = jax.vmap(partial(calculate_arap_loss, rotation_method=arap_rotation),
+    # Mass-weighted reductions (weighted_mean=True) so the graph priors track the consensus
+    # mass rather than the raw edge count; repulsion additionally takes the edge weights.
+    calculate_deformation_regularity_loss_batch = jax.vmap(partial(calculate_deformation_regularity_loss, weighted_mean=True),
+                                                           in_axes=(0, None, None, None))
+    calculate_repulsion_loss_batch = jax.vmap(calculate_repulsion_loss, in_axes=(0, None, None, None))
+    calculate_arap_loss_batch = jax.vmap(partial(calculate_arap_loss, rotation_method=arap_rotation, weighted_mean=True),
                                          in_axes=(0, None, None, None, None))
 
     def loss_fn(model, x):
@@ -890,11 +1136,18 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
             else:
                 latent, (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key, warmup_alpha=warmup_alpha)
 
-        # Decode volumes (freq_alpha anneals the decoder's first-SIREN-layer w0)
-        if model.isVae:
-            coords, values = model.delta_volume_decoder(sample, freq_alpha=freq_alpha)
-        else:
-            coords, values = model.delta_volume_decoder(latent, freq_alpha=freq_alpha)
+        # Decode volumes (freq_alpha anneals the decoder's first-SIREN-layer w0).
+        #
+        # latent_alpha (in [0, 1]) ramps the latent into the decoder. While it is 0
+        # the decoder sees the same (zero) latent for every particle, so it can only
+        # produce a single consensus volume -- and a consensus volume cannot absorb a
+        # *per-particle* pose error. Every bit of the misalignment therefore has to be explained by the pose head,
+        # which is what gives it a clean first shot at the residual. The heterogeneity
+        # is then ramped in against poses that have already been refined
+        z_dec = latent_alpha * (sample if model.isVae else latent)
+        coords, values, rigid_fraction, occ_change = model.delta_volume_decoder(z_dec, freq_alpha=freq_alpha,
+                                                                                occ_alpha=occ_alpha,
+                                                                                return_diagnostics=True)
 
         # Get rotation matrices
         if euler_angles.ndim == 2:
@@ -919,12 +1172,14 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
             rotations_refined = jnp.matmul(rotations, rotations_rigid)
         shifts_refined = shifts + shifts_rigid
 
-        # Geodesic anchor: keep the rigid rotation close to the identity so it stays a refinement
+        # Priors on the pose refinement
         cos_theta_rigid = jnp.clip((jnp.trace(rotations_rigid, axis1=-2, axis2=-1) - 1.0) / 2.0, -1.0, 1.0)
-        pose_refine_loss = jnp.mean(1.0 - cos_theta_rigid)
+        cos_deadzone = jnp.cos(jnp.deg2rad(pose_refine_max_angle))
+        pose_refine_loss = jnp.mean(nnx.relu((1.0 - cos_theta_rigid) - (1.0 - cos_deadzone)))
 
-        # Only rigid part: coords and values
-        reference_values = model.delta_volume_decoder.reference_values
+        # Priors on the in-plane shifts
+        shifts_sq = jnp.sum(jnp.square(shifts_rigid), axis=-1)
+        shift_refine_loss = jnp.mean(nnx.relu(shifts_sq - shift_refine_max ** 2))
 
         # Centering
         centering = model.delta_volume_decoder.centering
@@ -934,13 +1189,17 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         # it (render_sigma, coupled to the freq annealing).
         render_sigma_eff = model.sigma if render_sigma is None else render_sigma
 
-        # Generate projections
-        if model.has_reference_volume:
-            images_corrected, _ = phys_decoder(x, values, jax.lax.stop_gradient(coords), model.xsize, rotations_refined, shifts_refined,
+        # Generate the projections
+        if model.has_reference_volume and model.delta_volume_decoder.transport_mass:
+            reference_values = model.delta_volume_decoder.reference_values
+            images_corrected, _ = phys_decoder(x, values, jax.lax.stop_gradient(coords), model.xsize,
+                                               rotations_refined, shifts_refined,
                                                centering, ctf, model.ctf_type, render_sigma_eff, 0.0)
-            images_corrected_field, _ = phys_decoder(x, reference_values, coords, model.xsize, rotations_refined, shifts_refined,
+            images_corrected_field, _ = phys_decoder(x, reference_values, coords, model.xsize,
+                                                     rotations_refined, shifts_refined,
                                                      centering, ctf, model.ctf_type, render_sigma_eff, 0.0)
         else:
+            # No consensus to pin the amplitudes to, so there is no split to make
             images_corrected, _ = phys_decoder(x, values, coords, model.xsize, rotations_refined, shifts_refined,
                                                centering, ctf, model.ctf_type, render_sigma_eff, 0.0)
             images_corrected_field = images_corrected
@@ -964,28 +1223,20 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         images_corrected = jnp.squeeze(images_corrected)
         images_corrected_field = jnp.squeeze(images_corrected_field)
         x = jnp.squeeze(x)
-        # if not model.delta_volume_decoder.transport_mass:
-        #     images_consensus = jnp.squeeze(images_consensus)
 
         # Consider CTF if Wiener mode (only for loss)
         if model.ctf_type == "wiener":
             x_loss = wiener2DFilter(x, ctf, pad_factor=pad_factor)
             images_corrected_loss = wiener2DFilter_vmap(images_corrected, ctf, pad_factor)
             images_corrected_field_loss = wiener2DFilter_vmap(images_corrected_field, ctf, pad_factor)
-            # if not model.delta_volume_decoder.transport_mass:
-            #     images_consensus_loss = wiener2DFilter_vmap(images_consensus, ctf, pad_factor)
         elif model.ctf_type == "squared":
             x_loss = ctfFilter(x, ctf, pad_factor=pad_factor)
             images_corrected_loss = ctfFilter_vmap(images_corrected, ctf, pad_factor)
             images_corrected_field_loss = ctfFilter_vmap(images_corrected_field, ctf, pad_factor)
-            # if not model.delta_volume_decoder.transport_mass:
-            #     images_consensus_loss = ctfFilter_vmap(images_consensus, ctf, pad_factor)
         else:
             x_loss = x
             images_corrected_loss = images_corrected
             images_corrected_field_loss = images_corrected_field
-            # if not model.delta_volume_decoder.transport_mass:
-            #     images_consensus_loss = images_consensus
 
         if M > 1:
             x_loss = x_loss[:, None, ...]
@@ -994,13 +1245,13 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         x_loss = x_loss * projected_mask
         images_corrected_loss = images_corrected_loss * projected_mask
         images_corrected_field_loss = images_corrected_field_loss * projected_mask
-        # if not model.delta_volume_decoder.transport_mass:
-        #     images_consensus_loss = images_consensus_loss * projected_mask
 
         # Split the reconstruction between the amplitude pathway (learned values at
         # frozen coords -> images_corrected) and the mass-transport pathway (fixed
         # reference values at learned coords -> images_corrected_field)
-        recon_loss = amp_recon_weight * model.representation_loss_fn(images_corrected_loss, x_loss, freq_alpha) + (1.0 - amp_recon_weight) * model.representation_loss_fn(images_corrected_field_loss, x_loss, freq_alpha)
+        recon_loss = (amp_recon_weight * model.representation_loss_fn(images_corrected_loss, x_loss, freq_alpha)
+                      + (1.0 - amp_recon_weight)
+                      * model.representation_loss_fn(images_corrected_field_loss, x_loss, freq_alpha))
 
         # if model.delta_volume_decoder.transport_mass:
 
@@ -1050,9 +1301,10 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         # else:
         #     loss_cm = 0.0
 
-        # Local distance preservation
+        # Local distance preservation (decoded through the same latent ramp, or it
+        # would compare two different decoder inputs)
         if model.isVae:
-            coords_mean, values_mean = model.delta_volume_decoder(latent, freq_alpha=freq_alpha)
+            coords_mean, values_mean = model.delta_volume_decoder(latent_alpha * latent, freq_alpha=freq_alpha)
             loss_dp = jnp.abs(values[..., None] * coords / model.delta_volume_decoder.scale
                               - values_mean[..., None] * coords_mean / model.delta_volume_decoder.scale).mean()
         else:
@@ -1091,25 +1343,24 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
 
         # Graph based loss
         if model.has_reference_volume and model.delta_volume_decoder.transport_mass:
-            # Get data
-            consensus_distances = model.delta_volume_decoder.consensus_distances
+            # Graph terms relative to the (possibly learnable) corrected consensus, so the
+            # priors do not fight a consensus correction.
+            radius_graph, edge_weights, consensus_distances, consensus_positions, _ = \
+                model.delta_volume_decoder.graph_terms()
             deformed_positions = coords / model.delta_volume_decoder.scale
-            radius_graph = model.delta_volume_decoder.edge_index
-            edge_weights = model.delta_volume_decoder.edge_weights
             tau = model.delta_volume_decoder.tau
 
             # Losses
             loss_def_regularity = calculate_deformation_regularity_loss_batch(deformed_positions, radius_graph,
                                                                               consensus_distances, edge_weights)
-            loss_repulsion = calculate_repulsion_loss_batch(deformed_positions, radius_graph, tau)
+            loss_repulsion = calculate_repulsion_loss_batch(deformed_positions, radius_graph, tau, edge_weights)
 
             # As-rigid-as-possible term: penalise only the non-rigid part of the
             # local deformation (factors out the best local rotation), so hinge /
             # domain motions are not over-stiffened while noise-driven shear is
-            # resisted. Consensus (rest) positions are the decoder's normalized
-            # coords; deformed_positions are in the same normalized frame.
+            # resisted. Rest positions are the corrected consensus; deformed_positions are
+            # in the same normalized frame.
             if arap_lambda > 0.0:
-                consensus_positions = model.delta_volume_decoder.coords[0]
                 num_points = deformed_positions.shape[1]
                 loss_arap = calculate_arap_loss_batch(deformed_positions, consensus_positions,
                                                       radius_graph, edge_weights, num_points).mean()
@@ -1120,6 +1371,20 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
             loss_graph = (loss_def_regularity + 0.01 * loss_repulsion).mean() + arap_lambda * loss_arap
         else:
             loss_graph = 0.0
+
+        # Occupancy prior (transport mode)
+        if occupancy_reg > 0.0 and model.delta_volume_decoder.transport_mass and model.has_reference_volume:
+            edge_idx, edge_mass, _, _, node_mass = model.delta_volume_decoder.graph_terms()
+            node_mass = jax.lax.stop_gradient(node_mass)   # (N,); mass gates the prior, not optimised through it
+            edge_mass = jax.lax.stop_gradient(edge_mass)   # (E,)
+            occ_l1 = jnp.mean(jnp.sum(jnp.abs(occ_change) / (node_mass[None, :] + occupancy_kappa), axis=-1))
+
+            i_e, j_e = edge_idx
+            occ_tv = jnp.mean(jnp.sum(edge_mass[None, :] * jnp.abs(occ_change[:, i_e] - occ_change[:, j_e]), axis=-1)
+                              / (jnp.sum(edge_mass) + 1e-8))
+            loss_occupancy = occ_l1 + occupancy_tv * occ_tv
+        else:
+            loss_occupancy = 0.0
 
         # Decoupling
         if model.decoupling or model.isTomoSIREN:
@@ -1165,7 +1430,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
 
             def _render_point(z, ctx_i):
                 rot_i, shift_i, ctf_i = ctx_i
-                z_b = z[None, :]
+                z_b = latent_alpha * z[None, :]
                 coords_z, values_z = model.delta_volume_decoder(z_b, freq_alpha=freq_alpha)
                 img, _ = model.phys_decoder(z_b, values_z, coords_z, model.xsize,
                                             rot_i[None], shift_i[None], centering,
@@ -1179,10 +1444,41 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         else:
             loss_geometric = 0.0
 
-        loss = (nll + kl_lambda * kl_loss + 0.000001 * kl_pose + decoupling_lambda * decoupling_loss
+        # The KL rides the latent ramp: while the decoder ignores the latent, the
+        # reconstruction cannot push the posterior away from the prior, so a KL at
+        # full strength would just collapse a latent that is not being used yet
+        loss = (nll + kl_lambda * latent_alpha * kl_loss + 0.000001 * kl_pose + decoupling_lambda * decoupling_loss
                 + l1_lambda * l1_loss + graph_lambda * loss_graph + 100. * hist_loss + distance_preservation_lambda * loss_dp
-                + pose_refine_reg * pose_refine_loss + geometric_lambda * loss_geometric)
-        return loss, (recon_loss.mean(), latent)
+                + pose_refine_reg * pose_refine_loss + shift_refine_reg * shift_refine_loss
+                + geometric_lambda * loss_geometric + occupancy_reg * loss_occupancy)
+
+        # Pose diagnostics. `rigid_fraction` is how much of what the decoder just
+        # produced lives in the rigid subspace, i.e. how much pose the decoder is
+        # absorbing; it is measured even when the gauge is off. If the refinement
+        # angle and shift sit at ~0 while this climbs, the decoder is eating the pose
+        #
+        # `occ_fraction` is the share of the decoded density change explained by
+        # occupancy rather than motion: mean |occ_change| relative to the mean absolute
+        # deviation of the amplitudes from the reference. If it climbs while the
+        # deformation field goes quiet, the occupancy prior is too weak (compositional
+        # change is being explained as amplitude, not caught as motion, or vice versa)
+        theta_deg = jnp.rad2deg(jnp.arccos(jnp.clip(cos_theta_rigid, -1.0 + 1e-6, 1.0 - 1e-6)))
+        occ_fraction = jnp.mean(jnp.abs(occ_change)) / (jnp.mean(jnp.abs(values)) + 1e-8)
+
+        # The size of the deformation that survives the gauge, in Angstrom -- the only part
+        # that reaches the density, and the only part a downstream motion correction can use
+        deformation_A = jnp.mean(jnp.linalg.norm(
+            coords - model.delta_volume_decoder.scale * model.delta_volume_decoder.coords,
+            axis=-1)) * model.sr
+
+        metrics = {"pose_angle_deg": jnp.mean(theta_deg),
+                   "shift_norm_px": jnp.mean(jnp.sqrt(shifts_sq + 1e-8)),
+                   "rigid_fraction": rigid_fraction,
+                   "deformation_A": deformation_A,
+                   "occ_fraction": occ_fraction}
+        metrics = jax.lax.stop_gradient(metrics)
+
+        return loss, (recon_loss.mean(), latent, metrics)
 
     # Check if Tomo mode
     if model.isTomoSIREN:
@@ -1227,9 +1523,9 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
     params = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('delta_volume_decoder')))
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True, argnums=nnx.DiffState(0, params))
     if model.isTomoSIREN:
-        (loss, (recon_loss, latent)), grads = grad_fn(model, (x, subtomogram_label))
+        (loss, (recon_loss, latent, metrics)), grads = grad_fn(model, (x, subtomogram_label))
     else:
-        (loss, (recon_loss, latent)), grads = grad_fn(model, x)
+        (loss, (recon_loss, latent, metrics)), grads = grad_fn(model, x)
 
     if do_update:
         grads, _ = grads.split(params, ...)
@@ -1241,9 +1537,9 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
 
         state = nnx.state((model, optimizer))
 
-        return loss, recon_loss, state, key
+        return loss, recon_loss, metrics, state, key
     else:
-        return loss, recon_loss
+        return loss, recon_loss, metrics
 
 
 @partial(jax.jit, static_argnames=("do_update"))
@@ -1292,9 +1588,8 @@ def train_step_inverse_hetsiren(graphdef, state, x, labels, md, key, do_update=T
         mask = jax.random.bernoulli(subkey2, p=p, shape=(coords_scaled_resampled.shape[1],))[None, ...]
         inv_latent = model.inverse_volume_decoder(coords_scaled_resampled, mask=mask)
 
-        latent_no_grad = jax.lax.stop_gradient(latent)
-        if not model.delta_volume_decoder.point_transformer:
-            latent_no_grad = latent_no_grad[..., :model.lat_dim // 2]
+        # Only the coords half of the latent is recoverable from the point cloud
+        latent_no_grad = jax.lax.stop_gradient(latent)[..., :model.lat_dim // 2]
         loss = jnp.mean(jnp.square(latent_no_grad - inv_latent), axis=-1).mean()
         # loss = jnp.mean((jnp.sum(inv_latent - latent_no_grad, axis=-1) / (jnp.sum(jnp.abs(latent_no_grad), axis=-1) + 1e-6)) ** 2)
 
@@ -1352,8 +1647,9 @@ def gradient_for_recon_graph_losses(graphdef, state, x, labels, md, key):
     wiener2DFilter_vmap = wiener2DFilter
     ctfFilter_vmap = ctfFilter
 
-    calculate_deformation_regularity_loss_batch = jax.vmap(calculate_deformation_regularity_loss, in_axes=(0, None, None, None))
-    calculate_repulsion_loss_batch = jax.vmap(calculate_repulsion_loss, in_axes=(0, None, None))
+    calculate_deformation_regularity_loss_batch = jax.vmap(partial(calculate_deformation_regularity_loss, weighted_mean=True),
+                                                           in_axes=(0, None, None, None))
+    calculate_repulsion_loss_batch = jax.vmap(calculate_repulsion_loss, in_axes=(0, None, None, None))
 
     def predict_latent_from_images(model, x):
         # Check if Tomo mode
@@ -1462,7 +1758,7 @@ def gradient_for_recon_graph_losses(graphdef, state, x, labels, md, key):
             # Losses
             loss_def_regularity = calculate_deformation_regularity_loss_batch(deformed_positions, radius_graph,
                                                                               consensus_distances, edge_weights)
-            loss_repulsion = calculate_repulsion_loss_batch(deformed_positions, radius_graph, tau)
+            loss_repulsion = calculate_repulsion_loss_batch(deformed_positions, radius_graph, tau, edge_weights)
 
             # Total loss
             loss_graph = (loss_def_regularity + 0.01 * loss_repulsion).mean()
@@ -1734,12 +2030,46 @@ def main():
                         help=f'When set, HetSIREN will use an implicit neural network approach to recover conformational states. Implicit neural networks are more memory consuming, but they are also more accurate in the detection of very local motions. '
                              f'If this architecture is selected, we strongly recommend to set as well the parameter {bcolors.ITALIC}total_mass{bcolors.ENDC} to limit the memory consumption of the network and increase its performance.')
     parser.add_argument("--pose_refine_reg", required=False, type=float, default=0.1,
-                        help=f"Strength of the geodesic anchor that keeps the per-image rigid pose refinement close to the input poses (penalizes 1 - cos(theta) of the "
-                             f"refinement rotation). Larger values keep the refinement smaller/more conservative; set to 0 to disable it. "
-                             f"({bcolors.WARNING}NOTE{bcolors.ENDC}: this is the only regularizer acting on the rigid pose refinement in the default M=1 sampling regime)")
-    parser.add_argument("--pose_refine_warmup_epochs", required=False, type=float, default=3.0,
-                        help=f"Number of initial epochs over which the rigid pose refinement is ramped in from the identity. During this warmup the input poses are kept "
-                             f"(almost) untouched so the conformation latent and decoder can settle before poses start being refined. Set to 0 to refine from the first step.")
+                        help=f"Strength of the hinge that keeps the per-image rigid pose refinement within {bcolors.ITALIC}--pose_refine_max_angle{bcolors.ENDC} of the input poses. "
+                             f"It penalizes only the excess beyond that angle, so a genuinely-needed small correction is not pushed back to zero. Set to 0 to disable it.")
+    parser.add_argument("--pose_refine_max_angle", required=False, type=float, default=8.0,
+                        help=f"Deadzone (in degrees) of the pose-refinement hinge: rotations up to this angle are free, beyond it they are penalized with weight "
+                             f"{bcolors.ITALIC}--pose_refine_reg{bcolors.ENDC}. This is what 'stay a refinement' should mean -- do not wander further than a plausible alignment error. "
+                             f"{bcolors.WARNING}NOTE{bcolors.ENDC}: setting it to {bcolors.ITALIC}0{bcolors.ENDC} recovers the old one-sided pull towards the identity, which penalizes "
+                             f"even the sub-degree corrections you want and biases the model into letting the decoder absorb the pose instead.")
+    parser.add_argument("--shift_refine_reg", required=False, type=float, default=0.1,
+                        help=f"Strength of the hinge on the per-image in-plane shift refinement, the exact analogue of {bcolors.ITALIC}--pose_refine_reg{bcolors.ENDC} for translations. "
+                             f"Set to 0 to disable. ({bcolors.WARNING}NOTE{bcolors.ENDC}: the shift refinement previously had no prior at all, even though a 2D image shift is exactly a "
+                             f"3D translation of the decoded object and is therefore the most trivially absorbable part of the refinement)")
+    parser.add_argument("--shift_refine_max", required=False, type=float, default=4.0,
+                        help=f"Deadzone (in pixels) of the shift-refinement hinge: shifts up to this magnitude are free, beyond it they are penalized with weight "
+                             f"{bcolors.ITALIC}--shift_refine_reg{bcolors.ENDC}.")
+    parser.add_argument("--pose_refine_warmup_epochs", required=False, type=float, default=0.0,
+                        help=f"Number of initial epochs over which the rigid pose refinement is ramped in from the identity. {bcolors.WARNING}NOTE{bcolors.ENDC}: the refinement heads are "
+                             f"zero-initialized, so the model already starts at exactly the input poses -- the ramp buys nothing at initialization and only scales the pose head's gradient "
+                             f"towards zero during precisely the window in which the decoder is learning to absorb the misalignment. It now defaults to 0 (refine from the first step); the "
+                             f"decoder is instead held at a consensus early on, see {bcolors.ITALIC}--latent_warmup_epochs{bcolors.ENDC}.")
+    parser.add_argument("--latent_warmup_epochs", required=False, type=float, default=None,
+                        help=f"Number of initial epochs over which the latent is ramped INTO the decoder (default: {bcolors.ITALIC}~12%% of --epochs{bcolors.ENDC}, so the schedule scales with the budget). "
+                             f"For the first half of this window the decoder sees a zero latent, so it can only "
+                             f"produce a single consensus volume -- and a consensus volume cannot absorb a {bcolors.ITALIC}per-particle{bcolors.ENDC} pose error, so the whole misalignment "
+                             f"has to be explained by the pose head. Over the second half the latent (and the KL term, which rides the same clock) ramps in linearly, against poses that have "
+                             f"already been refined. This is the coarse-to-fine ordering a classical refinement uses -- consensus and poses first, heterogeneity after -- and it costs nothing. "
+                             f"Set to 0 to feed the full latent from the first step.")
+    parser.add_argument("--rigid_gauge", required=False, type=str, default="core", choices=["core", "mass", "off"],
+                        help=f"Pins the decoder's per-particle output to a canonical frame, so a pose error cannot be absorbed by the decoder and has nowhere to go except the pose head "
+                             f"(rotating the decoded object and refining the image pose produce the SAME projection, so without this the two are interchangeable -- and since every geometric "
+                             f"prior here is rigid-invariant while the pose head is anchored to the identity, the decoder is the cheaper place for the model to put a misalignment). With "
+                             f"{bcolors.ITALIC}--transport_mass{bcolors.ENDC} the deformed cloud is rigidly superposed back onto the rest cloud (a weighted Kabsch, one 3x3 solve per particle); "
+                             f"without it, the linearized rigid perturbations of the reference density are projected out instead. "
+                             f"{bcolors.WARNING}It does NOT remove motion{bcolors.ENDC}: the correction is an isometry of the decoded object, so internal distances, hinge angles and relative "
+                             f"domain motions are preserved exactly -- what it fixes is the FRAME the motion is reported in, and that frame is chosen by the weights: "
+                             f"{bcolors.ITALIC}core{bcolors.ENDC} (default) reweights against the residual so the frame is set by the least-moving part of the structure (the rigid core), which "
+                             f"leaves domain motions entirely in the deformation field. {bcolors.ITALIC}mass{bcolors.ENDC} uses the mass-weighted optimal superposition instead, in which a large "
+                             f"domain motion makes the 'stationary' domain appear to counter-rotate and lets the pose head absorb a slice of the conformational change. {bcolors.ITALIC}off"
+                             f"{bcolors.ENDC} disables the correction but still reports the diagnostic, so a run can be checked for pose absorption without changing its behaviour. "
+                             f"{bcolors.WARNING}NOTE{bcolors.ENDC}: without mass transport the gauge needs a reference density to differentiate, so it is unavailable (and silently a no-op) on "
+                             f"fully ab-initio runs with no {bcolors.ITALIC}--vol{bcolors.ENDC}.")
     parser.add_argument("--train_inverse", action='store_true',
                         help=f"When set, HetSIREN will additionally train an inverse decoder that maps the output Gaussian positions (the deformed point cloud produced by the "
                              f"decoder) back to latent vectors. This provides a direct point-cloud -> latent encoding that complements the image-based encoder. "
@@ -1783,24 +2113,47 @@ def main():
                              f"clock). Set to 1.0 to disable (default; fixed base width). Typical: 2-2.5 - the render blur uses a fixed 9-px kernel, so a broadened width beyond "
                              f"~2.5x the base sigma is progressively truncated (still broadens, just sub-linearly), which bounds the useful range.")
     parser.add_argument("--schedule_recon_split", action='store_true',
-                        help=f"Schedule the mass-transport reconstruction split instead of using the fixed {bcolors.ITALIC}0.1 / 0.9{bcolors.ENDC} weighting. The reconstruction loss "
-                             f"is a blend of an amplitude pathway (learned densities at frozen positions) and a mass-transport pathway (fixed reference densities at learned positions); "
-                             f"the weight of the amplitude term ramps linearly from {bcolors.ITALIC}--recon_split_start{bcolors.ENDC} to {bcolors.ITALIC}--recon_split_final{bcolors.ENDC} "
-                             f"over {bcolors.ITALIC}--recon_split_epochs{bcolors.ENDC} (the motion term takes the complement). Starting near 0 makes early training explain the data almost "
-                             f"purely by moving mass, so large-amplitude motions emerge and converge faster before the amplitude head is allowed to absorb residual density changes. Only "
-                             f"meaningful with mass transport ({bcolors.ITALIC}--transport_mass{bcolors.ENDC}). Default: off (fixed {bcolors.ITALIC}--recon_split_final{bcolors.ENDC} throughout, "
-                             f"i.e. the historical 0.1 / 0.9).")
+                        help=f"Ramp the reconstruction split over training instead of holding it fixed. When set, the weight of the amplitude term ramps linearly from "
+                             f"{bcolors.ITALIC}--recon_split_start{bcolors.ENDC} to {bcolors.ITALIC}--recon_split_final{bcolors.ENDC} over {bcolors.ITALIC}--recon_split_epochs"
+                             f"{bcolors.ENDC} (the motion term takes the complement). Starting near 0 makes early training explain the data almost purely by transport, so large "
+                             f"motions organise before occupancy is allowed in. Only meaningful with mass transport ({bcolors.ITALIC}--transport_mass{bcolors.ENDC}). Default: off "
+                             f"(fixed {bcolors.ITALIC}--recon_split_final{bcolors.ENDC} throughout).")
     parser.add_argument("--recon_split_start", required=False, type=float, default=0.0,
-                        help=f"Amplitude-term weight at the START of training when {bcolors.ITALIC}--schedule_recon_split{bcolors.ENDC} is on. {bcolors.ITALIC}0.0{bcolors.ENDC} (default) "
-                             f"means pure mass transport early (the reconstruction is explained entirely by motion). Ignored when scheduling is off.")
+                        help=f"Amplitude-term weight at the START of training when {bcolors.ITALIC}--schedule_recon_split{bcolors.ENDC} is on. {bcolors.ITALIC}0.0{bcolors.ENDC} "
+                             f"(default) means the data is explained purely by mass transport at the beginning.")
     parser.add_argument("--recon_split_final", required=False, type=float, default=0.1,
                         help=f"Amplitude-term weight at the END of the ramp (and the fixed weight used throughout when {bcolors.ITALIC}--schedule_recon_split{bcolors.ENDC} is off). "
-                             f"{bcolors.ITALIC}0.1{bcolors.ENDC} (default) reproduces the historical 0.1 / 0.9 split. The motion term always takes the complement (1 - this).")
+                             f"The reconstruction loss is {bcolors.ITALIC}w x L(learned amplitudes, frozen coords) + (1-w) x L(reference amplitudes, learned coords){bcolors.ENDC}. "
+                             f"The second term can only be reduced by moving mass, so it is what forces motion to be modelled as transport; the first lets occupancy explain the "
+                             f"residual transport cannot, without being able to leak gradient into the coordinate head. Default {bcolors.ITALIC}0.1{bcolors.ENDC} (90%% transport). "
+                             f"Raise it toward 0.5 if genuine compositional change is being forced into motion; lower it toward 0 for pure transport.")
     parser.add_argument("--recon_split_epochs", required=False, type=float, default=0.0,
-                        help=f"Number of initial epochs over which the amplitude-term weight ramps from {bcolors.ITALIC}--recon_split_start{bcolors.ENDC} to {bcolors.ITALIC}--recon_split_final"
-                             f"{bcolors.ENDC} when {bcolors.ITALIC}--schedule_recon_split{bcolors.ENDC} is on. If left at 0, it rides the coarse-to-fine clock and reuses "
-                             f"{bcolors.ITALIC}--freq_anneal_epochs{bcolors.ENDC} (amplitude is introduced as the resolution is refined); if both are 0 the weight jumps straight to "
-                             f"{bcolors.ITALIC}--recon_split_final{bcolors.ENDC}.")
+                        help=f"Number of initial epochs over which the amplitude-term weight ramps from {bcolors.ITALIC}--recon_split_start{bcolors.ENDC} to "
+                             f"{bcolors.ITALIC}--recon_split_final{bcolors.ENDC}. Only used with {bcolors.ITALIC}--schedule_recon_split{bcolors.ENDC}; if left at 0 the ramp "
+                             f"falls back to the {bcolors.ITALIC}--freq_anneal_epochs{bcolors.ENDC} clock.")
+    parser.add_argument("--occupancy_reg", required=False, type=float, default=0.0,
+                        help=f"Weight of the occupancy prior, which lets HetSIREN model {bcolors.ITALIC}compositional{bcolors.ENDC} heterogeneity (a domain/ligand appearing or "
+                             f"disappearing between particles) rather than forcing everything through the deformation field. Each Gaussian carries a per-particle amplitude change on top "
+                             f"of the reference; this penalises it with a {bcolors.ITALIC}scale-normalised L1{bcolors.ENDC} (cost = fold change where the reference has density, so "
+                             f"modulating existing density is cheap, while creating mass where the reference is empty costs {bcolors.ITALIC}|occ|/--occupancy_kappa{bcolors.ENDC} -- possible "
+                             f"but expensive). Set to 0 (default) to disable occupancy entirely (pure mass transport). Only meaningful with mass transport ({bcolors.ITALIC}--transport_mass"
+                             f"{bcolors.ENDC}) and a reference. {bcolors.WARNING}NOTE{bcolors.ENDC}: watch the {bcolors.ITALIC}occ_fraction{bcolors.ENDC} diagnostic -- if it climbs while the "
+                             f"pose/deformation goes quiet, lower this or {bcolors.ITALIC}--occupancy_kappa{bcolors.ENDC}.")
+    parser.add_argument("--occupancy_kappa", required=False, type=float, default=0.05,
+                        help=f"Creation threshold of the occupancy prior (as a density, in the reference's gray scale; default {bcolors.ITALIC}0.05{bcolors.ENDC}). It is added to the "
+                             f"reference amplitude in the L1 denominator, so it sets how much evidence it takes to invent mass where the reference is (near) empty: smaller = harder to create "
+                             f"mass, larger = easier. Where the reference already has substantial density it has little effect (the cost is a fold change). Only used when "
+                             f"{bcolors.ITALIC}--occupancy_reg{bcolors.ENDC} > 0.")
+    parser.add_argument("--occupancy_tv", required=False, type=float, default=1.0,
+                        help=f"Relative weight of the spatial-coherence (graph total-variation) term of the occupancy prior (default {bcolors.ITALIC}1.0{bcolors.ENDC}). It penalises "
+                             f"occupancy {bcolors.ITALIC}differences{bcolors.ENDC} between neighbouring Gaussians, so a whole domain switching on together pays only at its boundary while "
+                             f"scattered noise pays everywhere -- this is what separates a genuine compositional domain from amplitude noise. Raise it for blockier occupancy, lower it toward "
+                             f"0 to allow finer-grained occupancy. Only used when {bcolors.ITALIC}--occupancy_reg{bcolors.ENDC} > 0.")
+    parser.add_argument("--occupancy_warmup_epochs", required=False, type=float, default=3.0,
+                        help=f"Number of initial epochs over which occupancy is ramped in (default {bcolors.ITALIC}3.0{bcolors.ENDC}). While it ramps, the amplitudes stay at the reference "
+                             f"so the data is explained purely by transport -- large motions organise first -- and occupancy is then released to explain only the residual that motion cannot "
+                             f"(compositional change). Feeding occupancy from step 0 lets it short-circuit the motion (it is a strictly easier way to fit any image), so a non-zero warmup is "
+                             f"recommended. Only used when {bcolors.ITALIC}--occupancy_reg{bcolors.ENDC} > 0; set to 0 to use occupancy from the first step.")
     parser.add_argument("--arap_lambda", required=False, type=float, default=0.0,
                         help=f"Weight of the as-rigid-as-possible (ARAP) deformation prior. Unlike the distance-preservation term, ARAP factors out the best local rotation per "
                              f"Gaussian before penalizing the deformation, so locally rigid motions (hinges, domain rotations) are NOT over-stiffened while noise-driven non-rigid "
@@ -1932,20 +2285,12 @@ def main():
     if args.reload is not None:
         hetsiren = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "HetSIREN"))
 
+
     # Train network
     if args.mode == "train":
 
         # Prepare summary writer
         writer = JaxSummaryWriter(os.path.join(args.output_path, "HetSIREN_metrics"))
-
-        # data_loader_train, data_loader_val = generator.return_grain_dataset(batch_size=args.batch_size, shuffle="global_data_loader", num_epochs=None,
-        #                                                                     num_workers=-1, num_threads=1, split_fraction=args.dataset_split_fraction,
-        #                                                                     load_to_ram=args.load_images_to_ram)
-        # steps_per_epoch = int(int(args.dataset_split_fraction[0] * len(generator.md)) / args.batch_size)
-        # steps_per_val = int(int(args.dataset_split_fraction[1] * len(generator.md)) / args.batch_size)
-        # NOTE: the training data loader and steps_per_epoch are built further down,
-        # once the model exists and ``--batch_size auto`` (if requested) has been
-        # resolved into a concrete value (both depend on the batch size).
 
         # Projector help text in Tensorboard
         legend_projector = """
@@ -2048,7 +2393,14 @@ def main():
                                 isTomoSIREN=isTomoSIREN, is_implicit=use_implicit,
                                 point_transformer=use_point_transformer, train_inverse=train_inverse,
                                 loss_type=args.loss_type,
+                                rigid_gauge=args.rigid_gauge != "off",
+                                rigid_gauge_irls=1 if args.rigid_gauge == "core" else 0,
                                 architecture="convnn", rngs=nnx.Rngs(model_key))
+
+            if args.rigid_gauge != "off" and not hetsiren.delta_volume_decoder.gauge.available:
+                print(f"\n{bcolors.WARNING}--rigid_gauge {args.rigid_gauge} was requested, but without mass transport the gauge needs a reference "
+                      f"density to build its basis and none was given (--vol). The projection is disabled; the pose refinement is still protected by "
+                      f"--latent_warmup_epochs and the refinement hinges.{bcolors.ENDC}")
         hetsiren.train()
 
         # Resolve ``--batch_size auto`` before the data loader and steps_per_epoch
@@ -2113,6 +2465,14 @@ def main():
             x_example, labels_example = next(iter(data_loader_train))
         x_example = jax.vmap(min_max_scale)(x_example)
         writer.add_images("Training data batch", x_example, dataformats="NHWC")
+
+        # Curriculum warmups, resolved to absolute epoch counts. Left unset (the default)
+        # they scale as a fraction of --epochs
+        _wfloor = 2.0
+        latent_warmup_ep = (args.latent_warmup_epochs if args.latent_warmup_epochs is not None
+                            else max(_wfloor, 0.12 * args.epochs))          # ~12% forming the consensus / holding the latent
+        print(f"{bcolors.OKCYAN}Curriculum (epochs): latent_warmup={latent_warmup_ep:.1f}  "
+              f"(of {args.epochs} total){bcolors.ENDC}")
 
         # Learning rate: constant (default) or a warmup + cosine-decay schedule
         # (--lr_schedule). The schedule is a function of the optimizer step count,
@@ -2322,8 +2682,20 @@ def main():
                     i += 1
 
                 # Ramp the rigid pose refinement in from the identity over the first epochs
-                warmup_steps = max(1, int(args.pose_refine_warmup_epochs * steps_per_epoch))
-                warmup_alpha = float(min(1.0, total_steps / warmup_steps))
+                if args.pose_refine_warmup_epochs > 0:
+                    warmup_steps = max(1, int(args.pose_refine_warmup_epochs * steps_per_epoch))
+                    warmup_alpha = float(min(1.0, total_steps / warmup_steps))
+                else:
+                    warmup_alpha = 1.0
+
+                # Ramp the latent into the decoder
+                if latent_warmup_ep > 0:
+                    latent_steps = max(1, int(latent_warmup_ep * steps_per_epoch))
+                    hold_steps = latent_steps // 2
+                    latent_alpha = float(min(1.0, max(0.0, total_steps - hold_steps)
+                                             / max(1, latent_steps - hold_steps)))
+                else:
+                    latent_alpha = 1.0
 
                 # Coarse-to-fine frequency annealing: ramp freq_alpha from
                 # freq_anneal_start up to 1.0 over the first freq_anneal_epochs.
@@ -2349,8 +2721,17 @@ def main():
                 else:
                     render_sigma = None
 
-                # Mass-transport reconstruction split: weight of the amplitude term
-                # (the motion term takes the complement)
+                # Occupancy curriculum: ramp the per-particle amplitude change in from 0,
+                # so early training explains the data by transport (motion) and occupancy
+                # is only released later to catch the residual motion cannot
+                if args.occupancy_reg > 0.0 and args.occupancy_warmup_epochs > 0:
+                    occ_steps = max(1, int(args.occupancy_warmup_epochs * steps_per_epoch))
+                    occ_alpha = float(min(1.0, total_steps / occ_steps))
+                else:
+                    occ_alpha = 1.0
+
+                # Reconstruction split: weight of the amplitude (occupancy) rendering
+                # against the mass-transport rendering
                 if args.schedule_recon_split:
                     if args.recon_split_epochs and args.recon_split_epochs > 0:
                         split_steps = max(1, int(args.recon_split_epochs * steps_per_epoch))
@@ -2364,11 +2745,15 @@ def main():
                 else:
                     amp_recon_weight = jnp.float32(args.recon_split_final)
 
-                loss, recon_loss, state, rng = train_step_hetsiren(graphdef, state, x, labels, md_columns, rng,
+                loss, recon_loss, pose_metrics, state, rng = train_step_hetsiren(graphdef, state, x, labels, md_columns, rng,
                                                                    l1_lambda=args.denoising_strength,
                                                                    graph_lambda=graph_lambda,
                                                                    warmup_alpha=warmup_alpha,
+                                                                   latent_alpha=latent_alpha,
                                                                    pose_refine_reg=args.pose_refine_reg,
+                                                                   pose_refine_max_angle=args.pose_refine_max_angle,
+                                                                   shift_refine_reg=args.shift_refine_reg,
+                                                                   shift_refine_max=args.shift_refine_max,
                                                                    decoupling_lambda=args.decoupling_lambda,
                                                                    distance_preservation_lambda=args.distance_preservation_lambda,
                                                                    kl_lambda=args.kl_lambda,
@@ -2376,6 +2761,10 @@ def main():
                                                                    arap_lambda=args.arap_lambda,
                                                                    geometric_lambda=args.geometric_lambda,
                                                                    render_sigma=render_sigma,
+                                                                   occ_alpha=occ_alpha,
+                                                                   occupancy_reg=args.occupancy_reg,
+                                                                   occupancy_tv=args.occupancy_tv,
+                                                                   occupancy_kappa=args.occupancy_kappa,
                                                                    amp_recon_weight=amp_recon_weight,
                                                                    arap_rotation=args.arap_rotation)
                 total_loss += loss
@@ -2398,11 +2787,35 @@ def main():
                                        {"train": mean_recon_loss},
                                         i * steps_per_epoch + step)
 
+                    # Pose refinement vs. pose absorption
+                    pose_angle_deg = float(pose_metrics["pose_angle_deg"])
+                    shift_norm_px = float(pose_metrics["shift_norm_px"])
+                    rigid_fraction = float(pose_metrics["rigid_fraction"])
+                    deformation_A = float(pose_metrics["deformation_A"])
+                    occ_fraction = float(pose_metrics["occ_fraction"])
+
+                    writer.add_scalars('Pose refinement (HetSIREN)',
+                                       {"rotation (deg)": pose_angle_deg,
+                                        "shift (px)": shift_norm_px},
+                                       i * steps_per_epoch + step)
+                    writer.add_scalar('Decoder rigid fraction (HetSIREN)',
+                                      rigid_fraction,
+                                      i * steps_per_epoch + step)
+                    writer.add_scalar('Decoder deformation (A) (HetSIREN)',
+                                      deformation_A,
+                                      i * steps_per_epoch + step)
+                    writer.add_scalar('Occupancy fraction (HetSIREN)',
+                                      occ_fraction,
+                                      i * steps_per_epoch + step)
+
                     # Progress bar update  (TQDM)
+                    pose_str = (f"pose={pose_angle_deg:.2f}deg/{shift_norm_px:.2f}px | "
+                                f"rigid={rigid_fraction:.3f} | def={deformation_A:.2f}A")
+                    occ_str = f" | occ={occ_fraction:.3f}" if args.occupancy_reg > 0 else ""
                     if args.transport_mass:
-                        pbar.set_postfix_str(f"loss={mean_loss:.5f} | recon_loss={mean_recon_loss:.5f} | graph_lambda={graph_lambda:.5f}")
+                        pbar.set_postfix_str(f"loss={mean_loss:.5f} | recon_loss={mean_recon_loss:.5f} | {pose_str}{occ_str} | graph_lambda={graph_lambda:.5f}")
                     else:
-                        pbar.set_postfix_str(f"loss={mean_loss:.5f} | recon_loss={mean_recon_loss:.5f}")
+                        pbar.set_postfix_str(f"loss={mean_loss:.5f} | recon_loss={mean_recon_loss:.5f} | {pose_str}{occ_str}")
 
                 # # Summary writer (validation loss)
                 # if step % int(np.ceil(0.9 * steps_per_epoch)) == 0:
@@ -2427,6 +2840,7 @@ def main():
 
             # Save model
             NeuralNetworkCheckpointer.save(hetsiren, os.path.join(args.output_path, "HetSIREN_No_Inv"))
+
         else:
             hetsiren = NeuralNetworkCheckpointer.load(os.path.join(args.output_path, "HetSIREN_No_Inv"))
 

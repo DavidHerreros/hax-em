@@ -192,6 +192,23 @@ def scenarios(workdir, data):
                                    "consensus_volume.mrc")],
         timeout=1800))
 
+    # 6b) train with reference volume: point-transformer decoder. Needs more Gaussians
+    # than the other transport scenarios because build_geometry asserts that the finest
+    # hierarchy level (512) is coarser than the point cloud.
+    scn.append(Scenario(
+        name="train_vol_transport_pt",
+        description="train | ctf=apply | --vol --mask --transport_mass --point_transformer",
+        program="hetsiren",
+        args=["--md", ctf["md"], "--ctf_type", "apply", "--mode", "train",
+              "--lat_dim", "6", "--batch_size", "8",
+              "--vol", ctf["vol"], "--mask", ctf["mask"],
+              "--transport_mass", "--point_transformer", "--num_gaussians", "2000",
+              "--output_path", out("train_vol_transport_pt")] + base,
+        expect_files=[hs("train_vol_transport_pt"),
+                      os.path.join(out("train_vol_transport_pt"),
+                                   "consensus_volume.mrc")],
+        timeout=1800))
+
     # 7) train with reference volume: local_reconstruction (+mask, vol mandatory)
     scn.append(Scenario(
         name="train_vol_local_recon",
@@ -209,4 +226,4 @@ def scenarios(workdir, data):
 
 
 # Scenarios that need fit_volume (slow); skipped by --quick.
-SLOW = {"train_vol_transport_implicit", "train_vol_local_recon"}
+SLOW = {"train_vol_transport_implicit", "train_vol_transport_pt", "train_vol_local_recon"}

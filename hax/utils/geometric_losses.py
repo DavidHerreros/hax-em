@@ -21,8 +21,9 @@ def _neighbour_activation(neighbours_per_point, minimum=1.0, maximum=3.0):
     return (x1 - minimum) ** 2. + (x2 - maximum) ** 2.
 
 
-def calculate_deformation_regularity_loss(positions, radius_graph, consensus_distances, edge_weights, eps=1e-8):
-    """Preserves local distances (Spring-like prior)."""
+def calculate_deformation_regularity_loss(positions, radius_graph, consensus_distances, edge_weights,
+                                          eps=1e-8, weighted_mean=False):
+    """Preserves local distances (Spring-like prior)"""
     i, j = radius_graph
     # Safe distance calculation
     diffs = positions[i] - positions[j]
@@ -30,6 +31,8 @@ def calculate_deformation_regularity_loss(positions, radius_graph, consensus_dis
 
     # Square error compared to consensus
     loss = (distances - consensus_distances) ** 2.
+    if weighted_mean:
+        return jnp.sum(edge_weights * loss) / (jnp.sum(edge_weights) + eps)
     return jnp.mean(edge_weights * loss)
 
 def _closest_rotation_svd(S):
@@ -86,7 +89,7 @@ def _closest_rotation_polar(S, iters=6):
 
 
 def calculate_arap_loss(positions, consensus_positions, radius_graph, edge_weights, num_points,
-                        eps=1e-6, rotation_method="polar", polar_iters=6):
+                        eps=1e-6, rotation_method="polar", polar_iters=6, weighted_mean=False):
     """As-rigid-as-possible (ARAP) energy.
 
     For every node the best-fit local *rotation* is factored out before the
@@ -144,7 +147,10 @@ def calculate_arap_loss(positions, consensus_positions, radius_graph, edge_weigh
     R = jax.lax.stop_gradient(R)
 
     resid = e - jnp.einsum('eij,ej->ei', R[i], e0)              # (E, 3)
-    return jnp.mean(w * jnp.sum(resid ** 2., axis=-1))
+    per_edge = w * jnp.sum(resid ** 2., axis=-1)
+    if weighted_mean:
+        return jnp.sum(per_edge) / (jnp.sum(w) + eps)
+    return jnp.mean(per_edge)
 
 
 def calculate_deformation_coherence_loss(displacements, radius_graph, edge_weights, eps=1e-8):
@@ -156,8 +162,8 @@ def calculate_deformation_coherence_loss(displacements, radius_graph, edge_weigh
 
     return jnp.mean(edge_weights * dist_sq)
 
-def calculate_repulsion_loss(positions, radius_graph, tau, eps=1e-8):
-    """Prevents collisions/overlapping density."""
+def calculate_repulsion_loss(positions, radius_graph, tau, edge_weights=None, eps=1e-8):
+    """Prevents collisions/overlapping density"""
     i, j = radius_graph
     diffs = positions[i] - positions[j]
     distances = jnp.sqrt(jnp.sum(diffs ** 2., axis=-1) + eps)
@@ -167,6 +173,8 @@ def calculate_repulsion_loss(positions, radius_graph, tau, eps=1e-8):
     # This acts like a 'soft' version of your multiplier trick
     penalty = jnp.clip(distances, a_max=cutoff)
     penalty = jnp.abs(penalty - cutoff)
+    if edge_weights is not None:
+        return jnp.sum(edge_weights * penalty) / (jnp.sum(edge_weights) + eps)
     return penalty.mean()
 
 def calculate_outlier_loss(positions, knn_graph, tau, eps=1e-8):
