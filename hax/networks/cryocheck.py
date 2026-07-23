@@ -281,6 +281,7 @@ def main():
   from tqdm import tqdm
   import random
   import numpy as np
+  import matplotlib.pyplot as plt
   import argparse
   import shutil
   from xmipp_metadata.image_handler import ImageHandler
@@ -388,7 +389,7 @@ def main():
         
         # Adjust to images (options are apply mode or wiener mode)
         model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
-                                            num_epochs=500, is_global=True, ctf_type="apply")
+                                            num_epochs=5, is_global=True, ctf_type="apply")
 
         # Save model
         NeuralNetworkCheckpointer.save(model, fit_path)
@@ -626,6 +627,10 @@ def main():
               ImageHandler().write(np.array(res_aligned), os.path.join(args.output_path, "aligned_residual_sample.mrcs"), overwrite=True)
               ImageHandler().write(np.array(res_misaligned), os.path.join(args.output_path, "misaligned_residual_sample.mrcs"), overwrite=True)
 
+              # Save in bwr colormap
+              max_val = max(np.max(np.abs(res_aligned)), np.max(np.abs(res_misaligned)))
+              plt.imsave(os.path.join(args.output_path, "aligned_bwr.png"), res_aligned, cmap='bwr', vmin=-max_val, vmax=max_val)
+              plt.imsave(os.path.join(args.output_path, "misaligned_bwr.png"), res_misaligned, cmap='bwr', vmin=-max_val, vmax=max_val)
             ############################
 
 
