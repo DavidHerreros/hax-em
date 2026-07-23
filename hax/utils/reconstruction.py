@@ -484,17 +484,35 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
     return np.asarray(volume, np.float32)
 
 
-def consensus_mask(volume, threshold=0.02, dilate=2):
+def consensus_mask(volume, threshold=0.02, dilate=2, keep_largest=True):
     """A binary mask of the protein region of a reconstructed consensus volume.
 
     ``threshold`` is a fraction of the volume's maximum, applied after a light blur so the
     mask is connected rather than speckled; ``dilate`` grows it by that many voxels so the
     deformation has somewhere to move into.
+
+    ``keep_largest`` keeps only the single largest connected region. A gridding
+    reconstruction leaves faint fragments of mass away from the molecule -- most visibly in
+    the corners and along the edges of the box, where the CTF power is low and the
+    interpolation is least constrained. They sit above the intensity threshold, so thresholding
+    alone cannot remove them; but they are *disconnected* from the protein, which is one
+    contiguous blob, so a connected-component filter can. This runs before the dilation, so
+    growing the mask cannot reconnect a fragment that was just discarded.
     """
-    from scipy.ndimage import gaussian_filter, binary_dilation
+    from scipy.ndimage import gaussian_filter, binary_dilation, label
 
     smooth = gaussian_filter(np.asarray(volume, np.float32), 1.5)
     mask = smooth > threshold * smooth.max()
+
+    if keep_largest and mask.any():
+        # 6-connectivity (faces only): a fragment touching the protein at a single corner is
+        # not really attached, so it should not keep the fragment alive.
+        labels, n_components = label(mask)
+        if n_components > 1:
+            counts = np.bincount(labels.ravel())
+            counts[0] = 0                       # background label
+            mask = labels == counts.argmax()
+
     if dilate and dilate > 0:
         mask = binary_dilation(mask, iterations=int(dilate))
     return mask.astype(np.float32)

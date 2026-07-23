@@ -340,7 +340,7 @@ def main():
     from contextlib import closing, ExitStack
     from flax.training.early_stopping import EarlyStopping
     from hax.generators import MetaDataGenerator, extract_columns
-    from hax.metrics import JaxSummaryWriter
+    from hax.metrics import JaxSummaryWriter, TrainingLogger
     from hax.networks import VolumeAdjustment, train_step_volume_adjustment
     from hax.schedulers import CosineAnnealingScheduler
     from hax.checkpointer import NeuralNetworkCheckpointer
@@ -366,6 +366,7 @@ def main():
                              f"{bcolors.ENDC} or {bcolors.UNDERLINE} Zernike3Deep {bcolors.ENDC} neural network.")
     ca.add_output_path(parser)
     ca.add_ssd_scratch_folder(parser)
+    ca.add_logging_args(parser, landscape=False, checkpoint=False)
     args = ca.parse_with_config(parser)
 
     # Prepare metadata
@@ -427,6 +428,25 @@ def main():
     def get_modart_volume(graphdef, state):
         model, _ = nnx.merge(graphdef, state)
         return model(filter=True)
+
+    def write_intermediate_modart(volumes, step_idx):
+        """Write the intermediate map(s) to disk and log their central slices.
+
+        Runs on the logging thread; ``volumes`` are host-side numpy arrays so they are
+        safe to hand over. One tuple entry per half (or a single entry otherwise).
+        """
+        specs = (((volumes[0], "modart_first_half_intermediate.mrc", "Predicted MoDART first half (slices)"),
+                  (volumes[1], "modart_second_half_intermediate.mrc", "Predicted MoDART second half (slices)"))
+                 if args.reconstruct_halves else
+                 ((volumes[0], "modart_map_intermediate.mrc", "Predicted MoDART volume (slices)"),))
+        for vol_arr, fn, tag in specs:
+            ImageHandler().write(vol_arr, os.path.join(args.output_path, fn), overwrite=True)
+            middle_slize = int(np.round(0.5 * vol_arr.shape[-1]))
+            slice_xy, slice_xz, slice_yz = (min_max_scale(vol_arr[middle_slize, :, :]),
+                                            min_max_scale(vol_arr[:, middle_slize, :]),
+                                            min_max_scale(vol_arr[:, :, middle_slize]))
+            slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
+            writer.add_images(tag, slices, dataformats="NHWC", global_step=step_idx)
 
     # Prepare data loader
     if args.reconstruct_halves:
@@ -527,6 +547,12 @@ def main():
     optimizer = nnx.Optimizer(modart, optax.adam(lr_schedule), wrt=nnx.Param)
     graphdef, state = nnx.split((modart, optimizer))
 
+    # Logging cadence + background offload of the host-side logging work.
+    logger = TrainingLogger(image_every=args.log_images_every,
+                            steps_per_epoch=total_steps_per_epoch,
+                            time_budget=args.log_time_budget,
+                            background=not args.log_sync).start()
+
     # Reconstruction loop (MoDART)
     print(f"{bcolors.OKCYAN}\n###### Starting MoDART reconstruction... ######")
 
@@ -555,35 +581,14 @@ def main():
                 pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}")
 
                 # Intermediate volume
-                modart_volume = get_modart_volume(graphdef, state)
-                if args.reconstruct_halves:
-                    middle_slize = int(np.round(0.5 * modart_volume[0].shape[-1]))
-                    ImageHandler().write(np.array(modart_volume[0]),
-                                         os.path.join(args.output_path, "modart_first_half_intermediate.mrc"),
-                                         overwrite=True)
-                    ImageHandler().write(np.array(modart_volume[1]),
-                                         os.path.join(args.output_path, "modart_second_half_intermediate.mrc"),
-                                         overwrite=True)
-                    slice_xy, slice_xz, slice_yz = (min_max_scale(modart_volume[0][middle_slize, :, :]),
-                                                    min_max_scale(modart_volume[0][:, middle_slize, :]),
-                                                    min_max_scale(modart_volume[0][:, :, middle_slize]))
-                    slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
-                    writer.add_images("Predicted MoDART first half (slices)", slices, dataformats="NHWC", global_step=i)
-                    slice_xy, slice_xz, slice_yz = (min_max_scale(modart_volume[1][middle_slize, :, :]),
-                                                    min_max_scale(modart_volume[1][:, middle_slize, :]),
-                                                    min_max_scale(modart_volume[1][:, :, middle_slize]))
-                    slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
-                    writer.add_images("Predicted MoDART second half (slices)", slices, dataformats="NHWC",
-                                      global_step=i)
-                else:
-                    middle_slize = int(np.round(0.5 * modart_volume.shape[-1]))
-                    ImageHandler().write(np.array(modart_volume),
-                                         os.path.join(args.output_path, "modart_map_intermediate.mrc"), overwrite=True)
-                    slice_xy, slice_xz, slice_yz = (min_max_scale(modart_volume[middle_slize, :, :]),
-                                                    min_max_scale(modart_volume[:, middle_slize, :]),
-                                                    min_max_scale(modart_volume[:, :, middle_slize]))
-                    slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
-                    writer.add_images("Predicted MoDART volume (slices)", slices, dataformats="NHWC", global_step=i)
+                if logger.should("images", i):
+                    with logger.section():
+                        modart_volume = get_modart_volume(graphdef, state)
+                        if args.reconstruct_halves:
+                            volumes = (np.array(modart_volume[0]), np.array(modart_volume[1]))
+                        else:
+                            volumes = (np.array(modart_volume),)
+                    logger.submit(write_intermediate_modart, volumes, i)
 
                 i += 1
 
@@ -664,6 +669,9 @@ def main():
 
             pbar.update()
             total_steps += 1
+
+    # Let the background logging thread finish before writing the final map.
+    logger.close()
 
     # Save final MoDART volume
     modart_volume = get_modart_volume(graphdef, state)

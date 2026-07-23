@@ -553,6 +553,76 @@ def training_step_global_adjustment(graphdef, state, target, projection_paramete
     return loss_val, state
 
 
+@partial(jax.jit, static_argnames=("grid_size", "ctf_type"))
+def image_affine_stats(graphdef, state, target, projection_parameters, grid_size, ctf_type):
+    """Closed-form per-image contrast/bias fit between the current model projection and the images.
+
+    For every image ``i`` in the batch this solves the 1-D least-squares problem
+
+        target_i  ~=  a_i * P_i  +  b_i
+
+    where ``P_i`` is the CTF-applied projection of the *current* volume (linear in the Gaussian
+    weights) and ``(a_i, b_i)`` are the per-image contrast (slope) and background (offset). The
+    solution is the ordinary regression estimate ``a_i = Cov(P_i, T_i) / Var(P_i)`` obtained from a
+    handful of pixel sums -- no optimizer, no epochs. ``var_p`` is returned so the host can drop
+    ill-posed images (flat/empty projections) before aggregating the per-image slopes robustly.
+
+    Returns ``(a, b, var_p)`` each of shape ``[B]``.
+    """
+    model = nnx.merge(graphdef, state)
+    if isinstance(model, tuple):
+        model = model[0]
+
+    means = model.means.get_value()
+    weights = nnx.relu(model.weights.get_value())
+    sigma = nnx.relu(model.sigma_param.get_value())
+
+    # Batch alignments
+    euler_angles = projection_parameters["euler_angles"]
+    rotations = euler_matrix_batch(euler_angles[:, 0], euler_angles[:, 1], euler_angles[:, 2])
+    shifts = projection_parameters["shifts"]
+
+    # Batch CTFs (same convention as training_step_global_adjustment)
+    pad_factor = 1 if grid_size > 256 else 2
+    if "ctfDefocusU" in projection_parameters.keys():
+        defocusU = projection_parameters["ctfDefocusU"]
+        defocusV = projection_parameters["ctfDefocusV"]
+        defocusAngle = projection_parameters["ctfDefocusAngle"]
+        cs = projection_parameters["ctfSphericalAberration"]
+        kv = projection_parameters["ctfVoltage"][0]
+        ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
+                         projection_parameters["sr"],
+                         [pad_factor * grid_size, int(pad_factor * 0.5 * grid_size + 1)],
+                         rotations.shape[0], True)
+    else:
+        ctf = jnp.ones(
+            [rotations.shape[0], pad_factor * grid_size, int(pad_factor * 0.5 * grid_size + 1)],
+            dtype=means.dtype)
+
+    if ctf_type in ["wiener", "precorrect"]:
+        target = wiener2DFilter(jnp.squeeze(target), ctf)
+        ctf = jnp.ones_like(ctf)
+
+    proj = splat_weights_bilinear(grid_size, means, weights, sigma, rotations, shifts, ctf)
+
+    # Per-image ordinary least squares in image space: target ~= a * proj + b
+    proj = proj.reshape(proj.shape[0], -1).astype(jnp.float32)
+    tgt = target.reshape(target.shape[0], -1).astype(jnp.float32)
+    n = proj.shape[1]
+
+    sum_p = jnp.sum(proj, axis=1)
+    sum_t = jnp.sum(tgt, axis=1)
+    sum_pp = jnp.sum(proj * proj, axis=1)
+    sum_pt = jnp.sum(proj * tgt, axis=1)
+
+    var_p = sum_pp / n - (sum_p / n) ** 2
+    cov_pt = sum_pt / n - (sum_p / n) * (sum_t / n)
+
+    a = cov_pt / jnp.where(var_p > 0, var_p, 1.0)
+    b = (sum_t - a * sum_p) / n
+    return a, b, var_p
+
+
 def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densify_interval=500, grad_threshold=1e-5,
                n_init=2500, fixed_gaussians=False):
     # Grid size
@@ -776,7 +846,43 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
     return model, k_history, loss_history
 
 
-def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256, learning_rate=0.01, num_epochs=3, is_global=False, ctf_type="apply"):
+def _build_projection_parameters(md_columns, labels, sr, ctf_type):
+    projection_parameters = {"euler_angles": md_columns["euler_angles"][labels],
+                             "shifts": md_columns["shifts"][labels]}
+    if ctf_type in ["apply", "wiener", "squared", "precorrect"]:
+        ctf_parameters = {"ctfDefocusU": md_columns["ctfDefocusU"][labels],
+                          "ctfDefocusV": md_columns["ctfDefocusV"][labels],
+                          "ctfDefocusAngle": md_columns["ctfDefocusAngle"][labels],
+                          "ctfSphericalAberration": md_columns["ctfSphericalAberration"][labels],
+                          "ctfVoltage": md_columns["ctfVoltage"][labels],
+                          "sr": sr}
+        projection_parameters = dict(projection_parameters, **ctf_parameters)
+    return projection_parameters
+
+
+def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256, learning_rate=0.01, num_epochs=3,
+                             is_global=False, ctf_type="apply", max_samples=8192):
+    """Match the contrast (and background) of the model's projections to the experimental images.
+
+    ``is_global=True`` estimates a single positive contrast scale ``a`` (and background ``b``) that
+    best maps the current volume's projections onto the images, then rescales the Gaussian weights by
+    ``a``. Because splatting is *linear* in the weights, ``a * P(V)`` is exactly the projection of the
+    rescaled volume, so this is solved in **closed form**: each image gives an independent regression
+    slope ``a_i = Cov(P_i, T_i) / Var(P_i)``, and the global scale is the *median* of the per-image
+    slopes (robust to junk/outlier particles). This needs a single streaming pass over a subsample of
+    at most ``max_samples`` images -- no optimizer, no epochs -- and is both faster and more accurate
+    than gradient descent on the scalar. ``learning_rate``/``num_epochs`` are ignored in this mode and
+    kept only for backward compatibility.
+
+    Note on the background ``b``: the image-space offset is a per-image DC/solvent level and is *not*
+    representable in a single shared volume, so it is estimated for diagnostics but not baked into the
+    weights (unlike the previous blob-shaped parameterization, which polluted the reference volume).
+
+    ``is_global=False`` keeps the previous iterative per-Gaussian amplitude refinement (AdamW).
+
+    Returns ``(model, info)`` where ``info`` is a diagnostics dict for the global path or the loss
+    history for the local path.
+    """
     # Prepare metadata
     generator = MetaDataGenerator(md_path)
     md_columns = extract_columns(generator.md)
@@ -792,72 +898,75 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
                                                  num_epochs=None, num_workers=8, num_threads=1, load_to_ram=load_to_ram)
     steps_per_epoch = max(1, int(len(generator.md) / batch_size))
 
-    # Global vs local
+    # ------------------------------------------------------------------ GLOBAL (closed form)
     if is_global:
-        model_global_adjustment = GlobalAdjustment()
+        print(f"\n{bcolors.OKCYAN}###### Adjusting gaussian weights to images (Global, closed-form)... ######{bcolors.ENDC}")
 
-        # Init Optimizer (nnx.Optimizer automatically tracks model params)
-        optimizer = nnx.Optimizer(model_global_adjustment, optax.sgd(learning_rate), wrt=nnx.Param)
-        graphdef, state = nnx.split((model_global_adjustment, optimizer))
-
-        # Prepare gaussian params
-        means = model.means.get_value()
-        weights = model.weights.get_value()
-        sigma = model.sigma_param.get_value()
+        graphdef, state = nnx.split(model)
         grid_size = model.grid_size
 
-    else:
-        # Init Optimizer (nnx.Optimizer automatically tracks model params)
-        params_filter = nnx.All(nnx.Param, nnx.PathContains('weights'))
-        optimizer = nnx.Optimizer(model, optax.adamw(learning_rate), wrt=params_filter)
-        graphdef, state = nnx.split((model, optimizer))
+        # Only a subsample of images is needed to estimate two global scalars.
+        n_target = min(max_samples, len(generator.md)) if max_samples is not None else len(generator.md)
+        n_steps = max(1, int(np.ceil(n_target / batch_size)))
+
+        a_all, var_all, b_all = [], [], []
+        pbar = tqdm(range(n_steps), desc="Fitting contrast", file=sys.stdout, ascii=" >=", colour="green",
+                    bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
+        with closing(iter(data_loader)) as iter_data_loader:
+            for _ in pbar:
+                (x, labels) = next(iter_data_loader)
+                projection_parameters = _build_projection_parameters(md_columns, labels, sr, ctf_type)
+                a, b, var_p = image_affine_stats(graphdef, state, x[..., 0], projection_parameters,
+                                                 grid_size=grid_size, ctf_type=ctf_type)
+                a_all.append(np.asarray(a))
+                b_all.append(np.asarray(b))
+                var_all.append(np.asarray(var_p))
+
+        a_all = np.concatenate(a_all)
+        b_all = np.concatenate(b_all)
+        var_all = np.concatenate(var_all)
+
+        # Drop ill-posed images (flat projection) and non-finite slopes before aggregating.
+        valid = np.isfinite(a_all) & np.isfinite(b_all) & (var_all > 1e-8 * np.median(var_all[var_all > 0]))
+        if not np.any(valid):
+            print(f"{bcolors.WARNING}No valid projections to fit contrast; leaving weights unchanged.{bcolors.ENDC}")
+            return model, {"scale": 1.0, "offset": 0.0, "n_used": 0}
+
+        scale = float(np.median(a_all[valid]))
+        offset = float(np.median(b_all[valid]))
+        scale = max(scale, 0.0)  # contrast is non-negative (matches the previous relu on a)
+
+        print(f"{bcolors.OKGREEN}Contrast scale a = {scale:.4f} (median of {int(valid.sum())} images), "
+              f"background b = {offset:.4g} [not applied to shared volume].{bcolors.ENDC}")
+
+        model.weights = nnx.Param(scale * model.weights.get_value())
+        return model, {"scale": scale, "offset": offset, "n_used": int(valid.sum()),
+                       "a_per_image": a_all[valid]}
+
+    # ------------------------------------------------------------------ LOCAL (iterative refine)
+    params_filter = nnx.All(nnx.Param, nnx.PathContains('weights'))
+    optimizer = nnx.Optimizer(model, optax.adamw(learning_rate), wrt=params_filter)
+    graphdef, state = nnx.split((model, optimizer))
 
     loss_history = []
-
-    if is_global:
-        print(f"\n{bcolors.OKCYAN}###### Adjusting gaussian weights to images (Global version)... ######{bcolors.ENDC}")
-    else:
-        print(f"\n{bcolors.OKCYAN}###### Adjusting gaussian weights to images (Local version)... ######{bcolors.ENDC}")
+    print(f"\n{bcolors.OKCYAN}###### Adjusting gaussian weights to images (Local version)... ######{bcolors.ENDC}")
 
     pbar = tqdm(range(num_epochs * steps_per_epoch), desc="Adjusting weights", file=sys.stdout, ascii=" >=", colour="green",
                 bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
     with closing(iter(data_loader)) as iter_data_loader:
         for _ in pbar:
             (x, labels) = next(iter_data_loader)
-            # --- TRAIN STEP ---
-            projection_parameters = {"euler_angles": md_columns["euler_angles"][labels],
-                                     "shifts": md_columns["shifts"][labels]}
-            if ctf_type in ["apply", "wiener", "squared", "precorrect"]:
-                ctf_parameters = {"ctfDefocusU": md_columns["ctfDefocusU"][labels],
-                                  "ctfDefocusV": md_columns["ctfDefocusV"][labels],
-                                  "ctfDefocusAngle": md_columns["ctfDefocusAngle"][labels],
-                                  "ctfSphericalAberration": md_columns["ctfSphericalAberration"][labels],
-                                  "ctfVoltage": md_columns["ctfVoltage"][labels],
-                                  "sr": sr}
-                projection_parameters = dict(projection_parameters, **ctf_parameters)
-
-            if is_global:
-                loss_val, state = training_step_global_adjustment(graphdef, state, x[..., 0], projection_parameters,
-                                                                  means, weights, sigma, grid_size=grid_size, ctf_type=ctf_type)
-            else:
-                loss_val, state = training_step_local_adjustment(graphdef, state, x[..., 0], projection_parameters, ctf_type=ctf_type)
-
+            projection_parameters = _build_projection_parameters(md_columns, labels, sr, ctf_type)
+            loss_val, state = training_step_local_adjustment(graphdef, state, x[..., 0], projection_parameters, ctf_type=ctf_type)
             loss_history.append(loss_val)
 
             # Progress bar update  (TQDM)
             if len(loss_history) > 1000:
-                pbar.set_postfix_str(
-                    f"| Loss: {sum(loss_history[-1000:]) / 1000:.6f}")
+                pbar.set_postfix_str(f"| Loss: {sum(loss_history[-1000:]) / 1000:.6f}")
             else:
-                pbar.set_postfix_str(
-                    f"| Loss: {sum(loss_history) / len(loss_history):.6f}")
+                pbar.set_postfix_str(f"| Loss: {sum(loss_history) / len(loss_history):.6f}")
 
-    if is_global:
-        model_global_adjustment, _ = nnx.merge(graphdef, state)
-        model.weights = nnx.Param(model_global_adjustment(weights))
-    else:
-        model, _ = nnx.merge(graphdef, state)
-
+    model, _ = nnx.merge(graphdef, state)
     return model, loss_history
 
 

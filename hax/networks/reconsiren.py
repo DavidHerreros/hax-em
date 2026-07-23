@@ -1488,8 +1488,10 @@ def main():
         # Save model
         NeuralNetworkCheckpointer.save(reconsiren, os.path.join(args.output_path, "ReconSIREN"))
 
-        # Remove checkpoint
-        shutil.rmtree(os.path.join(args.output_path, "ReconSIREN_CHECKPOINT"))
+        # Remove checkpoint (cadence may be disabled or not yet reached, so it may not exist)
+        checkpoint_dir = os.path.join(args.output_path, "ReconSIREN_CHECKPOINT")
+        if os.path.isdir(checkpoint_dir):
+            shutil.rmtree(checkpoint_dir)
 
     elif args.mode == "predict":  # TODO: Save angles here
 
@@ -1537,7 +1539,8 @@ def main():
         latents = np.concatenate(latents, axis=0)
         md_pred[:, 'latent_space'] = np.asarray([",".join(np.char.mod('%f', item)) for item in latents])
 
-        md_pred.write(os.path.join(args.output_path, "predicted_pose_shifts" + os.path.splitext(args.md)[1]))
+        md_pred.write(os.path.join(args.output_path, "predicted_pose_shifts" + os.path.splitext(args.md)[1]),
+                      updateImagePaths=True)
 
         # Predict volume
         print(f"{bcolors.OKCYAN}\n###### Predicting volume... ######")

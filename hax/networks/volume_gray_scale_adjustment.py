@@ -263,7 +263,7 @@ def main():
     from hax.checkpointer import NeuralNetworkCheckpointer
     from hax.generators import MetaDataGenerator, extract_columns
     from hax.networks import train_step_volume_adjustment
-    from hax.metrics import JaxSummaryWriter
+    from hax.metrics import JaxSummaryWriter, TrainingLogger
     from hax.cli import common_args as ca
 
     parser = argparse.ArgumentParser()
@@ -286,6 +286,7 @@ def main():
     ca.add_output_path(parser, help="Path to save the results (trained neural network, adjusted volume...)")
     ca.add_reload(parser, help=ca.RELOAD_HELP_BASIC)
     ca.add_ssd_scratch_folder(parser)
+    ca.add_logging_args(parser, images=False, landscape=False)
     args = ca.parse_with_config(parser)
 
     # Check that training and validation fractions add up to one
@@ -363,6 +364,12 @@ def main():
         else:
             resume_epoch = 0
 
+        # Logging cadence + background offload of the host-side logging work.
+        logger = TrainingLogger(checkpoint_every=args.log_checkpoint_every,
+                                steps_per_epoch=steps_per_epoch,
+                                time_budget=args.log_time_budget,
+                                background=not args.log_sync).start()
+
         # Training loop
         print(f"{bcolors.OKCYAN}\n###### Training volume adjustment... ######")
 
@@ -399,9 +406,10 @@ def main():
                                            {"validation": total_validation_loss / steps_per_val},
                                            i * steps_per_epoch + step)
 
-                    if i % 5:
+                    if logger.should("checkpoint", i):
                         # Save checkpoint model
-                        NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "volumeAdjustment_CHECKPOINT"), epoch=i)
+                        with logger.section():
+                            NeuralNetworkCheckpointer.save_intermediate(graphdef, state, os.path.join(args.output_path, "volumeAdjustment_CHECKPOINT"), epoch=i, wait=False)
 
                     i += 1
 
@@ -419,13 +427,20 @@ def main():
 
                 step += 1
 
+        # Let the background logging thread and the asynchronous checkpoint write finish
+        # before the process moves on.
+        logger.close()
+        NeuralNetworkCheckpointer.wait_for_pending()
+
         volumeAdjustment, optimizer = nnx.merge(graphdef, state)
 
         # Save model
         NeuralNetworkCheckpointer.save(volumeAdjustment, os.path.join(args.output_path, "volumeAdjustment"))
 
-        # Remove checkpoint
-        shutil.rmtree(os.path.join(args.output_path, "volumeAdjustment_CHECKPOINT"))
+        # Remove checkpoint (cadence may be disabled or not yet reached, so it may not exist)
+        checkpoint_dir = os.path.join(args.output_path, "volumeAdjustment_CHECKPOINT")
+        if os.path.isdir(checkpoint_dir):
+            shutil.rmtree(checkpoint_dir)
 
     elif args.mode == "predict":
 
