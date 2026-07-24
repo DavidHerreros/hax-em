@@ -25,143 +25,27 @@ from hax.programs.gaussian_volume_fitting import fit_volume, adjust_weights_to_i
 
 
 
-# Bottleneck block that is gonna be iterated [3 4 6 3] times for each layer
-class BottleneckBlock(nnx.Module):
-
-  expansion = 4
-  def __init__(self, in_channels, out_channels, rngs:nnx.Rngs, stride = 1, downsample=True):   
-
-    self.in_channels = in_channels
-    self.out_channels = out_channels
-    self.stride = stride
-    self.downsample = downsample
-
-    reduced_channels = out_channels // self.expansion   
-    self.reduced_channels = reduced_channels
-
-    # Set of tasks repeated in each layer
-    self.conv1 = nnx.Conv(in_channels, reduced_channels, kernel_size=(1,1), use_bias=False, rngs=rngs)      
-    self.bn1 = nnx.BatchNorm(reduced_channels, rngs=rngs)  
-
-    self.conv2 = nnx.Conv(reduced_channels, reduced_channels, kernel_size=(3,3), strides=stride, padding= 'SAME', use_bias=False, rngs=rngs) 
-    self.bn2 = nnx.BatchNorm(reduced_channels, rngs=rngs)
-
-    self.conv3 = nnx.Conv(reduced_channels, out_channels, kernel_size=(1,1), strides=1, use_bias=False, rngs=rngs) 
-    self.bn3 = nnx.BatchNorm(out_channels, rngs=rngs)
-
-    # Downsampling
-    if self.downsample:
-      self.downsample_conv = nnx.Conv(in_channels, out_channels, kernel_size=(1,1), strides=stride, use_bias=False, rngs=rngs)
-      self.downsample_bn = nnx.BatchNorm(out_channels, rngs=rngs)
-
-
-  def __call__(self, x):
-    identity = x
-
-    out = self.conv1(x)
-    out = self.bn1(out)
-    out = nnx.relu(out)
-
-    out = self.conv2(out)
-    out = self.bn2(out)
-    out = nnx.relu(out)
-
-    out = self.conv3(out)
-    out = self.bn3(out)
-
-    if self.downsample:
-      identity = self.downsample_conv(x)
-      identity = self.downsample_bn(identity)
-
-    out += identity
-    out = nnx.relu(out)
-
-    return out
-
-
+# MLP
 class CryoCheck(nnx.Module):
   @save_config
-  def __init__ (self, rngs:nnx.Rngs, block=BottleneckBlock, layers=[3, 4, 6, 3], num_classes=1):
-    
-    self.in_channels = 64
-    self.block = block
-    self.layers = layers
-    self.num_classes = num_classes
-
-    # Initial adaptating convolution 
-    self.conv1 = nnx.Conv(1, 64, kernel_size=(7,7), strides=2, padding=3, use_bias=False, rngs=rngs)
-    self.bn1 = nnx.BatchNorm(self.in_channels, rngs=rngs)  #perchè solo conv1 ha bisogno della bn
-
-    self.conv2 = nnx.Conv(64, 128, kernel_size=(1,1), strides=1, padding='SAME', use_bias=False, rngs=rngs)
-    self.conv3 = nnx.Conv(128, 256, kernel_size=(1,1), strides=1, padding='SAME', use_bias=False, rngs=rngs)
-    self.conv4 = nnx.Conv(256, 512, kernel_size=(1,1), strides=1, padding='SAME', use_bias=False, rngs=rngs)
-
-    # Residual layers 
-    self.layer1 = self._make_layer(block, self.in_channels, 64, layers[0], rngs=rngs)
-    self.layer2 = self._make_layer(block, 128, 128, layers[1], stride=2, rngs=rngs)
-    self.layer3 = self._make_layer(block, 256, 256, layers[2], stride=2, rngs=rngs)
-    self.layer4 = self._make_layer(block, 512, 512, layers[3], stride=2, rngs=rngs)
-
-    # Linear layer for classification
-    self.fc = nnx.Linear(512, 1, rngs=rngs)   
-
-  def _make_layer(self, block, in_channels, out_channels, blocks,  rngs, stride=1):
-
-    downsample = False    
-    if stride != 1:
-      downsample = True   
-
-    layers = []         
-    layers.append(block(in_channels=in_channels, out_channels=out_channels, rngs=rngs, stride=stride, downsample=downsample))        
-
-    for _ in range(1, blocks):
-            layers.append(block(in_channels=in_channels, out_channels=out_channels, rngs=rngs))                                      
-
-    return nnx.Sequential(*layers)
+  def __init__(self, n_shells, rngs: nnx.Rngs, hidden=(64, 32)):
+    self.fc1 = nnx.Linear(n_shells, hidden[0], rngs=rngs)
+    self.bn1 = nnx.BatchNorm(hidden[0], rngs=rngs)
+    self.fc2 = nnx.Linear(hidden[0], hidden[1], rngs=rngs)
+    self.bn2 = nnx.BatchNorm(hidden[1], rngs=rngs)
+    self.fc3 = nnx.Linear(hidden[1], 1, rngs=rngs)
 
   @nnx.jit(static_argnames='eval')
-  def __call__(self,x, eval=False, train=False):
-    if x.ndim == 3:
-      # if x is (N,H,W) add a channel dimension
-      x=jnp.expand_dims(x, -1)
-    elif x.ndim == 2:
-      # if x is (N,D), reshape to (N,H,W,1)
-      x=x.reshape(x.shape[0],int(jnp.sqrt(x.shape[1])), int(jnp.sqrt(x.shape[1])), 1)
-    elif x.ndim == 4:
-      # if x is already a (N,H,W,C), ensure C=1
-      if x.shape[-1] != 1:                  #50?
-        raise ValueError("Expected input with 1 channel, but got {} channels.".format(x.shape[-1]))
-    else:
-      raise ValueError("Unsupported input dimensions: {}.".format(x.shape[-1]))
-
-
-    # Initial convolutional layers
-    x = self.conv1(x)
-    x = self.bn1(x)
-    x = nnx.relu(x)
-
-    # Residual layers
-    x = self.layer1(x)
-    x = self.conv2(x)
-    x = self.layer2(x)
-    x = self.conv3(x)
-    x = self.layer3(x)
-    x = self.conv4(x)
-    x = self.layer4(x)
-
-    # Pooling and classification
-    x = jnp.mean(x, axis=(1,2))
-
-    x = self.fc(x)
-
+  def __call__(self, x, eval=False, train=False):
+    x = nnx.relu(self.bn1(self.fc1(x)))
+    x = nnx.relu(self.bn2(self.fc2(x)))
+    x = self.fc3(x)
     if eval:
       x = nnx.sigmoid(x)
-
     return x
   
 
 # Training and Validation
-
 @nnx.jit(static_argnames='train')
 def cryoCheck_step(model, optimizer, x, labels,*, train: bool):
 
@@ -352,8 +236,10 @@ def main():
   mask = ImageHandler().generateMask(inputFn=vol, boxsize=64)
 
   # Prepare network
+  x_size = vol.shape[0]
+  n_shells = x_size // 2 
   rngs = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
-  cryoCheck = CryoCheck(rngs=nnx.Rngs(rngs))
+  cryoCheck = CryoCheck(n_shells=n_shells, rngs=nnx.Rngs(rngs))
 
   # Reload network
   if args.reload is not None:
@@ -389,7 +275,7 @@ def main():
         
         # Adjust to images (options are apply mode or wiener mode)
         model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
-                                            num_epochs=5, is_global=True, ctf_type="apply")
+                                            num_epochs=500, is_global=True, ctf_type="apply")
 
         # Save model
         NeuralNetworkCheckpointer.save(model, fit_path)
@@ -456,13 +342,14 @@ def main():
                                  euler_angles=euler_angles,
                                  shifts=shifts,
                                  ctf=ctf)
-        result = compute_fourier_residual(projection_al, x)
+        result = compute_fourier_residual(projection_al, x, n_shells=n_shells)
+        aligned_curve = result.frc_curve
         aligned_res = result.residual_map
         aligned_labels = jnp.ones((batch_size,1)) #label for aligned res is 1
 
         # Misaligned images - Data Augmentation
         rngs, subkey = jax.random.split(rngs)
-        noise = (jax.random.normal(subkey, shape=euler_angles.shape) * 2) + 20
+        noise = jax.random.uniform(subkey, shape=euler_angles.shape, minval=15.0, maxval=60.0)
         euler_angles_noisy = euler_angles + noise
 
         projection_misal = Preprocessing(vol=vol,
@@ -470,12 +357,13 @@ def main():
                                  euler_angles=euler_angles_noisy,
                                  shifts=shifts,
                                  ctf=ctf)
-        result = compute_fourier_residual(projection_misal, x)
+        result = compute_fourier_residual(projection_misal, x, n_shells=n_shells)
+        misaligned_curve = result.frc_curve
         misaligned_res = result.residual_map
         misaligned_labels = jnp.zeros((batch_size,1)) #label for misaligned res is 0
       
        
-        res = jnp.concatenate([aligned_res, misaligned_res], axis=0)
+        res = jnp.concatenate([aligned_curve, misaligned_curve], axis=0)
         labels = jnp.concatenate([aligned_labels, misaligned_labels], axis=0)
 
 
@@ -492,6 +380,8 @@ def main():
             #print(f"WIENER IMAGE  -> Min: {jnp.min(wiener_sample):.4f} | Max: {jnp.max(wiener_sample):.4f} | Mean: {jnp.mean(wiener_sample):.4f}")
             print(f"ALIGNED RESIDUAL  -> Min: {jnp.min(aligned_res[0]):.4f} | Max: {jnp.max(aligned_res[0]):.4f} | Mean: {jnp.mean(aligned_res[0]):.4f}")
             print("="*50 + "\n")
+
+            
         #########################################################################
         
 
@@ -553,14 +443,15 @@ def main():
                                  euler_angles=euler_angles,
                                  shifts=shifts,
                                  ctf=ctf)
-            result = compute_fourier_residual(projection_al_v, x_validation)
+            result = compute_fourier_residual(projection_al_v, x_validation, n_shells=n_shells)
+            aligned_curve_v = result.frc_curve
             aligned_res_v = result.residual_map
             aligned_labels_v = jnp.ones((batch_size_v,1))
         
     
             # Misaligned images
             rngs, subkey_v = jax.random.split(rngs)
-            noise = (jax.random.normal(subkey_v, shape=euler_angles.shape) * 2) + 20
+            noise = jax.random.uniform(subkey_v, shape=euler_angles.shape, minval=15.0, maxval=60.0)
             euler_angles_noisy = euler_angles + noise
 
             projection_misal_v = Preprocessing(vol=vol,
@@ -568,15 +459,16 @@ def main():
                                  euler_angles=euler_angles_noisy,
                                  shifts=shifts,
                                  ctf=ctf)
-            result = compute_fourier_residual(projection_misal_v, x_validation)
+            result = compute_fourier_residual(projection_misal_v, x_validation, n_shells=n_shells)
+            misaligned_curve_v = result.frc_curve
             misaligned_res_v = result.residual_map
             misaligned_labels_v = jnp.zeros((batch_size_v,1))
           
-            res_validation = jnp.concatenate([aligned_res_v, misaligned_res_v],axis=0)
+            res_validation = jnp.concatenate([aligned_curve_v, misaligned_curve_v],axis=0)
             labels_validation = jnp.concatenate([aligned_labels_v, misaligned_labels_v], axis=0)
 
 
-            ##########################
+            ###########################################################
             # Debugging: save pure projection aligned and misaligned
             if _ == 0:
               
@@ -590,9 +482,9 @@ def main():
               ImageHandler().write(np.array(pure_proj_aligned), os.path.join(args.output_path, "pure_projection_aligned.mrcs"), overwrite=True)
               ImageHandler().write(np.array(pure_proj_misaligned), os.path.join(args.output_path, "pure_projection_misaligned.mrcs"), overwrite=True)
 
-              # Debugging: save aligned and misaligned residuals to TensorBoard
-              res_aligned = jnp.squeeze(aligned_res[0])
-              res_misaligned = jnp.squeeze(misaligned_res[0])
+              # Debugging: save aligned and misaligned residuals val to TensorBoard
+              res_aligned = jnp.squeeze(aligned_res_v[0])
+              res_misaligned = jnp.squeeze(misaligned_res_v[0])
 
               writer.add_image("Residual_Visual/Aligned_Sample", res_aligned, global_step=i, dataformats='HW')
               writer.add_image("Residual_Visual/Misaligned_Sample", res_misaligned, global_step=i, dataformats='HW')
@@ -604,7 +496,24 @@ def main():
               max_val = max(np.max(np.abs(res_aligned)), np.max(np.abs(res_misaligned)))
               plt.imsave(os.path.join(args.output_path, "aligned_bwr.png"), res_aligned, cmap='bwr', vmin=-max_val, vmax=max_val)
               plt.imsave(os.path.join(args.output_path, "misaligned_bwr.png"), res_misaligned, cmap='bwr', vmin=-max_val, vmax=max_val)
-            ############################
+
+              # --- FRC curve: nuovo, log come figura 1D ---
+              fig, ax = plt.subplots()
+              ax.plot(result.freqs, np.array(aligned_curve_v[0]), label="Aligned")
+              ax.plot(result.freqs, np.array(misaligned_curve_v[0]), label="Misaligned")
+              ax.axhline(0.143, color="gray", linestyle="--", label="FRC=0.143")
+              ax.set_xlabel("Spatial frequency (cycles/pixel)")
+              ax.set_ylabel("FRC")
+              ax.set_title("FRC curve - Aligned vs Misaligned sample")
+              ax.legend()
+              ax.set_ylim(-0.2, 1.05)
+              writer.add_figure("FRC_Curve/Aligned_vs_Misaligned", fig, global_step=i)
+              plt.close(fig)
+  
+              np.save(os.path.join(args.output_path, "aligned_frc_curve.npy"), np.array(aligned_curve_v[0]))
+              np.save(os.path.join(args.output_path, "misaligned_frc_curve.npy"), np.array(misaligned_curve_v[0]))
+
+            ######################################################################
 
 
             loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=res_validation, labels=labels_validation, train=False)
@@ -693,10 +602,10 @@ def main():
                                  euler_angles=euler_angles,
                                  shifts=shifts,
                                  ctf=ctf)
-      result = compute_fourier_residual(projection_pred, x)
-      prediction_res = result.residual_map
+      result = compute_fourier_residual(projection_pred, x, n_shells=n_shells)
+      prediction_curve = result.frc_curve
       #predictions = predict_fn(prediction_res,eval=True)
-      predictions = cryoCheck(prediction_res, eval=True)
+      predictions = cryoCheck(prediction_curve, eval=True)
 
       labels_prediction.append(np.array(predictions))
 
@@ -719,3 +628,4 @@ def main():
     md[:, "misalignment_score_heavy"] = final_predictions_heavy
     md.write(os.path.join(args.output_path, "md_final_predictions" +  os.path.splitext(args.md)[1]))
 
+### mlp architecture, uniform distribution for  misalignment 
