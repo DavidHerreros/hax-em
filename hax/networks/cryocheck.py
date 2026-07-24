@@ -451,24 +451,12 @@ def main():
         batch_size = len(index)
         
         # Aligned images
-        # aligned_res = jnp.abs(Preprocessing(vol=vol,
-        #                           mask=mask,
-        #                           euler_angles=euler_angles,
-        #                           shifts=shifts,
-        #                           ctf=ctf) - x)
-        #APPLY WIENER
-        # aligned_res = jnp.abs(Preprocessing(vol=vol,
-        #                         mask=mask,
-        #                         euler_angles=euler_angles,
-        #                         shifts=shifts,
-        #                         ctf=jnp.ones_like(ctf)) - wiener2DFilter(x[..., 0], ctf)[..., None])
-
-        projection = Preprocessing(vol=vol,
+        projection_al = Preprocessing(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles,
                                  shifts=shifts,
                                  ctf=ctf)
-        result = compute_fourier_residual(projection, x)
+        result = compute_fourier_residual(projection_al, x)
         aligned_res = result.residual_map
         aligned_labels = jnp.ones((batch_size,1)) #label for aligned res is 1
 
@@ -477,23 +465,18 @@ def main():
         noise = (jax.random.normal(subkey, shape=euler_angles.shape) * 2) + 20
         euler_angles_noisy = euler_angles + noise
 
-        # misaligned_res = jnp.abs(Preprocessing(vol=vol,
-        #                          mask=mask,
-        #                          euler_angles=euler_angles_noisy,
-        #                          shifts=shifts,
-        #                          ctf=ctf) - x)
-        projection_imgs_noisy = Preprocessing(vol=vol,
+        projection_misal = Preprocessing(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles_noisy,
                                  shifts=shifts,
                                  ctf=ctf)
-        result = compute_fourier_residual(projection_imgs_noisy, x)
+        result = compute_fourier_residual(projection_misal, x)
         misaligned_res = result.residual_map
         misaligned_labels = jnp.zeros((batch_size,1)) #label for misaligned res is 0
       
        
-        res=jnp.concatenate([aligned_res, misaligned_res], axis=0)
-        labels=jnp.concatenate([aligned_labels, misaligned_labels], axis=0)
+        res = jnp.concatenate([aligned_res, misaligned_res], axis=0)
+        labels = jnp.concatenate([aligned_labels, misaligned_labels], axis=0)
 
 
         ######## === PRINT VALUES RANGE (ONLY FOR THE FIRST BATCH) === ########
@@ -565,19 +548,14 @@ def main():
 
 
             # Aligned images
-            # aligned_vimgs = jnp.abs(Preprocessing(vol=vol,
-            #                   mask=mask,
-            #                   euler_angles=euler_angles,
-            #                   shifts=shifts,
-            #                   ctf=ctf) - x_validation)
-            projection_vimgs = Preprocessing(vol=vol,
+            projection_al_v = Preprocessing(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles,
                                  shifts=shifts,
                                  ctf=ctf)
-            result = compute_fourier_residual(projection_vimgs, x_validation)
-            aligned_vimgs = result.residual_map
-            aligned_vlabels = jnp.ones((batch_size_v,1))
+            result = compute_fourier_residual(projection_al_v, x_validation)
+            aligned_res_v = result.residual_map
+            aligned_labels_v = jnp.ones((batch_size_v,1))
         
     
             # Misaligned images
@@ -585,22 +563,17 @@ def main():
             noise = (jax.random.normal(subkey_v, shape=euler_angles.shape) * 2) + 20
             euler_angles_noisy = euler_angles + noise
 
-            # misaligned_vimgs = jnp.abs(Preprocessing(vol=vol,
-            #                   mask=mask,
-            #                   euler_angles=euler_angles_noisy,
-            #                   shifts=shifts,
-            #                   ctf=ctf) - x_validation)
-            projection_vimgs_noisy = Preprocessing(vol=vol,
+            projection_misal_v = Preprocessing(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles_noisy,
                                  shifts=shifts,
                                  ctf=ctf)
-            result = compute_fourier_residual(projection_vimgs_noisy, x_validation)
-            misaligned_vimgs = result.residual_map
-            misaligned_vlabels = jnp.zeros((batch_size_v,1))
+            result = compute_fourier_residual(projection_misal_v, x_validation)
+            misaligned_res_v = result.residual_map
+            misaligned_labels_v = jnp.zeros((batch_size_v,1))
           
-            res_validation = jnp.concatenate([aligned_vimgs, misaligned_vimgs],axis=0)
-            labels_validation = jnp.concatenate([aligned_vlabels, misaligned_vlabels], axis=0)
+            res_validation = jnp.concatenate([aligned_res_v, misaligned_res_v],axis=0)
+            labels_validation = jnp.concatenate([aligned_labels_v, misaligned_labels_v], axis=0)
 
 
             ##########################
@@ -715,13 +688,6 @@ def main():
 
       euler_angles, shifts, ctf = md_extraction (md_columns, index, vol, args)
       
-
-      # prediction_res = jnp.abs(Preprocessing(vol=vol,
-      #                            mask=mask,
-      #                            euler_angles=euler_angles,
-      #                            shifts=shifts,
-      #                            ctf=ctf) - x)
-
       projection_pred = Preprocessing(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles,
