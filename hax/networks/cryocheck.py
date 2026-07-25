@@ -28,7 +28,7 @@ from hax.programs.gaussian_volume_fitting import fit_volume, adjust_weights_to_i
 # MLP
 class CryoCheck(nnx.Module):
   @save_config
-  def __init__(self, n_shells, rngs: nnx.Rngs, hidden=(64, 32)):
+  def __init__(self, n_shells, rngs: nnx.Rngs, hidden=(64, 32)): #a third hidden layer may be added
     self.fc1 = nnx.Linear(n_shells, hidden[0], rngs=rngs)
     self.bn1 = nnx.BatchNorm(hidden[0], rngs=rngs)
     self.fc2 = nnx.Linear(hidden[0], hidden[1], rngs=rngs)
@@ -156,6 +156,55 @@ def Preprocessing(vol, mask, euler_angles, shifts, ctf):
 
     return images[..., None] 
 
+# Compute Misalignment 
+def compute_min_rotation_angle(mask, pixel_threshold=2.0):
+    """
+    Minimum rotation angle (degrees) such that the mask voxel farthest from
+    its center of mass travels at least `pixel_threshold` pixels of arc.
+
+    arc = R * theta  ->  theta_min = pixel_threshold / R_max
+
+    Call once, right after computing `mask`.
+    """
+    inds = np.asarray(np.where(mask > 0.0)).T          # (N, 3) z,y,x voxel coords
+    com = inds.mean(axis=0)                              # geometric centroid
+    R_max = np.linalg.norm(inds - com, axis=1).max()
+
+    theta_min_deg = np.degrees(pixel_threshold / R_max)
+    return float(theta_min_deg), float(R_max)
+
+
+def generate_misalignment(rngs, euler_angles, shifts, box_size, theta_min_deg,
+                           theta_max_deg=180.0, shift_min_px=2.0, shift_max_frac=0.10):
+    """
+    Perturb ground-truth angles and shifts for a "misaligned" example.
+    Angle magnitude ~ Uniform[theta_min_deg, theta_max_deg], random sign per
+    angle (rotation can go either direction).
+    Shift magnitude/direction sampled in polar form so every direction is
+    equally likely.
+
+    Call identically in training and validation, passing the same
+    `theta_min_deg` (from compute_min_rotation_angle) and `box_size`.
+
+    Returns: rngs (updated key), euler_angles_noisy, shifts_noisy
+    """
+    B = euler_angles.shape[0]
+
+    rngs, k1, k2, k3, k4 = jax.random.split(rngs, 5)
+
+    angle_mag = jax.random.uniform(k1, euler_angles.shape, minval=theta_min_deg, maxval=theta_max_deg)
+    angle_sign = jax.random.choice(k2, jnp.array([-1.0, 1.0]), shape=euler_angles.shape)
+    euler_angles_noisy = euler_angles + angle_mag * angle_sign
+
+    shift_max_px = shift_max_frac * box_size
+    shift_mag = jax.random.uniform(k3, (B,), minval=shift_min_px, maxval=shift_max_px)
+    shift_angle = jax.random.uniform(k4, (B,), minval=0.0, maxval=2 * jnp.pi)
+    shift_noise = jnp.stack([shift_mag * jnp.cos(shift_angle), shift_mag * jnp.sin(shift_angle)], axis=1)
+    shifts_noisy = shifts + shift_noise
+
+    return rngs, euler_angles_noisy, shifts_noisy
+
+
 
 
 def main():
@@ -175,7 +224,7 @@ def main():
   from hax.checkpointer import NeuralNetworkCheckpointer
   from hax.generators import MetaDataGenerator, extract_columns
   from hax.metrics import JaxSummaryWriter
-  from hax.utils.frc import compute_fourier_residual
+  from hax.utils.frc_jit import compute_fourier_residual
 
   def list_of_floats(arg):
         return list(map(float, arg.split(',')))
@@ -234,6 +283,7 @@ def main():
   # Volume and Mask handling
   vol = ImageHandler(args.vol).getData()
   mask = ImageHandler().generateMask(inputFn=vol, boxsize=64)
+  theta_min_deg, R_max = compute_min_rotation_angle(mask, pixel_threshold=2.0) # it will be further used to compute misalignment; ita has to be computed once
 
   # Prepare network
   x_size = vol.shape[0]
@@ -275,7 +325,7 @@ def main():
         
         # Adjust to images (options are apply mode or wiener mode)
         model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
-                                            num_epochs=500, is_global=True, ctf_type="apply")
+                                            num_epochs=5, is_global=True, ctf_type="apply")
 
         # Save model
         NeuralNetworkCheckpointer.save(model, fit_path)
@@ -348,14 +398,11 @@ def main():
         aligned_labels = jnp.ones((batch_size,1)) #label for aligned res is 1
 
         # Misaligned images - Data Augmentation
-        rngs, subkey = jax.random.split(rngs)
-        noise = jax.random.uniform(subkey, shape=euler_angles.shape, minval=15.0, maxval=60.0)
-        euler_angles_noisy = euler_angles + noise
-
+        rngs, euler_angles_noisy, shifts_noisy = generate_misalignment(rngs, euler_angles, shifts, box_size=x_size, theta_min_deg=theta_min_deg)
         projection_misal = Preprocessing(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles_noisy,
-                                 shifts=shifts,
+                                 shifts=shifts_noisy,
                                  ctf=ctf)
         result = compute_fourier_residual(projection_misal, x, n_shells=n_shells)
         misaligned_curve = result.frc_curve
@@ -365,26 +412,7 @@ def main():
        
         res = jnp.concatenate([aligned_curve, misaligned_curve], axis=0)
         labels = jnp.concatenate([aligned_labels, misaligned_labels], axis=0)
-
-
-        ######## === PRINT VALUES RANGE (ONLY FOR THE FIRST BATCH) === ########
-        if total_steps == 0:
-            # Extract the first sample of the batch for debugging
-            proj_sample = Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles, shifts=shifts, ctf=ctf)[0]
-            #wiener_sample = wiener2DFilter(x[..., 0], ctf)[0]
-            
-            print("\n" + "="*50)
-            print("[VALUES RANGE - FIRST SAMPLE ]")
-            print(f"EXP PROJECTION  -> Min: {jnp.min(x[0]):.4f} | Max: {jnp.max(x[0]):.4f} | Mean: {jnp.mean(x[0]):.4f}")
-            print(f"PURE PROJECTION  -> Min: {jnp.min(proj_sample):.4f} | Max: {jnp.max(proj_sample):.4f} | Mean: {jnp.mean(proj_sample):.4f}")
-            #print(f"WIENER IMAGE  -> Min: {jnp.min(wiener_sample):.4f} | Max: {jnp.max(wiener_sample):.4f} | Mean: {jnp.mean(wiener_sample):.4f}")
-            print(f"ALIGNED RESIDUAL  -> Min: {jnp.min(aligned_res[0]):.4f} | Max: {jnp.max(aligned_res[0]):.4f} | Mean: {jnp.mean(aligned_res[0]):.4f}")
-            print("="*50 + "\n")
-
-            
-        #########################################################################
         
-
         loss, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=res, labels=labels, train=True)
         total_loss += loss
         
@@ -396,8 +424,8 @@ def main():
         #VALIDATION STEP at the end of each epoch  
         if (total_steps + 1) % steps_per_epoch == 0:    
 
-
-          ####
+          # Compute training scores and metrics 
+          #################
           t_score_epoch= jnp.concatenate(t_score, axis=0)
           t_labels_epoch = jnp.concatenate(t_labels, axis=0)
 
@@ -415,7 +443,7 @@ def main():
           writer.add_scalars('Training loss (cryocheck)',
                                        {"train": avg_train_loss},
                                        total_steps + 1)
-          ####
+          ###################
 
           total_loss = 0
           total_validation_loss = 0
@@ -450,14 +478,11 @@ def main():
         
     
             # Misaligned images
-            rngs, subkey_v = jax.random.split(rngs)
-            noise = jax.random.uniform(subkey_v, shape=euler_angles.shape, minval=15.0, maxval=60.0)
-            euler_angles_noisy = euler_angles + noise
-
+            rngs, euler_angles_noisy, shifts_noisy = generate_misalignment(rngs, euler_angles, shifts, box_size=x_size, theta_min_deg=theta_min_deg)
             projection_misal_v = Preprocessing(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles_noisy,
-                                 shifts=shifts,
+                                 shifts=shifts_noisy,
                                  ctf=ctf)
             result = compute_fourier_residual(projection_misal_v, x_validation, n_shells=n_shells)
             misaligned_curve_v = result.frc_curve
@@ -471,18 +496,17 @@ def main():
             ###########################################################
             # Debugging: save pure projection aligned and misaligned
             if _ == 0:
-              
-              pure_proj_aligned = jnp.squeeze(Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles, shifts=shifts, ctf=ctf)[0])
-              pure_proj_misaligned = jnp.squeeze(Preprocessing(vol=vol, mask=mask, euler_angles=euler_angles_noisy, shifts=shifts, ctf=ctf)[0])
-              # wiener_img = jnp.squeeze(wiener2DFilter(x[..., 0], ctf[...])[0])
+              # Projections 
+              proj_al_2d = jnp.squeeze(projection_al_v[0])      
+              proj_misal_2d = jnp.squeeze(projection_misal_v[0])
 
-              writer.add_image("Pure_Projection/Aligned", pure_proj_aligned, global_step=i, dataformats='HW')
-              writer.add_image("Pure_Projection/Misaligned", pure_proj_misaligned, global_step=i, dataformats='HW')
+              writer.add_image("Pure_Projection/Aligned", proj_al_2d, global_step=i, dataformats='HW')
+              writer.add_image("Pure_Projection/Misaligned", proj_misal_2d, global_step=i, dataformats='HW')
 
-              ImageHandler().write(np.array(pure_proj_aligned), os.path.join(args.output_path, "pure_projection_aligned.mrcs"), overwrite=True)
-              ImageHandler().write(np.array(pure_proj_misaligned), os.path.join(args.output_path, "pure_projection_misaligned.mrcs"), overwrite=True)
+              ImageHandler().write(np.array(proj_al_2d), os.path.join(args.output_path, "pure_projection_aligned.mrcs"), overwrite=True)
+              ImageHandler().write(np.array(proj_misal_2d), os.path.join(args.output_path, "pure_projection_misaligned.mrcs"), overwrite=True)
 
-              # Debugging: save aligned and misaligned residuals val to TensorBoard
+              # Residuals
               res_aligned = jnp.squeeze(aligned_res_v[0])
               res_misaligned = jnp.squeeze(misaligned_res_v[0])
 
