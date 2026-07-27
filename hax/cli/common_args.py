@@ -57,8 +57,6 @@ MD_HELP = "Xmipp/Relion metadata file with the images (+ alignments / CTF) to be
 SR_HELP = "Sampling rate of the images/volume"
 
 CTF_TYPE_CHOICES = ["None", "apply", "wiener", "precorrect"]
-# Only the reconstruction accepts this one, so it is kept out of the shared list: the other
-# programs branch on the mode by name and would silently treat an unknown one as "apply".
 CTF_TYPE_CHOICES_PREMULTIPLIED = CTF_TYPE_CHOICES + ["premultiplied"]
 CTF_TYPE_HELP = ("Determines whether to consider the CTF and, in case it is considered, whether it will be "
                  "applied to the projections (apply) or used to correct the metadata images (wiener - precorrect)")

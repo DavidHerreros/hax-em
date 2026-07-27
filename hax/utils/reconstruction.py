@@ -101,13 +101,6 @@ def _insert_slices(num, den, images, rotations, shifts, ctf, k_rot, box, f0, f1,
                                     + shifts[:, 0, None, None] * f1[None]) / box)
     ft = ft * phase
 
-    # The Wiener denominator is sum(CTF^2) either way; what changes is the numerator.
-    # Normally the stored image is the raw observation CTF*P(V), so it has to be multiplied
-    # by the CTF here to form sum(CTF*I). Some extractions have already done that -- RELION's
-    # 2D stacks and Warp's `ts_export_particles` particle series are both written
-    # pre-multiplied by default -- and multiplying a second time would accumulate CTF^3
-    # against a CTF^2 denominator, leaving the map modulated by one extra CTF: low
-    # frequencies suppressed and the CTF zeros squared.
     data = ft if premultiplied else ft * ctf
     weight = ctf ** 2
 
