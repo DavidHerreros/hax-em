@@ -77,13 +77,50 @@ def _slice_geometry(box, sr):
             jnp.asarray(f0), jnp.asarray(f1))
 
 
+# Grant & Grigorieff (2015) critical-dose parameterisation, the same one Warp and RELION
+# use to dose-weight tilt series.
+_DOSE_A, _DOSE_B, _DOSE_C = 0.24499, 1.6649, 2.8141
+
+
+def _critical_dose_reciprocal(s):
+    """``1 / (2 N_c(k))`` on the slice frequency grid -- the exponent of the dose weight.
+
+    ``N_c`` diverges at DC, so the weight there is 1 and nothing is attenuated; the clamp
+    only keeps the power law finite at ``k = 0``.
+    """
+    k = np.maximum(np.asarray(s, np.float64), 1e-6)
+    return jnp.asarray(1.0 / (2.0 * (_DOSE_A * k ** -_DOSE_B + _DOSE_C)), jnp.float32)
+
+
+def _rows(values, rows, default):
+    """``values[rows]`` on device, or a constant when that column is not in the metadata."""
+    if values is None:
+        return jnp.full((len(rows),), default, jnp.float32)
+    return jnp.asarray(np.asarray(values, np.float32)[rows])
+
+
+def _dose_weight(inv2nc, dose, scale):
+    """The per-tilt weight already folded into a tomography particle image.
+
+    ``exp(-dose / 2 N_c(k))`` is the radiation-damage weighting; ``scale``
+    (``rlnCtfScalefactor``, ~``cos(tilt)``) is the amplitude term that goes with the longer
+    path length at high tilt. Both multiply the CTF, so as far as the reconstruction is
+    concerned they are one weight ``W`` and the total premultiplier is ``CTF * W``.
+    """
+    return jnp.exp(-dose[:, None, None] * inv2nc[None]) * scale[:, None, None]
+
+
 @partial(jax.jit, static_argnums=(7, 10), donate_argnums=(0, 1))
 def _insert_slices(num, den, images, rotations, shifts, ctf, k_rot, box, f0, f1,
-                   premultiplied=False):
+                   premultiplied=False, dose_w=None):
     """Accumulate one batch of CTF-weighted central slices into the 3D transform.
 
     ``premultiplied`` says whether the stored images have already been multiplied by their
     CTF by whatever extracted them. See the ``data``/``weight`` lines below.
+
+    ``dose_w`` is that image's dose/tilt weight ``W``, broadcast over the slice. Tomography
+    extractions premultiply by ``CTF * W``, not by ``CTF`` alone, so ``W`` belongs in the
+    denominator with it -- see the ``weight`` line.
 
     The accumulators are **donated**, so the scatter lands in place. Without that, XLA has to
     preserve the caller's buffers: every call allocates a fresh ``num`` (262 MB at box 320) and
@@ -101,8 +138,13 @@ def _insert_slices(num, den, images, rotations, shifts, ctf, k_rot, box, f0, f1,
                                     + shifts[:, 0, None, None] * f1[None]) / box)
     ft = ft * phase
 
-    data = ft if premultiplied else ft * ctf
-    weight = ctf ** 2
+    # The image as stored is CTF*W*O, so the matched filter is CTF*W and the Wiener
+    # denominator is sum((CTF*W)^2). Leaving W out of the denominator does not cancel: it
+    # leaves the map multiplied by the CTF^2-weighted mean of W, which for a 40-tilt series
+    # is a ~450 A^2 B-factor -- a real, avoidable loss of everything past ~20 A.
+    w = ctf if dose_w is None else ctf * dose_w
+    data = ft if premultiplied else ft * w
+    weight = w ** 2
 
     k = jnp.einsum("bji,jhw->bihw", rotations, k_rot)             # R^T @ (f1, f0, 0), components
     k = jnp.stack([k[:, 2], k[:, 1], k[:, 0]], 1)                 # reversed -> volume array order
@@ -234,7 +276,7 @@ def _project(volume_ft, rotations, shifts, ctf, k_rot, box, f0, f1):
 
 
 def _gray_scale(volume, reader, columns, sr, box, has_ctf, k_rot, f0, f1, s, a, n_probe=2000,
-                batch_size=256, premultiplied=False):
+                batch_size=256, premultiplied=False, dose=None, scalefactor=None, inv2nc=None):
     """Global scale putting the map's projections on the gray scale of the input images.
 
     Measured, not derived: forward-project the finished map at a subset of the real poses,
@@ -275,8 +317,11 @@ def _gray_scale(volume, reader, columns, sr, box, has_ctf, k_rot, f0, f1, s, a, 
         else:
             ctf = jnp.ones((chunk.shape[0], box, box), jnp.float32)
 
-        # Predict the image as *stored*: pre-multiplied data carries CTF^2 * P(V), so the
-        # forward model has to square the CTF too or the scale comes out biased.
+        if inv2nc is not None:
+            ctf = ctf * _dose_weight(inv2nc, _rows(dose, chunk, 0.0), _rows(scalefactor, chunk, 1.0))
+
+        # Predict the image as *stored*: pre-multiplied data carries (CTF*W)^2 * P(V), so the
+        # forward model has to square the weight too or the scale comes out biased.
         predicted = _project(volume_ft, rotations, jnp.asarray(shifts[chunk]),
                              ctf ** 2 if premultiplied else ctf,
                              k_rot, box, f0, f1)
@@ -376,7 +421,8 @@ def _stream_chunks(reader, n, batch_size, threads):
 
 def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, threads=8,
                                  use_ctf=True, denoise=True, calibrate_gray_scale=True,
-                                 scratch_dir=None, quiet=False, premultiplied=False):
+                                 scratch_dir=None, quiet=False, premultiplied=False,
+                                 dose_weighting=True):
     """Reconstruct a consensus volume from posed particles in a single streaming pass.
 
     ``md`` is an ``XmippMetaData``; ``columns`` the dict from ``extract_columns`` (it
@@ -390,9 +436,14 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
     denominator uses the CTF; multiplying again would leave the map modulated by one extra
     CTF. It has no effect unless ``use_ctf``, since without a CTF there is nothing to undo.
 
-    One approximation to be aware of: those extractions fold their dose/tilt weighting into
-    the images alongside the CTF, so the exact denominator would be ``sum((CTF*W)^2)`` rather
-    than ``sum(CTF^2)``. The weighting is not represented here, so it is left in the map.
+    ``dose_weighting`` handles the other half of what those extractions fold in. A tilt image
+    is premultiplied by ``CTF * W``, where ``W`` is the radiation-damage weight and the tilt
+    amplitude scale, so the denominator has to be ``sum((CTF*W)^2)``. Leaving ``W`` out does
+    not cancel -- it leaves the map multiplied by the CTF^2-weighted mean of ``W``, which for
+    a 40-tilt, 120 e/A2 series is 0.78 at 40 A but 0.19 at 8 A: a ~450 A^2 B-factor, and the
+    difference between a map with mid-resolution detail and a smooth blob. ``W`` is rebuilt
+    from ``preExposure`` and ``ctfScaleFactor``; the flag is ignored when the metadata has
+    neither, which is every single-particle data set, so nothing changes for those.
 
     ``tau`` is only a numerical floor for the Wiener quotient -- the resolution is set by
     the data, not by this. With ``denoise`` the particles are split into two halves, the
@@ -423,6 +474,15 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
     angles = np.asarray(columns["euler_angles"], np.float32)
     shifts = np.asarray(columns["shifts"], np.float32)
     has_ctf = use_ctf and "ctfDefocusU" in columns
+
+    # The dose/tilt weight only exists for tilt-series data. Without a CTF there is no
+    # premultiplier to correct at all, so the weight has nothing to attach to either.
+    dose = np.asarray(columns["preExposure"], np.float32).ravel() if "preExposure" in columns else None
+    scalefactor = (np.asarray(columns["ctfScaleFactor"], np.float32).ravel()
+                   if "ctfScaleFactor" in columns else None)
+    inv2nc = (_critical_dose_reciprocal(s)
+              if dose_weighting and has_ctf and (dose is not None or scalefactor is not None)
+              else None)
     # Without a CTF there is no pre-multiplication to undo, so the flag cannot mean anything
     premultiplied = bool(premultiplied) and has_ctf
     if has_ctf:
@@ -430,6 +490,17 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
 
     if not quiet:
         print(f"{bcolors.OKCYAN}\n###### Reconstructing consensus volume from {n} posed particles... ######{bcolors.ENDC}")
+        if inv2nc is not None:
+            have = ", ".join(x for x, present in (("dose", dose is not None),
+                                                  ("tilt scale", scalefactor is not None)) if present)
+            print(f"{bcolors.OKCYAN}Dose weighting is ON ({have} found in the metadata); "
+                  f"the Wiener denominator uses sum((CTF*W)^2).{bcolors.ENDC}")
+        elif dose_weighting and has_ctf and "subtomo_labels" in columns:
+            # Only worth saying for tilt-series data: single-particle metadata has no dose
+            # column and never will, so the same message there would be pure noise.
+            print(f"{bcolors.WARNING}No preExposure / ctfScaleFactor column: dose weighting "
+                  f"is off. For tilt-series data that leaves a large B-factor in the "
+                  f"map.{bcolors.ENDC}")
 
     n_chunks = (n + batch_size - 1) // batch_size
     for labels, images in tqdm(_stream_chunks(reader, n, batch_size, threads), total=n_chunks,
@@ -466,9 +537,12 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
             else:
                 ctf = jnp.ones((idx.shape[0], box, box), jnp.float32)
 
+            dose_w = None if inv2nc is None else _dose_weight(
+                inv2nc, _rows(dose, idx, 0.0), _rows(scalefactor, idx, 1.0))
+
             num[half], den[half] = _insert_slices(
                 num[half], den[half], images_dev[jnp.asarray(pos)], rotations,
-                jnp.asarray(shifts[idx]), ctf, k_rot, box, f0, f1, premultiplied)
+                jnp.asarray(shifts[idx]), ctf, k_rot, box, f0, f1, premultiplied, dose_w)
 
     # The Friedel mates of every slice, added in one pass rather than during the streaming.
     num[0], den[0] = _hermitian_symmetrize(num[0], den[0])
@@ -495,7 +569,8 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
 
     if calibrate_gray_scale:
         scale = _gray_scale(volume, reader, columns, sr, box, has_ctf, k_rot, f0, f1, s, a,
-                            premultiplied=premultiplied)
+                            premultiplied=premultiplied, dose=dose,
+                            scalefactor=scalefactor, inv2nc=inv2nc)
         volume = volume * scale
         if not quiet:
             print(f"{bcolors.OKGREEN}Gray-scale calibrated to the input images (x{scale:.3f}); "

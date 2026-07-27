@@ -50,6 +50,12 @@ def main():
                              f"FSC between the resulting half maps measures the spectral signal-to-noise, and the combined map is "
                              f"filtered with it, so the shells carrying signal pass untouched and the shells that are only noise are "
                              f"removed (the measured resolution is printed). Pass this flag to get the raw, unfiltered map instead.")
+    parser.add_argument("--no_dose_weighting", action='store_true',
+                        help=f"{bcolors.BOLD}(optional){bcolors.ENDC} Do not fold the "
+                             f"tilt-series dose/tilt weighting into the Wiener denominator. "
+                             f"Tomography images are pre-multiplied by CTF*W, so W belongs "
+                             f"there; turning this off leaves a large B-factor in the map. "
+                             f"Ignored when the metadata has no preExposure column.")
     parser.add_argument("--no_gray_scale_calibration", action='store_true',
                         help=f"Skip the global gray-scale calibration. By default the finished map is forward-projected at a subset "
                              f"of the real poses and least-squares scaled against the input images, so that re-projecting it "
@@ -113,6 +119,7 @@ def main():
                                           use_ctf=args.ctf_type not in (None, "None"),
                                           premultiplied=args.ctf_type == "premultiplied",
                                           denoise=not args.no_denoise,
+                                          dose_weighting=not args.no_dose_weighting,
                                           calibrate_gray_scale=not args.no_gray_scale_calibration,
                                           scratch_dir=scratch_dir)
 

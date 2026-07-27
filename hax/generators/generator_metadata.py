@@ -801,6 +801,12 @@ def extract_columns(md, hasCTF=None, isTomo=None):
         columns["ctfVoltage"] = jnp.array(md.getMetaDataColumns("ctfVoltage").astype(jnp.float32))
     if isTomo:
         columns["subtomo_labels"] = jnp.array(md.getMetaDataColumns("subtomo_labels").astype(jnp.float32))
+    # Tilt-series weighting: the accumulated dose of each tilt image and the tilt amplitude
+    # scale. Both are optional -- older tomo metadata may carry neither -- and absent from
+    # every single-particle data set, so they are looked up rather than required.
+    for label in ("preExposure", "ctfScaleFactor"):
+        if md.isMetaDataLabel(label):
+            columns[label] = jnp.array(md.getMetaDataColumns(label).astype(jnp.float32))
     return columns
 
 
