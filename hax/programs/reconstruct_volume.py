@@ -26,12 +26,20 @@ def main():
     ca.add_md(parser)
     ca.add_sr(parser)
     ca.add_ctf_type(parser,
-                    help=f"Whether the images carry a CTF. The reconstruction only needs to know if they do: "
+                    choices=ca.CTF_TYPE_CHOICES_PREMULTIPLIED,
+                    help=f"Whether the images carry a CTF, and whether it has already been multiplied into them. "
                          f"{bcolors.ITALIC}apply{bcolors.ENDC}, {bcolors.ITALIC}wiener{bcolors.ENDC} and "
-                         f"{bcolors.ITALIC}precorrect{bcolors.ENDC} all mean they do (the slices are CTF weighted and the "
-                         f"quotient deconvolves them), while {bcolors.ITALIC}None{bcolors.ENDC} means they do not. "
-                         f"{bcolors.WARNING}NOTE{bcolors.ENDC}: this must match your data -- weighting CTF-free images by a "
-                         f"CTF is not a harmless no-op, it reweights the slices and degrades the map.")
+                         f"{bcolors.ITALIC}precorrect{bcolors.ENDC} all mean the images are the raw observations "
+                         f"(the slices are CTF weighted here and the quotient deconvolves them), while "
+                         f"{bcolors.ITALIC}None{bcolors.ENDC} means they carry no CTF at all.\n"
+                         f"Use {bcolors.ITALIC}premultiplied{bcolors.ENDC} when whatever extracted the particles already "
+                         f"multiplied them by their CTF -- this is the default for RELION's 2D tilt-series stacks and for "
+                         f"{bcolors.UNDERLINE}WarpTools ts_export_particles{bcolors.ENDC}, which does "
+                         f"{bcolors.ITALIC}ImagesFT.Multiply(CTFs){bcolors.ENDC} unless asked not to. The slices then go in "
+                         f"as they are and only the denominator uses the CTF.\n"
+                         f"{bcolors.WARNING}NOTE{bcolors.ENDC}: this must match your data. Weighting CTF-free images by a "
+                         f"CTF is not a harmless no-op, and multiplying pre-multiplied ones a second time leaves the map "
+                         f"modulated by an extra CTF -- low frequencies suppressed and the CTF zeros squared.")
     parser.add_argument("--tau", required=False, type=float, default=0.05,
                         help=f"Wiener floor of the reconstruction quotient (set by default to 0.05). This is only a numerical "
                              f"regularizer to keep the shells with little CTF power from blowing up -- the resolution of the map "
@@ -95,12 +103,15 @@ def main():
 
     # Reconstruct the consensus volume. Every CTF mode except None means the stored images
     # carry the CTF (precorrect only Wiener-filters them at train time, it does not alter
-    # the data), so that is what decides whether the slices are CTF weighted.
+    # the data), so that is what decides whether the slices are CTF weighted. `premultiplied`
+    # additionally says the CTF is already *in* the pixels, so it belongs in the denominator
+    # only.
     volume = reconstruct_consensus_volume(generator.md, md_columns, args.sr,
                                           tau=args.tau,
                                           batch_size=args.batch_size,
                                           threads=args.threads,
                                           use_ctf=args.ctf_type not in (None, "None"),
+                                          premultiplied=args.ctf_type == "premultiplied",
                                           denoise=not args.no_denoise,
                                           calibrate_gray_scale=not args.no_gray_scale_calibration,
                                           scratch_dir=scratch_dir)

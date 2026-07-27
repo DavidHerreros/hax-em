@@ -77,9 +77,13 @@ def _slice_geometry(box, sr):
             jnp.asarray(f0), jnp.asarray(f1))
 
 
-@partial(jax.jit, static_argnums=(7,), donate_argnums=(0, 1))
-def _insert_slices(num, den, images, rotations, shifts, ctf, k_rot, box, f0, f1):
+@partial(jax.jit, static_argnums=(7, 10), donate_argnums=(0, 1))
+def _insert_slices(num, den, images, rotations, shifts, ctf, k_rot, box, f0, f1,
+                   premultiplied=False):
     """Accumulate one batch of CTF-weighted central slices into the 3D transform.
+
+    ``premultiplied`` says whether the stored images have already been multiplied by their
+    CTF by whatever extracted them. See the ``data``/``weight`` lines below.
 
     The accumulators are **donated**, so the scatter lands in place. Without that, XLA has to
     preserve the caller's buffers: every call allocates a fresh ``num`` (262 MB at box 320) and
@@ -97,7 +101,14 @@ def _insert_slices(num, den, images, rotations, shifts, ctf, k_rot, box, f0, f1)
                                     + shifts[:, 0, None, None] * f1[None]) / box)
     ft = ft * phase
 
-    data = ft * ctf
+    # The Wiener denominator is sum(CTF^2) either way; what changes is the numerator.
+    # Normally the stored image is the raw observation CTF*P(V), so it has to be multiplied
+    # by the CTF here to form sum(CTF*I). Some extractions have already done that -- RELION's
+    # 2D stacks and Warp's `ts_export_particles` particle series are both written
+    # pre-multiplied by default -- and multiplying a second time would accumulate CTF^3
+    # against a CTF^2 denominator, leaving the map modulated by one extra CTF: low
+    # frequencies suppressed and the CTF zeros squared.
+    data = ft if premultiplied else ft * ctf
     weight = ctf ** 2
 
     k = jnp.einsum("bji,jhw->bihw", rotations, k_rot)             # R^T @ (f1, f0, 0), components
@@ -230,7 +241,7 @@ def _project(volume_ft, rotations, shifts, ctf, k_rot, box, f0, f1):
 
 
 def _gray_scale(volume, reader, columns, sr, box, has_ctf, k_rot, f0, f1, s, a, n_probe=2000,
-                batch_size=256):
+                batch_size=256, premultiplied=False):
     """Global scale putting the map's projections on the gray scale of the input images.
 
     Measured, not derived: forward-project the finished map at a subset of the real poses,
@@ -271,7 +282,10 @@ def _gray_scale(volume, reader, columns, sr, box, has_ctf, k_rot, f0, f1, s, a, 
         else:
             ctf = jnp.ones((chunk.shape[0], box, box), jnp.float32)
 
-        predicted = _project(volume_ft, rotations, jnp.asarray(shifts[chunk]), ctf,
+        # Predict the image as *stored*: pre-multiplied data carries CTF^2 * P(V), so the
+        # forward model has to square the CTF too or the scale comes out biased.
+        predicted = _project(volume_ft, rotations, jnp.asarray(shifts[chunk]),
+                             ctf ** 2 if premultiplied else ctf,
                              k_rot, box, f0, f1)
         cross += float(jnp.sum(predicted * jnp.asarray(images)))
         energy += float(jnp.sum(predicted ** 2))
@@ -369,13 +383,23 @@ def _stream_chunks(reader, n, batch_size, threads):
 
 def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, threads=8,
                                  use_ctf=True, denoise=True, calibrate_gray_scale=True,
-                                 scratch_dir=None, quiet=False):
+                                 scratch_dir=None, quiet=False, premultiplied=False):
     """Reconstruct a consensus volume from posed particles in a single streaming pass.
 
     ``md`` is an ``XmippMetaData``; ``columns`` the dict from ``extract_columns`` (it
     supplies ``euler_angles``, ``shifts`` and, when present, the CTF parameters).
     ``use_ctf`` must reflect the data: weighting CTF-free images by a CTF is not a harmless
     no-op, it reweights the slices and degrades the map.
+
+    ``premultiplied`` says the images were already multiplied by their CTF when they were
+    extracted, which is what RELION's 2D stacks and Warp's ``ts_export_particles`` particle
+    series contain by default. The slices are then inserted as they are and only the
+    denominator uses the CTF; multiplying again would leave the map modulated by one extra
+    CTF. It has no effect unless ``use_ctf``, since without a CTF there is nothing to undo.
+
+    One approximation to be aware of: those extractions fold their dose/tilt weighting into
+    the images alongside the CTF, so the exact denominator would be ``sum((CTF*W)^2)`` rather
+    than ``sum(CTF^2)``. The weighting is not represented here, so it is left in the map.
 
     ``tau`` is only a numerical floor for the Wiener quotient -- the resolution is set by
     the data, not by this. With ``denoise`` the particles are split into two halves, the
@@ -406,6 +430,8 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
     angles = np.asarray(columns["euler_angles"], np.float32)
     shifts = np.asarray(columns["shifts"], np.float32)
     has_ctf = use_ctf and "ctfDefocusU" in columns
+    # Without a CTF there is no pre-multiplication to undo, so the flag cannot mean anything
+    premultiplied = bool(premultiplied) and has_ctf
     if has_ctf:
         kv = float(np.asarray(columns["ctfVoltage"]).ravel()[0])
 
@@ -449,7 +475,7 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
 
             num[half], den[half] = _insert_slices(
                 num[half], den[half], images_dev[jnp.asarray(pos)], rotations,
-                jnp.asarray(shifts[idx]), ctf, k_rot, box, f0, f1)
+                jnp.asarray(shifts[idx]), ctf, k_rot, box, f0, f1, premultiplied)
 
     # The Friedel mates of every slice, added in one pass rather than during the streaming.
     num[0], den[0] = _hermitian_symmetrize(num[0], den[0])
@@ -475,7 +501,8 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
                   f"(Nyquist {2.0 * sr:.1f} A); the map is filtered to that limit.{bcolors.ENDC}")
 
     if calibrate_gray_scale:
-        scale = _gray_scale(volume, reader, columns, sr, box, has_ctf, k_rot, f0, f1, s, a)
+        scale = _gray_scale(volume, reader, columns, sr, box, has_ctf, k_rot, f0, f1, s, a,
+                            premultiplied=premultiplied)
         volume = volume * scale
         if not quiet:
             print(f"{bcolors.OKGREEN}Gray-scale calibrated to the input images (x{scale:.3f}); "
