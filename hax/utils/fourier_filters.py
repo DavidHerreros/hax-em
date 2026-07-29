@@ -6,6 +6,8 @@ import numpy as np
 from scipy import signal
 from functools import partial
 
+from .ctf import ctf_freqs
+
 
 class FastVariableBlur2D(nnx.Module):
     def __init__(self, shape: tuple[int, int]):
@@ -360,6 +362,63 @@ def ctfFilter(images, ctf, pad_factor=2):
     ft_ctf_images_imag = ft_images.imag * ctf
     ft_ctf_images = jlx.complex(ft_ctf_images_real, ft_ctf_images_imag)
     images = jnp.fft.irfft2(jnp.fft.ifftshift(ft_ctf_images))
+
+    if pad_factor > 1:
+        images = images[:, pad_diff:-pad_diff, pad_diff:-pad_diff]
+
+    return images
+
+
+def gaussian_envelope(shape, sigma, pad_factor=1):
+    """Gaussian splat envelope ``exp(-2 pi^2 sigma^2 f^2)`` on the CTF's frequency grid.
+
+    ``sigma`` is a width in *pixels*, so the envelope is built on frequencies in
+    cycles/pixel -- the ``d = 1`` case of :func:`hax.utils.ctf_freqs`.  The grid is
+    laid out exactly as :func:`hax.utils.computeCTF` lays out a CTF (half spectrum,
+    ``fftshift``-ed), which is what lets the two be multiplied together.
+
+    ``shape`` is the *unpadded* image shape; ``pad_factor`` matches the one handed to
+    :func:`ctfFilter`, so the envelope is returned for the padded box that filter
+    actually transforms.
+    """
+    m = int(shape[-1]) * pad_factor
+
+    # Same construction as computeCTF: full grid, sliced to the rfft half, then shifted.
+    rho, _ = ctf_freqs([m, m], d=1.0)
+    rho = jnp.fft.fftshift(rho[:, :m // 2 + 1])
+
+    # reshape(()) rather than a bare square: a per-image sigma would need a batch axis
+    # that the fftshift below does not roll, so it would pair with the wrong images.
+    # Failing loudly here beats being silently wrong.
+    sigma_sq = jnp.square(jnp.asarray(sigma, jnp.float32)).reshape(())
+
+    return jnp.exp(-2.0 * jnp.pi ** 2. * sigma_sq * rho ** 2.)
+
+
+def gaussianCTFFilter(images, sigma=None, ctf=None, pad_factor=2):
+    """Gaussian splat envelope and CTF applied together, in one Fourier pass."""
+    if sigma is None and ctf is None:
+        return images
+
+    xsize = images.shape[1]
+
+    if pad_factor > 1:
+        pad_diff = xsize * (pad_factor - 1) // pad_factor
+        images = jnp.pad(images, ((0, 0), (pad_diff, pad_diff), (pad_diff, pad_diff)), mode="constant")
+
+    ft_images = jnp.fft.fftshift(jnp.fft.rfft2(images))
+
+    if sigma is None:
+        filter_2d = ctf
+    else:
+        filter_2d = gaussian_envelope((xsize, xsize), sigma, pad_factor=pad_factor)
+        if ctf is not None:
+            filter_2d = ctf * filter_2d
+
+    ft_filtered_real = ft_images.real * filter_2d
+    ft_filtered_imag = ft_images.imag * filter_2d
+    ft_filtered = jlx.complex(ft_filtered_real, ft_filtered_imag)
+    images = jnp.fft.irfft2(jnp.fft.ifftshift(ft_filtered))
 
     if pad_factor > 1:
         images = images[:, pad_diff:-pad_diff, pad_diff:-pad_diff]
