@@ -119,6 +119,43 @@ def generate_spherical_rotations(n: int) -> np.ndarray:
     return R
 
 
+def lowpass_sigma_from_resolution(resolution_A, sr):
+    """Gaussian width, in pixels, that is at half amplitude at ``resolution_A``.
+
+    A Gaussian of width ``sigma`` multiplies the spectrum by ``exp(-2 pi^2 sigma^2 k^2)``,
+    so asking for half amplitude at ``k = sr / d`` gives
+    ``sigma = sqrt(ln 2 / (2 pi^2)) * d / sr``. Stating the band-limit in Angstrom rather
+    than in pixels keeps the schedule meaningful across box sizes and sampling rates --
+    the same 40 A start is the same physical resolution whatever the box.
+    """
+    return float(np.sqrt(np.log(2.0) / (2.0 * np.pi ** 2)) * resolution_A / sr)
+
+
+def lowpass_sigma_schedule(step, total_steps, sigma_start, frac=0.6):
+    """Cosine anneal of the comparison band-limit, ``sigma_start`` -> 0 over ``frac`` of training.
+
+    This is coarse-to-fine pose search, applied on the model side. The width of the
+    correlation peak in orientation scales with the resolution the projections are
+    compared at, so a search that starts at full Nyquist has a basin of attraction far
+    narrower than the anchor spacing and the pose head never leaves its initialisation.
+    Starting wide makes that basin large enough to fall into and then narrows it.
+
+    A cosine is used rather than a linear ramp because it is flat at both ends: the
+    opening plateau covers the soft-selection (``use_tau``) window for free, and the
+    closing plateau stops the band-limit from still moving while the poses settle.
+
+    The schedule targets *zero* extra width, not the splat width. What is annealed is a
+    band-limit applied identically to the renders and to the targets; the mixture's own
+    ``sigma`` is part of the forward model and is left alone (see the caller, which
+    composes the two as ``sqrt(sigma_splat^2 + sigma_lp^2)``).
+    """
+    if sigma_start <= 0.0 or total_steps <= 0:
+        return 0.0
+    ramp = max(1.0, frac * total_steps)
+    t = min(1.0, step / ramp)
+    return float(0.5 * sigma_start * (1.0 + np.cos(np.pi * t)))
+
+
 def sliced_wasserstein_sphere(
     directions: jax.Array,      # (N, 3) unit vectors from R[:,:,2]
     rng: jax.Array,
@@ -626,15 +663,17 @@ class PhysDecoder:
 
         images = jax.vmap(scatter_img)(images, bposi, bamp)
 
-        # Gaussian filter (needed by forward interpolation)
-        if filter:
-            images = dm_pix.gaussian_blur(images[..., None], std, kernel_size=9)[..., 0]
-
-        # Apply CTF
+        # Splat envelope and CTF, in one Fourier pass. The envelope has to be the exact
+        # exp(-2 pi^2 sigma^2 k^2) rather than a 9-tap kernel: the annealed width starts
+        # around 5-7 px, where 9 taps span well under one sigma and the render comes out
+        # far sharper than asked for -- which is precisely the band-limit the anneal
+        # exists to impose.
         if ctf_type in ["apply", "wiener", "squared"]:
             ctf = jnp.broadcast_to(ctf[:, None, :], (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
             ctf = rearrange(ctf, "b n w h -> (b n) w h")
-            images = ctfFilter(images, ctf, pad_factor=2)
+            images = gaussianCTFFilter(images, sigma=std if filter else None, ctf=ctf)
+        else:
+            images = gaussianCTFFilter(images, sigma=std if filter else None, ctf=None)
 
         images = rearrange(images, "(b n) w h -> b n w h", b=rotations.shape[0], n=rotations.shape[1])
 
@@ -703,7 +742,7 @@ class ReconSIREN(nnx.Module):
 
         # Generate projections
         images_corrected = self.phys_decoder(x, values, coords, self.xsize, rotations, shifts, ctf, 
-                                             self.get_std(), ctf_type)
+                                             ctf_type, self.get_std())
 
         return images_corrected
 
@@ -721,8 +760,16 @@ class ReconSIREN(nnx.Module):
         return vol
 
 
-@partial(jax.jit, static_argnames=("use_tau",))
-def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_tau=False, lambda_uniform=0.1):
+@partial(jax.jit, static_argnames=("use_tau", "use_lowpass"))
+def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_tau=False, lambda_uniform=0.1,
+                          sigma_lp=0.0, use_lowpass=False):
+    """One optimisation step.
+
+    ``sigma_lp`` is the extra band-limit (in pixels) applied to *both* the renders and the
+    targets this step -- see :func:`lowpass_sigma_schedule`. It is traced, so it can move
+    every step without forcing a recompile; ``use_lowpass`` is static and only says whether
+    the feature is on at all, so a run that does not use it pays nothing.
+    """
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
 
     # Random keys
@@ -755,8 +802,16 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
         random_indices = jax.random.choice(choice_key, jnp.arange(model.symmetry_matrices.shape[0]), shape=(rotations.shape[0],))
         rotations = jnp.matmul(jnp.transpose(model.symmetry_matrices[random_indices], (0, 2, 1))[:, None, :, :], rotations)
 
+        # Render width for this step: the mixture's own splat width, widened by the
+        # annealed band-limit. Two Gaussians compose in quadrature, and both are diagonal
+        # in Fourier space, so this is exactly "render, then low-pass" at no extra cost --
+        # and it leaves the model's sigma (the tiling floor its point count implies)
+        # untouched, which keeps the anneal a property of the *comparison* rather than of
+        # the volume.
+        sigma_render = jnp.sqrt(model.get_std() ** 2 + sigma_lp ** 2) if use_lowpass else model.get_std()
+
         # Generate projections
-        images_corrected = model.phys_decoder(x, values, coords, model.xsize, rotations, shifts, ctf, model.ctf_type, model.get_std())
+        images_corrected = model.phys_decoder(x, values, coords, model.xsize, rotations, shifts, ctf, model.ctf_type, sigma_render)
 
         # Losses
         images_corrected_loss = images_corrected[..., 0] if images_corrected.shape[-1] == 1 else images_corrected
@@ -782,12 +837,26 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
             images_corrected_loss = ctfFilter(images_corrected_loss, ctf_broadcasted, pad_factor=2)
             images_corrected_loss = rearrange(images_corrected_loss, "(b n) w h -> b n w h")
 
+        # Band-limit the targets by the same envelope the renders carry. Attenuating only
+        # the renders would leave the data's high frequencies -- which the mixture cannot
+        # produce at any sigma -- in the MSE as a term that is identical across the pose
+        # hypotheses, so it adds variance to the argmin without telling it anything.
+        #
+        # standard_normalization works off per-image statistics, so normalising the
+        # (B, H, W) stack and then broadcasting is identical to broadcasting and then
+        # normalising -- and it band-limits B images rather than B * num_components.
+        x_pose_target = standard_normalization(x_loss_nb)
+        if use_lowpass:
+            x_pose_target = gaussianCTFFilter(x_pose_target, sigma=sigma_lp, ctf=None)
+            x_het_target = gaussianCTFFilter(x_loss_nb, sigma=sigma_lp, ctf=None)
+        else:
+            x_het_target = x_loss_nb
+
         # Broadcast input images to right size
-        x_loss = jnp.broadcast_to(x_loss_nb[:, None, ...], (x_loss_nb.shape[0], images_corrected.shape[1], x_loss_nb.shape[1], x_loss_nb.shape[2]))
+        x_loss = jnp.broadcast_to(x_pose_target[:, None, ...], (x_pose_target.shape[0], images_corrected.shape[1], x_pose_target.shape[1], x_pose_target.shape[2]))
 
         x_flat = rearrange(x_loss, "b n w h -> (b n) w h")
         images_corrected_flat = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
-        x_flat = standard_normalization(x_flat)
 
         # Bandpass (TODO: Make optional to membrane proteins only)
         # x_flat = bandpass_filter(x_flat, pixel_size_A=model.sr, highpass_A=50.)
@@ -809,7 +878,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
         shifts_het = shifts[jnp.arange(images_corrected.shape[0]), min_indices_het, :][:, None, ...]
         # TODO: Test stop gradient in rotations_het and shifts_het
         images_het = model.phys_decoder(x, values_het, coords_het, model.xsize, jax.lax.stop_gradient(rotations_het),
-                                        jax.lax.stop_gradient(shifts_het), ctf, model.ctf_type, model.get_std())[:, 0, ...]
+                                        jax.lax.stop_gradient(shifts_het), ctf, model.ctf_type, sigma_render)[:, 0, ...]
         images_het_loss = images_het[..., 0] if images_het.shape[-1] == 1 else images_het
         if model.ctf_type == "wiener":
             images_het_loss = wiener2DFilter(images_het_loss, ctf, pad_factor=2)
@@ -821,7 +890,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
         # x_loss_nb = bandpass_filter(x_loss_nb, pixel_size_A=model.sr, highpass_A=50.)
         # images_het_loss = bandpass_filter(images_het_loss, pixel_size_A=model.sr, highpass_A=50.)
 
-        recon_het_loss = dm_pix.mse(images_het_loss[..., None], x_loss_nb[..., None]).mean()
+        recon_het_loss = dm_pix.mse(images_het_loss[..., None], x_het_target[..., None]).mean()
 
         # Index losses and rotations based on extracted indices
         recon_loss = recon_loss[jnp.arange(images_corrected.shape[0]), min_indices].mean()
@@ -1163,6 +1232,20 @@ def main():
                              f"best-matching one. A larger value covers orientation space more densely, making the pose search more robust to local minima, but increases GPU "
                              f"memory and compute roughly linearly (this is the main driver of ReconSIREN's training footprint). Set it lower to fit a smaller GPU at the cost of a "
                              f"coarser pose search. Default: 18.")
+    parser.add_argument("--lowpass_start", required=False, type=float, default=None,
+                        help=f"Resolution (in Angstrom) at which the {bcolors.ITALIC}ab initio{bcolors.ENDC} pose search starts, annealed to full "
+                             f"resolution as training proceeds. Projections and images are compared through a Gaussian band-limit that starts here "
+                             f"and is removed on a cosine schedule (see --lowpass_frac); the same envelope is applied to both sides, so this narrows "
+                             f"what the loss can see rather than what the map can hold. This exists because the width of the correlation peak in "
+                             f"orientation scales with the resolution the projections are compared at: searching at full Nyquist from step one leaves "
+                             f"a basin of attraction much narrower than the spacing of the pose anchors, and the pose encoder never leaves its "
+                             f"initialisation (the giveaway is an angular distribution with exactly --num_components distinct directions). Values "
+                             f"around 30-40 A are a reasonable start. {bcolors.WARNING}NOTE{bcolors.ENDC}: off by default, so runs behave as before "
+                             f"unless you ask for it.")
+    parser.add_argument("--lowpass_frac", required=False, type=float, default=0.6,
+                        help="Fraction of the total training over which --lowpass_start is annealed away (default: 0.6). The remaining fraction trains "
+                             "at full resolution. The schedule is a cosine, so it is flat at both ends: it holds wide over the early exploration phase "
+                             "and stops moving before the poses settle. Ignored unless --lowpass_start is given.")
     ca.add_ctf_type(parser)
     ca.add_mode(parser)
     ca.add_epochs(parser)
@@ -1342,6 +1425,17 @@ def main():
         else:
             resume_epoch = 0
 
+        # Coarse-to-fine schedule for the pose search. The band-limit is expressed in
+        # Angstrom on the CLI and converted once here, so it means the same thing whatever
+        # the box and sampling rate.
+        total_training_steps = args.epochs * steps_per_epoch
+        use_lowpass = args.lowpass_start is not None
+        sigma_lp_start = lowpass_sigma_from_resolution(args.lowpass_start, args.sr) if use_lowpass else 0.0
+        if use_lowpass:
+            print(f"{bcolors.OKCYAN}\nPose search band-limit: {args.lowpass_start:.1f} A "
+                  f"(sigma {sigma_lp_start:.2f} px) annealed to full resolution over "
+                  f"{100 * args.lowpass_frac:.0f}% of training{bcolors.ENDC}")
+
         # Logging cadence + background offload of the host-side logging work.
         logger = TrainingLogger(image_every=args.log_images_every,
                                 landscape_every=args.log_landscape_every,
@@ -1439,7 +1533,10 @@ def main():
                 else:
                     tau = 0.0
                     use_tau = False
-                loss, recon_loss, state, rng = train_step_reconsiren(graphdef, state, x, labels, md_columns, rng, lambda_uniform=0.1, tau=tau, use_tau=use_tau)
+                sigma_lp = jnp.float32(lowpass_sigma_schedule(total_steps, total_training_steps,
+                                                              sigma_lp_start, args.lowpass_frac))
+                loss, recon_loss, state, rng = train_step_reconsiren(graphdef, state, x, labels, md_columns, rng, lambda_uniform=0.1, tau=tau, use_tau=use_tau,
+                                                                     sigma_lp=sigma_lp, use_lowpass=use_lowpass)
                 total_loss += loss
                 total_recon_loss += recon_loss
 
@@ -1456,8 +1553,14 @@ def main():
                                        {"train": mean_recon_loss},
                                        i * steps_per_epoch + step)
 
+                    if use_lowpass:
+                        writer.add_scalar('Pose search band-limit (sigma, px)',
+                                          float(sigma_lp),
+                                          i * steps_per_epoch + step)
+
                     # Progress bar update  (TQDM)
-                    pbar.set_postfix_str(f"loss={mean_loss:.5f} | recon_loss={mean_recon_loss:.5f}")
+                    lp_str = f" | lowpass={float(sigma_lp):.2f}px" if use_lowpass else ""
+                    pbar.set_postfix_str(f"loss={mean_loss:.5f} | recon_loss={mean_recon_loss:.5f}{lp_str}")
 
                 # # Summary writer (validation loss)  FIXME: This fails with StopIteration
                 # if step % int(np.ceil(0.5 * steps_per_epoch)) == 0:
