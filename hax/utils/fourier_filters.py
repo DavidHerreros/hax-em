@@ -396,9 +396,28 @@ def gaussian_envelope(shape, sigma, pad_factor=1):
 
 
 def gaussianCTFFilter(images, sigma=None, ctf=None, pad_factor=2):
-    """Gaussian splat envelope and CTF applied together, in one Fourier pass."""
+    """Gaussian splat envelope and CTF applied together, in one Fourier pass.
+
+    Accepts ``(H, W)``, ``(batch, H, W)`` or ``(batch, H, W, 1)`` and returns the rank
+    it was given: the tap-kernel blur this replaces is channel-last while ctfFilter
+    takes the bare stack, and call sites carry both. Rank 3 follows ctfFilter and is
+    read as a stack, never as a single channel-last image.
+    """
     if sigma is None and ctf is None:
         return images
+
+    ndim = images.ndim
+    if ndim == 2:
+        images = images[None, ...]
+    elif ndim == 4:
+        if images.shape[-1] != 1:
+            raise ValueError(
+                f"gaussianCTFFilter got {images.shape[-1]} channels; the CTF is per image, "
+                f"so fold the channels into the batch and repeat the CTF to match."
+            )
+        images = images[..., 0]
+    elif ndim != 3:
+        raise ValueError(f"gaussianCTFFilter expects rank 2, 3 or 4, got shape {images.shape}.")
 
     xsize = images.shape[1]
 
@@ -422,6 +441,11 @@ def gaussianCTFFilter(images, sigma=None, ctf=None, pad_factor=2):
 
     if pad_factor > 1:
         images = images[:, pad_diff:-pad_diff, pad_diff:-pad_diff]
+
+    if ndim == 2:
+        images = images[0]
+    elif ndim == 4:
+        images = images[..., None]
 
     return images
 
