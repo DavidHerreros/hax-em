@@ -481,39 +481,47 @@ class DeltaVolumeDecoder(nnx.Module):
         self.coords = coords[None, ...]
         self.reference_values = values[None, ...]
 
-        # The consensus deltas are held directly rather than decoded by an MLP.
-        #
-        # The MLP that used to sit here took no argument: it read `self.coords`, which is a
-        # plain array and not a parameter, so every layer consumed a constant and the whole
-        # stack evaluated to a constant. It was 218M parameters at 30k Gaussians -- 37% of
-        # the model -- to express 4N = 120k free numbers, and it carried no inductive bias
-        # to justify the cost: all 3N coordinates were flattened into a single vector, so
-        # unlike a coordinate network evaluated per point there was no per-point structure
-        # and no smoothness prior over the cloud.
-        #
-        # A parameter of the same shape as the output is exactly as expressive. It is not
-        # optimiser-neutral -- a deep over-parameterisation conditions Adam differently --
-        # so treat this as a change to be measured, not a pure refactor.
-        shape = (1, self.n_gaussians, 4 if learn_delta_volume else 3)
         if jnp.all(self.reference_values == 0):
-            # No reference to perturb, so the deltas have to start somewhere.
-            self.deltas = nnx.Param(0.01 * jax.random.normal(rngs.params(), shape))
+            kernel_init = nnx.initializers.glorot_uniform()
         else:
-            # Matches the old zeros-initialised readout: start on the reference volume.
-            self.deltas = nnx.Param(jnp.zeros(shape))
+            kernel_init = nnx.initializers.zeros_init()
+
+        hidden_linear = [
+            Siren2Linear(in_features=self.n_gaussians * 3, out_features=1024, rngs=rngs, dtype=jnp.bfloat16, is_first=True,
+                         w0=1.0, s=0.0, c=1.0)]
+        for _ in range(3):
+            hidden_linear.append(
+                Siren2Linear(in_features=1024, out_features=1024, rngs=rngs, dtype=jnp.bfloat16, is_first=False,
+                             custom_init=True, is_residual=False, w0=1.0, s=0.0, c=1.0))
+        if learn_delta_volume:
+            hidden_linear.append(Linear(in_features=1024, out_features=4 * self.n_gaussians, rngs=rngs, kernel_init=kernel_init))
+        else:
+            hidden_linear.append(Linear(in_features=1024, out_features=3 * self.n_gaussians, rngs=rngs, kernel_init=kernel_init))
+        self.hidden_linear = nnx.List(hidden_linear)
+
 
     def __call__(self):
+        x = self.coords.flatten()[None, ...]
+
         if self.learn_delta_volume:
-            deltas = self.deltas.get_value()
-            delta_coords, delta_values = deltas[..., :3], deltas[..., 3]
+            # Decode voxel values
+            x = self.hidden_linear[0](x)
+            for layer in self.hidden_linear[1:-1]:
+                x = layer(x)
+            x = self.hidden_linear[-1](x)
+
+              # Extract delta_coords and values
+            x = jnp.reshape(x, (x.shape[0], self.n_gaussians, 4))
+            delta_coords, delta_values = x[..., :3], x[..., 3]
 
             # Recover volume values (TODO: Check if applying ReLu is really needed)
             values = nnx.relu(self.reference_values + delta_values)
         else:
-            # Positions stay on the reference cloud. The old code reshaped the flattened
-            # *coordinates* into delta_coords here, which doubled every coordinate and put
-            # the cloud outside the box; nothing fed a gradient back, so the deltas were
-            # frozen either way and zero is what freezing was meant to mean.
+            # Extract delta_coords
+            # Positions stay on the reference cloud. This used to reshape the flattened
+            # *coordinates* into delta_coords, which doubled every coordinate and put the
+            # cloud outside the box; nothing fed a gradient back either way, so the deltas
+            # were frozen regardless and zero is what freezing was meant to mean.
             delta_coords = jnp.zeros_like(self.coords)
 
             # Recover volume values (TODO: Check if applying ReLu is really needed)
@@ -1293,15 +1301,14 @@ def main():
                         help="Fraction of the total training over which --lowpass_start is annealed away (default: 0.6). The remaining fraction trains "
                              "at full resolution. The schedule is a cosine, so it is flat at both ends: it holds wide over the early exploration phase "
                              "and stops moving before the poses settle. Ignored unless --lowpass_start is given.")
-    parser.add_argument("--volume_learning_rate", required=False, type=float, default=3e-2,
-                        help=f"Learning rate for the consensus volume deltas (default: 3e-2). This optimiser is separate from "
-                             f"--learning_rate, which drives the pose encoder. {bcolors.WARNING}NOTE{bcolors.ENDC}: the default is "
-                             f"deliberately ~300x the pose rate. The deltas used to be emitted by a 1024-wide readout, and under Adam a "
-                             f"readout of width W moves its output about W times further per step than a parameter held directly, so the "
-                             f"old MLP was acting as a large hidden multiplier on this rate. Holding the deltas directly is the same "
-                             f"function with 218M fewer parameters, but it makes that multiplier explicit and it has to be paid back here. "
-                             f"3e-2 was measured to reproduce the old loss and volume-drift trajectories at box 64/3k Gaussians and box "
-                             f"128/10k. Lower it if the map goes unstable; raising it past ~1e-1 is not something we have looked at.")
+    parser.add_argument("--volume_learning_rate", required=False, type=float, default=1e-4,
+                        help=f"Learning rate for the consensus volume deltas (default: 1e-4, the value this was hard-coded to). "
+                             f"Separate from --learning_rate, which drives the pose encoder; it selects only delta_volume_decoder. "
+                             f"{bcolors.WARNING}NOTE{bcolors.ENDC}: the deltas are in normalised units where 1.0 is half a box, and "
+                             f"under Adam the step size in parameter units is just the learning rate, so this rate means "
+                             f"{bcolors.ITALIC}lr * 0.5 * box{bcolors.ENDC} voxels of movement per step -- 0.013 vox/step at box 256, "
+                             f"but 0.003 at box 64. It is not box-independent, so a value carried over from a different box size does "
+                             f"not mean what it did there. Retune it against the box you are running.")
     ca.add_ctf_type(parser)
     ca.add_mode(parser)
     ca.add_epochs(parser)
@@ -1469,9 +1476,8 @@ def main():
         params_volume = nnx.All(nnx.Param, nnx.PathContains('delta_volume_decoder'))
         params_het = nnx.All(nnx.Param, (nnx.PathContains('encoder_het'), nnx.PathContains('delta_het_decoder')))
         optimizer_pose = nnx.Optimizer(reconsiren,  optax.chain(optax.clip_by_global_norm(1.0),optax.adamw(args.learning_rate, eps=1e-6)), wrt=params_pose)
-        # The volume rate is its own knob and its default is ~300x the pose rate on purpose: the
-        # deltas used to come out of a 1024-wide readout, which under Adam moves its output about
-        # W times further per step than a directly held parameter would. See --volume_learning_rate.
+        # Exposed rather than hard-coded so it can be retuned per box: the deltas are in units of
+        # half a box, so under Adam this rate is lr * 0.5 * box voxels per step. See the help text.
         optimizer_volume = nnx.Optimizer(reconsiren, optax.chain(optax.clip_by_global_norm(1.0),optax.adamw(learning_rate=args.volume_learning_rate, eps=1e-6)), wrt=params_volume)
         optimizer_het = nnx.Optimizer(reconsiren, optax.chain(optax.clip_by_global_norm(1.0),optax.adamw(learning_rate=1e-4, eps=1e-6)), wrt=params_het)
         graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_volume, optimizer_het))
