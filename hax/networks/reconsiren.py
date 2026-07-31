@@ -379,11 +379,14 @@ class EncoderHet(nnx.Module):
         self.input_dim = input_dim
         self.input_conv_dim = 64
         self.out_conv_dim = int(self.input_conv_dim / (2 ** 4))
+        # The stack used to open with a dense Linear(box^2, 64^2) -- a learned resampler from
+        # the full image to the working resolution. It was 268M parameters at box 256, 45% of
+        # the whole model, and 419M at box 320, which is what made the heterogeneity encoder
+        # the single largest thing on the device and made it grow with the box. It is now a
+        # jax.image.resize, which costs nothing and is exactly what EncoderPose already does
+        # at its own input.
         hidden_layers_conv = [
-            Linear(self.input_dim * self.input_dim, self.input_conv_dim * self.input_conv_dim, rngs=rngs,
-                   dtype=jnp.bfloat16)]
-        hidden_layers_conv.append(
-            Conv(1, 4, kernel_size=(5, 5), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+            Conv(1, 4, kernel_size=(5, 5), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16)]
         hidden_layers_conv.append(
             Conv(4, 8, kernel_size=(5, 5), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
         hidden_layers_conv.append(
@@ -416,13 +419,10 @@ class EncoderHet(nnx.Module):
         return logstd * jnr.normal(rngs, shape=mean.shape) + mean
 
     def __call__(self, x, *, rngs=None):
-        x = rearrange(x, 'b h w c -> b (h w c)')
+        # Resample to the working resolution (see __init__ for what this replaces).
+        x = jax.image.resize(x, (x.shape[0], self.input_conv_dim, self.input_conv_dim, 1), method="bilinear")
 
-        x = nnx.leaky_relu(self.hidden_layers_conv[0](x))  # or nnx.relu
-
-        x = rearrange(x, 'b (h w c) -> b h w c', h=self.input_conv_dim, w=self.input_conv_dim, c=1)
-
-        for layer in self.hidden_layers_conv[1:]:
+        for layer in self.hidden_layers_conv:
             if layer.in_features != layer.out_features:
                 x = nnx.leaky_relu(layer(x))  # or nnx.relu
             else:
