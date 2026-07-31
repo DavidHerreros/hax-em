@@ -1293,6 +1293,15 @@ def main():
                         help="Fraction of the total training over which --lowpass_start is annealed away (default: 0.6). The remaining fraction trains "
                              "at full resolution. The schedule is a cosine, so it is flat at both ends: it holds wide over the early exploration phase "
                              "and stops moving before the poses settle. Ignored unless --lowpass_start is given.")
+    parser.add_argument("--volume_learning_rate", required=False, type=float, default=3e-2,
+                        help=f"Learning rate for the consensus volume deltas (default: 3e-2). This optimiser is separate from "
+                             f"--learning_rate, which drives the pose encoder. {bcolors.WARNING}NOTE{bcolors.ENDC}: the default is "
+                             f"deliberately ~300x the pose rate. The deltas used to be emitted by a 1024-wide readout, and under Adam a "
+                             f"readout of width W moves its output about W times further per step than a parameter held directly, so the "
+                             f"old MLP was acting as a large hidden multiplier on this rate. Holding the deltas directly is the same "
+                             f"function with 218M fewer parameters, but it makes that multiplier explicit and it has to be paid back here. "
+                             f"3e-2 was measured to reproduce the old loss and volume-drift trajectories at box 64/3k Gaussians and box "
+                             f"128/10k. Lower it if the map goes unstable; raising it past ~1e-1 is not something we have looked at.")
     ca.add_ctf_type(parser)
     ca.add_mode(parser)
     ca.add_epochs(parser)
@@ -1460,7 +1469,10 @@ def main():
         params_volume = nnx.All(nnx.Param, nnx.PathContains('delta_volume_decoder'))
         params_het = nnx.All(nnx.Param, (nnx.PathContains('encoder_het'), nnx.PathContains('delta_het_decoder')))
         optimizer_pose = nnx.Optimizer(reconsiren,  optax.chain(optax.clip_by_global_norm(1.0),optax.adamw(args.learning_rate, eps=1e-6)), wrt=params_pose)
-        optimizer_volume = nnx.Optimizer(reconsiren, optax.chain(optax.clip_by_global_norm(1.0),optax.adamw(learning_rate=1e-4, eps=1e-6)), wrt=params_volume)
+        # The volume rate is its own knob and its default is ~300x the pose rate on purpose: the
+        # deltas used to come out of a 1024-wide readout, which under Adam moves its output about
+        # W times further per step than a directly held parameter would. See --volume_learning_rate.
+        optimizer_volume = nnx.Optimizer(reconsiren, optax.chain(optax.clip_by_global_norm(1.0),optax.adamw(learning_rate=args.volume_learning_rate, eps=1e-6)), wrt=params_volume)
         optimizer_het = nnx.Optimizer(reconsiren, optax.chain(optax.clip_by_global_norm(1.0),optax.adamw(learning_rate=1e-4, eps=1e-6)), wrt=params_het)
         graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_volume, optimizer_het))
 
