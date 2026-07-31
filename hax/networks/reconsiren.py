@@ -244,21 +244,46 @@ class PoseHead(nnx.Module):
 
 
 class PoseHeadEnsemble(nnx.Module):
+    """One shared trunk, one 6D readout per ensemble member.
+
+    Each member used to carry its own copy of the three 1024x1024 trunk layers, so the
+    ensemble cost ``num_members`` x 3.15M parameters -- 56.8M at the default 18, a tenth
+    of the whole model -- and ran ``num_members`` independent MLPs over the full batch
+    every step. The members differ in what they *predict*, not in the features they need
+    to predict it from, so the trunk is shared and only the readout is per member. That
+    is the usual multi-head arrangement and it leaves the output identical in shape and
+    in initialisation: ``rot6d_perturbation_init`` already emits ``N`` distinct rotation
+    perturbations in one call, so each member still starts on its own ~5 degree offset.
+
+    This does reduce capacity -- the members can no longer learn independent features.
+    Of the parameter reductions in this series it is the one with the least to gain and
+    the most to disturb, so it is on its own commit.
+    """
+
     def __init__(self, num_members, is_refine=False, *, rngs: nnx.Rngs):
-        key = rngs.params()
-        member_keys = jax.random.split(key, num_members)
+        self.num_members = num_members
 
-        @nnx.vmap(in_axes=(0), out_axes=0)
-        def make_member(key):
-            return PoseHead(is_refine=is_refine, rngs=nnx.Rngs(key))
+        hidden_layers = []
+        for _ in range(3):
+            hidden_layers.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+        self.hidden_layers = nnx.List(hidden_layers)
 
-        self.ensemble = make_member(member_keys)
+        if is_refine:
+            kernel = nnx.initializers.zeros_init()(rngs.params(), (num_members, 1024, 6))
+            bias = jnp.zeros((num_members, 6))
+        else:
+            kernel = nnx.initializers.normal(1e-2)(rngs.params(), (num_members, 1024, 6))
+            bias = rot6d_perturbation_init(N=num_members, sigma=5.0, mode="bias")(
+                rngs.params(), (num_members * 6,)).reshape(num_members, 6)
+        self.readout_kernel = nnx.Param(kernel)
+        self.readout_bias = nnx.Param(bias)
 
     def __call__(self, x):
-        @nnx.vmap(in_axes=(0, None), out_axes=1)
-        def forward(model, x):
-            return model(x)
-        return forward(self.ensemble, x)
+        for layer in self.hidden_layers:
+            x = nnx.gelu(layer(x))
+        # (batch, features) x (members, features, 6) -> (batch, members, 6), the layout the
+        # per-member vmap produced with out_axes=1.
+        return jnp.einsum('bf,mfo->bmo', x, self.readout_kernel.get_value()) + self.readout_bias.get_value()
 
 
 class EncoderPose(nnx.Module):
