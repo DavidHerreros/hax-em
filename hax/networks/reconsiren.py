@@ -802,16 +802,22 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
         random_indices = jax.random.choice(choice_key, jnp.arange(model.symmetry_matrices.shape[0]), shape=(rotations.shape[0],))
         rotations = jnp.matmul(jnp.transpose(model.symmetry_matrices[random_indices], (0, 2, 1))[:, None, :, :], rotations)
 
-        # Render width for this step: the mixture's own splat width, widened by the
-        # annealed band-limit. Two Gaussians compose in quadrature, and both are diagonal
-        # in Fourier space, so this is exactly "render, then low-pass" at no extra cost --
-        # and it leaves the model's sigma (the tiling floor its point count implies)
-        # untouched, which keeps the anneal a property of the *comparison* rather than of
-        # the volume.
-        sigma_render = jnp.sqrt(model.get_std() ** 2 + sigma_lp ** 2) if use_lowpass else model.get_std()
+        # Render width for the *pose* pathway: the mixture's own splat width, widened by the
+        # annealed band-limit. Two Gaussians compose in quadrature, and both are diagonal in
+        # Fourier space, so this is exactly "render, then low-pass" at no extra cost. The
+        # model's own sigma -- the tiling floor its point count implies -- never moves.
+        sigma_pose = jnp.sqrt(model.get_std() ** 2 + sigma_lp ** 2) if use_lowpass else model.get_std()
 
-        # Generate projections
-        images_corrected = model.phys_decoder(x, values, coords, model.xsize, rotations, shifts, ctf, model.ctf_type, sigma_render)
+        # Generate projections for every pose hypothesis. While the band-limit is active the
+        # volume is held out of this render, because a blurred target is the wrong objective
+        # for a point cloud: the cheapest way for narrow Gaussians to match a wide blob is to
+        # spread out, and once the band-limit lifts the position gradient only reaches about
+        # a splat width, so points that diffused cannot come back. The band-limit widens the
+        # basin the *poses* are searched in; the volume is fitted by its own full-resolution
+        # term below and never sees a blurred target at all.
+        images_corrected = model.phys_decoder(x, jax.lax.stop_gradient(values) if use_lowpass else values,
+                                              jax.lax.stop_gradient(coords) if use_lowpass else coords,
+                                              model.xsize, rotations, shifts, ctf, model.ctf_type, sigma_pose)
 
         # Losses
         images_corrected_loss = images_corrected[..., 0] if images_corrected.shape[-1] == 1 else images_corrected
@@ -837,10 +843,12 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
             images_corrected_loss = ctfFilter(images_corrected_loss, ctf_broadcasted, pad_factor=2)
             images_corrected_loss = rearrange(images_corrected_loss, "(b n) w h -> b n w h")
 
-        # Band-limit the targets by the same envelope the renders carry. Attenuating only
-        # the renders would leave the data's high frequencies -- which the mixture cannot
-        # produce at any sigma -- in the MSE as a term that is identical across the pose
-        # hypotheses, so it adds variance to the argmin without telling it anything.
+        # Band-limit the pose target by the same envelope its renders carry. Attenuating
+        # only the renders would leave the data's high frequencies -- which the mixture
+        # cannot produce at any sigma -- in the MSE as a term that is identical across the
+        # pose hypotheses, so it adds variance to the argmin without telling it anything.
+        # Only this target is band-limited: the volume and heterogeneity terms below are
+        # deliberately left at full resolution.
         #
         # standard_normalization works off per-image statistics, so normalising the
         # (B, H, W) stack and then broadcasting is identical to broadcasting and then
@@ -848,9 +856,6 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
         x_pose_target = standard_normalization(x_loss_nb)
         if use_lowpass:
             x_pose_target = gaussianCTFFilter(x_pose_target, sigma=sigma_lp, ctf=None)
-            x_het_target = gaussianCTFFilter(x_loss_nb, sigma=sigma_lp, ctf=None)
-        else:
-            x_het_target = x_loss_nb
 
         # Broadcast input images to right size
         x_loss = jnp.broadcast_to(x_pose_target[:, None, ...], (x_pose_target.shape[0], images_corrected.shape[1], x_pose_target.shape[1], x_pose_target.shape[2]))
@@ -872,13 +877,35 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
         else:
             min_indices = jnp.argmin(recon_loss, axis=1)
 
+        # Volume: refit at full resolution against the pose the band-limited search just
+        # picked. Only the selected hypothesis is re-rendered, so this costs one image per
+        # particle against the num_components the pose pathway already paid for. The poses
+        # are held fixed here for the same reason the volume was held fixed above -- each
+        # term drives one parameter group, at the resolution that group needs.
+        rotations_sel = rotations[jnp.arange(images_corrected.shape[0]), min_indices, :][:, None, ...]
+        shifts_sel = shifts[jnp.arange(images_corrected.shape[0]), min_indices, :][:, None, ...]
+        if use_lowpass:
+            images_vol = model.phys_decoder(x, values, coords, model.xsize, jax.lax.stop_gradient(rotations_sel),
+                                            jax.lax.stop_gradient(shifts_sel), ctf, model.ctf_type, model.get_std())[:, 0, ...]
+            images_vol_loss = images_vol[..., 0] if images_vol.shape[-1] == 1 else images_vol
+            if model.ctf_type == "wiener":
+                images_vol_loss = wiener2DFilter(images_vol_loss, ctf, pad_factor=2)
+            elif model.ctf_type == "squared":
+                images_vol_loss = ctfFilter(images_vol_loss, ctf, pad_factor=2)
+            recon_vol_loss = dm_pix.mse(images_vol_loss[..., None],
+                                        standard_normalization(x_loss_nb)[..., None]).mean()
+        else:
+            # Nothing to decouple without a band-limit: the selected hypothesis of the render
+            # above already *is* the full-resolution one, so reuse it rather than pay again.
+            recon_vol_loss = None
+
         # Heterogeneity
         min_indices_het = jnp.argmin(recon_loss, axis=1)
         rotations_het = rotations[jnp.arange(images_corrected.shape[0]), min_indices_het, :][:, None, ...]
         shifts_het = shifts[jnp.arange(images_corrected.shape[0]), min_indices_het, :][:, None, ...]
         # TODO: Test stop gradient in rotations_het and shifts_het
         images_het = model.phys_decoder(x, values_het, coords_het, model.xsize, jax.lax.stop_gradient(rotations_het),
-                                        jax.lax.stop_gradient(shifts_het), ctf, model.ctf_type, sigma_render)[:, 0, ...]
+                                        jax.lax.stop_gradient(shifts_het), ctf, model.ctf_type, model.get_std())[:, 0, ...]
         images_het_loss = images_het[..., 0] if images_het.shape[-1] == 1 else images_het
         if model.ctf_type == "wiener":
             images_het_loss = wiener2DFilter(images_het_loss, ctf, pad_factor=2)
@@ -890,11 +917,19 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
         # x_loss_nb = bandpass_filter(x_loss_nb, pixel_size_A=model.sr, highpass_A=50.)
         # images_het_loss = bandpass_filter(images_het_loss, pixel_size_A=model.sr, highpass_A=50.)
 
-        recon_het_loss = dm_pix.mse(images_het_loss[..., None], x_het_target[..., None]).mean()
+        recon_het_loss = dm_pix.mse(images_het_loss[..., None], x_loss_nb[..., None]).mean()
 
         # Index losses and rotations based on extracted indices
-        recon_loss = recon_loss[jnp.arange(images_corrected.shape[0]), min_indices].mean()
-        recon_loss_all = 0.5 * (recon_loss + recon_het_loss)
+        recon_pose_loss = recon_loss[jnp.arange(images_corrected.shape[0]), min_indices].mean()
+        if use_lowpass:
+            # Three terms for three parameter groups. The stop_gradients above mean each one
+            # only reaches the group it is meant for, so they can each keep the weight the
+            # single shared term used to carry.
+            recon_loss_all = 0.5 * (recon_pose_loss + recon_vol_loss + recon_het_loss)
+        else:
+            # Undecoupled: one term drives both the poses and the volume, as before.
+            recon_vol_loss = recon_pose_loss
+            recon_loss_all = 0.5 * (recon_pose_loss + recon_het_loss)
         
         # Viewing directions from rotations
         rotations = rearrange(rotations, "b n w h -> (b n) w h")
@@ -914,7 +949,10 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
         loss_uniform = lambda_uniform * loss_swd + 0.0 * loss_repulsion
 
         loss = (recon_loss_all + 1.0 * loss_uniform)
-        return loss, (recon_loss, loss_uniform, directions)
+        # Report the full-resolution term: the pose term's value moves with the band-limit,
+        # so it is not comparable across the anneal or against a run without one. With the
+        # band-limit off the two are the same number.
+        return loss, (recon_vol_loss, loss_uniform, directions)
 
     # Optimizer parameters
     params_pose = nnx.All(nnx.Param, nnx.PathContains('encoder_pose'))
