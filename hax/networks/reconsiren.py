@@ -456,44 +456,40 @@ class DeltaVolumeDecoder(nnx.Module):
         self.coords = coords[None, ...]
         self.reference_values = values[None, ...]
 
+        # The consensus deltas are held directly rather than decoded by an MLP.
+        #
+        # The MLP that used to sit here took no argument: it read `self.coords`, which is a
+        # plain array and not a parameter, so every layer consumed a constant and the whole
+        # stack evaluated to a constant. It was 218M parameters at 30k Gaussians -- 37% of
+        # the model -- to express 4N = 120k free numbers, and it carried no inductive bias
+        # to justify the cost: all 3N coordinates were flattened into a single vector, so
+        # unlike a coordinate network evaluated per point there was no per-point structure
+        # and no smoothness prior over the cloud.
+        #
+        # A parameter of the same shape as the output is exactly as expressive. It is not
+        # optimiser-neutral -- a deep over-parameterisation conditions Adam differently --
+        # so treat this as a change to be measured, not a pure refactor.
+        shape = (1, self.n_gaussians, 4 if learn_delta_volume else 3)
         if jnp.all(self.reference_values == 0):
-            kernel_init = nnx.initializers.glorot_uniform()
+            # No reference to perturb, so the deltas have to start somewhere.
+            self.deltas = nnx.Param(0.01 * jax.random.normal(rngs.params(), shape))
         else:
-            kernel_init = nnx.initializers.zeros_init()
-
-        hidden_linear = [
-            Siren2Linear(in_features=self.n_gaussians * 3, out_features=1024, rngs=rngs, dtype=jnp.bfloat16, is_first=True,
-                         w0=1.0, s=0.0, c=1.0)]
-        for _ in range(3):
-            hidden_linear.append(
-                Siren2Linear(in_features=1024, out_features=1024, rngs=rngs, dtype=jnp.bfloat16, is_first=False,
-                             custom_init=True, is_residual=False, w0=1.0, s=0.0, c=1.0))
-        if learn_delta_volume:
-            hidden_linear.append(Linear(in_features=1024, out_features=4 * self.n_gaussians, rngs=rngs, kernel_init=kernel_init))
-        else:
-            hidden_linear.append(Linear(in_features=1024, out_features=3 * self.n_gaussians, rngs=rngs, kernel_init=kernel_init))
-        self.hidden_linear = nnx.List(hidden_linear)
-
+            # Matches the old zeros-initialised readout: start on the reference volume.
+            self.deltas = nnx.Param(jnp.zeros(shape))
 
     def __call__(self):
-        x = self.coords.flatten()[None, ...]
-
         if self.learn_delta_volume:
-            # Decode voxel values
-            x = self.hidden_linear[0](x)
-            for layer in self.hidden_linear[1:-1]:
-                x = layer(x)
-            x = self.hidden_linear[-1](x)
-
-              # Extract delta_coords and values
-            x = jnp.reshape(x, (x.shape[0], self.n_gaussians, 4))
-            delta_coords, delta_values = x[..., :3], x[..., 3]
+            deltas = self.deltas.get_value()
+            delta_coords, delta_values = deltas[..., :3], deltas[..., 3]
 
             # Recover volume values (TODO: Check if applying ReLu is really needed)
             values = nnx.relu(self.reference_values + delta_values)
         else:
-            # Extract delta_coords
-            delta_coords = jnp.reshape(x, (x.shape[0], self.n_gaussians, 3))
+            # Positions stay on the reference cloud. The old code reshaped the flattened
+            # *coordinates* into delta_coords here, which doubled every coordinate and put
+            # the cloud outside the box; nothing fed a gradient back, so the deltas were
+            # frozen either way and zero is what freezing was meant to mean.
+            delta_coords = jnp.zeros_like(self.coords)
 
             # Recover volume values (TODO: Check if applying ReLu is really needed)
             values = nnx.relu(self.reference_values)
