@@ -651,17 +651,21 @@ class PhysDecoder:
         bposi = bposf.astype(jnp.int32)
         bposf = c_sampling - bposf
 
-        bamp0 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1])
-        bamp1 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1])
-        bamp2 = values * (bposf[:, :, 0]) * (bposf[:, :, 1])
-        bamp3 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1])
-        bamp = jnp.concat([bamp0, bamp1, bamp2, bamp3], axis=1)
-        bposi = jnp.concat([bposi, bposi + jnp.array((1, 0)), bposi + jnp.array((1, 1)), bposi + jnp.array((0, 1))], axis=1)
+        # Accumulate the four bilinear corners one at a time rather than concatenating them
+        # first: the concatenated form materialises the amplitudes at 4x and the indices at
+        # 8x the point count in one go, which at 30k Gaussians and a full hypothesis sweep
+        # is the largest buffer in the render.
+        fx, fy = bposf[:, :, 0], bposf[:, :, 1]
 
         def scatter_img(image, bpos_i, bamp_i):
             return image.at[bpos_i[..., 0], bpos_i[..., 1]].add(bamp_i)
 
-        images = jax.vmap(scatter_img)(images, bposi, bamp)
+        scatter = jax.vmap(scatter_img)
+        for offset, weight in (((0, 0), (1.0 - fx) * (1.0 - fy)),
+                               ((1, 0), fx * (1.0 - fy)),
+                               ((1, 1), fx * fy),
+                               ((0, 1), (1.0 - fx) * fy)):
+            images = scatter(images, bposi + jnp.array(offset), values * weight)
 
         # Splat envelope and CTF, in one Fourier pass. The envelope has to be the exact
         # exp(-2 pi^2 sigma^2 k^2) rather than a 9-tap kernel: the annealed width starts
@@ -810,8 +814,18 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
         # the volume.
         sigma_render = jnp.sqrt(model.get_std() ** 2 + sigma_lp ** 2) if use_lowpass else model.get_std()
 
-        # Generate projections
-        images_corrected = model.phys_decoder(x, values, coords, model.xsize, rotations, shifts, ctf, model.ctf_type, sigma_render)
+        # Selection pass. The loss below gathers exactly one hypothesis per particle, so
+        # the other num_components - 1 renders receive no cotangent -- their forward
+        # residuals are kept alive through the backward pass for nothing. Cutting every
+        # differentiable input here puts the whole sweep in the primal-only part of the
+        # trace, so nothing is retained, and the winner is re-rendered with gradients
+        # below. Same arithmetic, one render's worth of activations instead of
+        # num_components. (The selection itself is never differentiable: argmin has no
+        # gradient, and jax.random.categorical does not propagate one through its logits.)
+        images_corrected = model.phys_decoder(x, jax.lax.stop_gradient(values), jax.lax.stop_gradient(coords),
+                                              model.xsize, jax.lax.stop_gradient(rotations),
+                                              jax.lax.stop_gradient(shifts), ctf, model.ctf_type,
+                                              jax.lax.stop_gradient(sigma_render))
 
         # Losses
         images_corrected_loss = images_corrected[..., 0] if images_corrected.shape[-1] == 1 else images_corrected
@@ -892,26 +906,38 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
 
         recon_het_loss = dm_pix.mse(images_het_loss[..., None], x_het_target[..., None]).mean()
 
-        # Index losses and rotations based on extracted indices
-        recon_loss = recon_loss[jnp.arange(images_corrected.shape[0]), min_indices].mean()
+        # Gradient pass: re-render only the hypothesis the selection just picked. Gathering
+        # the winner keeps the path back to the pose encoder, so this carries exactly the
+        # gradient the indexed loss used to carry -- and it is numerically the same number,
+        # since the selection pass rendered these very poses.
+        rotations_sel = rotations[jnp.arange(images_corrected.shape[0]), min_indices, :][:, None, ...]
+        shifts_sel = shifts[jnp.arange(images_corrected.shape[0]), min_indices, :][:, None, ...]
+        images_sel = model.phys_decoder(x, values, coords, model.xsize, rotations_sel, shifts_sel,
+                                        ctf, model.ctf_type, sigma_render)[:, 0, ...]
+        images_sel_loss = images_sel[..., 0] if images_sel.shape[-1] == 1 else images_sel
+        if model.ctf_type == "wiener":
+            images_sel_loss = wiener2DFilter(images_sel_loss, ctf, pad_factor=2)
+        elif model.ctf_type == "squared":
+            images_sel_loss = ctfFilter(images_sel_loss, ctf, pad_factor=2)
+
+        recon_loss = dm_pix.mse(images_sel_loss[..., None], x_pose_target[..., None]).mean()
         recon_loss_all = 0.5 * (recon_loss + recon_het_loss)
         
         # Viewing directions from rotations
         rotations = rearrange(rotations, "b n w h -> (b n) w h")
         directions = rotations[:, :, 2]
 
-        # L1 based denoising
-        l1_loss = jnp.mean(jnp.abs(values)) + jnp.mean(jnp.abs(values_het))
-
-        # KL loss VAE
-        kl_loss = -0.5 * jnp.sum(1. + 2. * logstd - jnp.square(jnp.exp(logstd)) - jnp.square(latent))
+        # An L1 term on the amplitudes and a VAE KL term used to be computed here and never
+        # reached `loss`; :func:`repulsion_loss` was computed and multiplied by 0.0. None of
+        # them were free -- `0.0 * x` is not eliminated (0 * NaN is NaN), and the repulsion
+        # term materialises a (batch * num_components)^2 x 3 pairwise tensor. Reinstate them
+        # by adding them to `loss`, not by computing them and discarding the result.
 
         # Decoupling (TODO: In the future this will be for missing angles like TF implementation)
 
         # Uniform angular distribution loss
         loss_swd = sliced_wasserstein_sphere(directions, rng=key, n_projections=64)
-        loss_repulsion = repulsion_loss(directions, s=2.)
-        loss_uniform = lambda_uniform * loss_swd + 0.0 * loss_repulsion
+        loss_uniform = lambda_uniform * loss_swd
 
         loss = (recon_loss_all + 1.0 * loss_uniform)
         return loss, (recon_loss, loss_uniform, directions)
