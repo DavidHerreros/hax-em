@@ -57,7 +57,9 @@ def eval_ctf(s, a, def1, def2, angast=0., phase=0., kv=300., ac=0.1, cs=2.0, bf=
 def computeCTF(defocusU, defocusV, defocusAngle, cs, kv, sr, img_shape, batch_size, applyCTF):
     if applyCTF:
         s, a = ctf_freqs([img_shape[0], img_shape[0]], 1 / sr)
-        s, a = jnp.tile(s[None, :, :], [batch_size, 1, 1]), jnp.tile(a[None, :, :], [batch_size, 1, 1])
+        # ``eval_ctf`` introduces the particle axis through defocus/angle.  Keep
+        # the invariant frequency grids two-dimensional and let broadcasting do
+        # the work instead of materialising two batch-sized copies every step.
         ctf = eval_ctf(s, a, defocusU, defocusV, angast=defocusAngle, cs=cs, kv=kv)
         ctf = jnp.fft.fftshift(ctf[:, :, :img_shape[1]])
         return ctf

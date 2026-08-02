@@ -11,6 +11,8 @@ networks.  Coverage:
 * ``--mode``                   : train, predict
 * ``--vol`` / ``--mask``       : reference-volume start (Gaussian fitting path)
 * ``--num_gaussians``          : size of the Gaussian point cloud
+* optimized/legacy profiles    : independent low-rank heads, direct consensus,
+                                  candidate and Gaussian render chunking
 * ``--do_not_learn_volume``    : pose/shift-only refinement against a reference
 * ``--refine_current_assignment`` / ``--symmetry_group``
 * ``--load_images_to_ram`` (on) and the memory-mapped path (off) + ``--ssd_scratch_folder``
@@ -106,7 +108,9 @@ def scenarios(workdir, data):
         return os.path.join(out(name), "ReconSIREN")
 
     base = ["--sr", str(SR), "--epochs", str(EPOCHS),
-            "--num_gaussians", str(NUM_GAUSS), "--load_images_to_ram"]
+            "--num_gaussians", str(NUM_GAUSS), "--load_images_to_ram",
+            "--optimization_profile", "aggressive",
+            "--render_chunk_size", "128", "--candidate_chunk_size", "3"]
 
     scn = []
 
@@ -146,6 +150,7 @@ def scenarios(workdir, data):
               "--batch_size", "4", "--learning_rate", "5e-5",
               "--dataset_split_fraction", "0.7,0.3",
               "--num_gaussians", str(NUM_GAUSS),
+              "--optimization_profile", "legacy",
               "--ssd_scratch_folder", out("train_apply_mmap_scratch"),
               "--sr", str(SR), "--epochs", str(EPOCHS),
               "--output_path", out("train_apply_mmap")],

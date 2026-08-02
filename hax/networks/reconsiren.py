@@ -178,8 +178,29 @@ def repulsion_loss(
     return jnp.mean(energy)
 
 
+class LowRankLinear(nnx.Module):
+    """Independent low-rank replacement for a square dense layer.
+
+    Every pose-hypothesis member owns both factors; no weights are shared between
+    hypotheses.  ``rank=0`` keeps the legacy dense layer for old checkpoints.
+    """
+
+    def __init__(self, features, rank=0, *, rngs: nnx.Rngs, dtype=jnp.bfloat16):
+        self.rank = int(rank or 0)
+        if self.rank > 0:
+            self.down = Linear(features, self.rank, rngs=rngs, dtype=dtype, use_bias=False)
+            self.up = Linear(self.rank, features, rngs=rngs, dtype=dtype)
+        else:
+            self.dense = Linear(features, features, rngs=rngs, dtype=dtype)
+
+    def __call__(self, x):
+        if self.rank > 0:
+            return self.up(self.down(x))
+        return self.dense(x)
+
+
 class PoseHead(nnx.Module):
-    def __init__(self, is_refine=False, *, rngs: nnx.Rngs):
+    def __init__(self, is_refine=False, low_rank=0, *, rngs: nnx.Rngs):
         if is_refine:
             kernel_init = nnx.initializers.zeros_init()
             bias_init = nnx.initializers.zeros_init()
@@ -195,7 +216,11 @@ class PoseHead(nnx.Module):
 
         hidden_layers = []
         for _ in range(3):
-            hidden_layers.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+            if low_rank > 0:
+                hidden_layers.append(LowRankLinear(1024, rank=low_rank, rngs=rngs, dtype=jnp.bfloat16))
+            else:
+                # Keep the exact legacy state-tree path for old checkpoints.
+                hidden_layers.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         self.hidden_layers = nnx.List(hidden_layers)
         self.pose_layer = Linear(1024, 6, rngs=rngs, kernel_init=kernel_init, bias_init=bias_init)
 
@@ -207,13 +232,13 @@ class PoseHead(nnx.Module):
 
 
 class PoseHeadEnsemble(nnx.Module):
-    def __init__(self, num_members, is_refine=False, *, rngs: nnx.Rngs):
+    def __init__(self, num_members, is_refine=False, low_rank=0, *, rngs: nnx.Rngs):
         key = rngs.params()
         member_keys = jax.random.split(key, num_members)
 
         @nnx.vmap(in_axes=(0), out_axes=0)
         def make_member(key):
-            return PoseHead(is_refine=is_refine, rngs=nnx.Rngs(key))
+            return PoseHead(is_refine=is_refine, low_rank=low_rank, rngs=nnx.Rngs(key))
 
         self.ensemble = make_member(member_keys)
 
@@ -226,7 +251,7 @@ class PoseHeadEnsemble(nnx.Module):
 
 class EncoderPose(nnx.Module):
     def __init__(self, input_dim, pyramid_levels=4, num_components=18, refine_current_assignment=False,
-                 use_anchor_rotations=True, *, rngs: nnx.Rngs):
+                 use_anchor_rotations=True, low_rank=0, spatial_pool=1, *, rngs: nnx.Rngs):
         self.input_dim = input_dim
         self.input_conv_dim = 64  # Original was 64
         self.out_conv_dim = int(self.input_conv_dim / (2 ** 3))
@@ -234,6 +259,7 @@ class EncoderPose(nnx.Module):
         self.num_components = num_components
         self.refine_current_assignment = refine_current_assignment
         self.use_anchor_rotations = use_anchor_rotations
+        self.spatial_pool = max(1, int(spatial_pool))
 
         # Hidden layers
         hidden_layers_conv = [Conv(self.pyramid_levels, 64, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16)]
@@ -251,7 +277,8 @@ class EncoderPose(nnx.Module):
         hidden_layers_conv.append(Conv(512, 512, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
         self.hidden_layers_conv = nnx.List(hidden_layers_conv)
 
-        hidden_layers_linear = [Linear(self.out_conv_dim * self.out_conv_dim * 512, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        linear_spatial = max(1, self.out_conv_dim // self.spatial_pool)
+        hidden_layers_linear = [Linear(linear_spatial * linear_spatial * 512, 1024, rngs=rngs, dtype=jnp.bfloat16)]
         hidden_layers_linear.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         hidden_layers_linear.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         # self.hidden_layers_linear.append(Linear(1024, 8, rngs=rngs))
@@ -261,7 +288,8 @@ class EncoderPose(nnx.Module):
         self.anchor_rotations = jnp.array(generate_spherical_rotations(num_components))
 
         # Layers to 9D rotation
-        self.ensemble_6d_heads = PoseHeadEnsemble(num_members=num_components, is_refine=False, rngs=rngs)
+        self.ensemble_6d_heads = PoseHeadEnsemble(num_members=num_components, is_refine=False,
+                                                 low_rank=low_rank, rngs=rngs)
 
         # Layers to shifts
         hidden_shifts = [Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
@@ -297,6 +325,10 @@ class EncoderPose(nnx.Module):
                 x = nnx.gelu(x + layer(x))
             else:
                 x = nnx.gelu(layer(x))
+
+        if self.spatial_pool > 1:
+            x = nnx.avg_pool(x, window_shape=(self.spatial_pool, self.spatial_pool),
+                             strides=(self.spatial_pool, self.spatial_pool), padding="VALID")
 
         # Linear hidden layers
         x = rearrange(x, 'b h w c -> b (h w c)')
@@ -338,13 +370,35 @@ class EncoderPose(nnx.Module):
 
 
 class EncoderHet(nnx.Module):
-    def __init__(self, input_dim, lat_dim=8, *, rngs: nnx.Rngs):
+    def __init__(self, input_dim, lat_dim=8, architecture="legacy", *, rngs: nnx.Rngs):
         self.input_dim = input_dim
         self.input_conv_dim = 64
         self.out_conv_dim = int(self.input_conv_dim / (2 ** 4))
-        hidden_layers_conv = [
-            Linear(self.input_dim * self.input_dim, self.input_conv_dim * self.input_conv_dim, rngs=rngs,
-                   dtype=jnp.bfloat16)]
+        self.architecture = architecture
+
+        if architecture == "convstem":
+            # Bring arbitrary box sizes to the legacy 64x64 grid without the
+            # O(box^2 * 4096) flattened projection.  The final resize handles
+            # non-powers of two and boxes below 64.
+            n_stem = max(0, int(np.floor(np.log2(max(self.input_dim, 1) / self.input_conv_dim))))
+            stem = []
+            channels = 1
+            for i in range(n_stem):
+                out_channels = min(16, 4 * (2 ** i))
+                stem.append(Conv(channels, out_channels, kernel_size=(5, 5), strides=(2, 2),
+                                 padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+                channels = out_channels
+            stem.append(Conv(channels, 1, kernel_size=(1, 1), strides=(1, 1),
+                             padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+            self.stem = nnx.List(stem)
+            hidden_layers_conv = []
+        elif architecture == "legacy":
+            hidden_layers_conv = [
+                Linear(self.input_dim * self.input_dim, self.input_conv_dim * self.input_conv_dim, rngs=rngs,
+                       dtype=jnp.bfloat16)]
+        else:
+            raise ValueError(f"Unknown ReconSIREN heterogeneity encoder architecture: {architecture}")
+
         hidden_layers_conv.append(
             Conv(1, 4, kernel_size=(5, 5), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
         hidden_layers_conv.append(
@@ -379,13 +433,21 @@ class EncoderHet(nnx.Module):
         return logstd * jnr.normal(rngs, shape=mean.shape) + mean
 
     def __call__(self, x, *, rngs=None):
-        x = rearrange(x, 'b h w c -> b (h w c)')
+        if self.architecture == "legacy":
+            x = rearrange(x, 'b h w c -> b (h w c)')
+            x = nnx.leaky_relu(self.hidden_layers_conv[0](x))
+            x = rearrange(x, 'b (h w c) -> b h w c', h=self.input_conv_dim,
+                          w=self.input_conv_dim, c=1)
+            conv_layers = self.hidden_layers_conv[1:]
+        else:
+            for layer in self.stem:
+                x = nnx.leaky_relu(layer(x))
+            if x.shape[1] != self.input_conv_dim or x.shape[2] != self.input_conv_dim:
+                x = jax.image.resize(
+                    x, (x.shape[0], self.input_conv_dim, self.input_conv_dim, 1), method="bilinear")
+            conv_layers = self.hidden_layers_conv
 
-        x = nnx.leaky_relu(self.hidden_layers_conv[0](x))  # or nnx.relu
-
-        x = rearrange(x, 'b (h w c) -> b h w c', h=self.input_conv_dim, w=self.input_conv_dim, c=1)
-
-        for layer in self.hidden_layers_conv[1:]:
+        for layer in conv_layers:
             if layer.in_features != layer.out_features:
                 x = nnx.leaky_relu(layer(x))  # or nnx.relu
             else:
@@ -411,13 +473,23 @@ class EncoderHet(nnx.Module):
 
 
 class DeltaVolumeDecoder(nnx.Module):
-    def __init__(self, coords, values, volume_size, learn_delta_volume=True, *, rngs: nnx.Rngs):
+    def __init__(self, coords, values, volume_size, learn_delta_volume=True,
+                 parameterization="network", *, rngs: nnx.Rngs):
         self.volume_size = volume_size
         self.learn_delta_volume = learn_delta_volume
+        self.parameterization = parameterization
         self.n_gaussians = coords.shape[0]
         self.factor = 0.5 * volume_size
         self.coords = coords[None, ...]
         self.reference_values = values[None, ...]
+
+        if parameterization == "direct":
+            variable_type = nnx.Param if learn_delta_volume else nnx.Variable
+            self.delta_coords = variable_type(jnp.zeros_like(coords))
+            self.delta_values = variable_type(jnp.zeros_like(values))
+            return
+        if parameterization != "network":
+            raise ValueError(f"Unknown consensus parameterization: {parameterization}")
 
         if jnp.all(self.reference_values == 0):
             kernel_init = nnx.initializers.glorot_uniform()
@@ -439,6 +511,17 @@ class DeltaVolumeDecoder(nnx.Module):
 
 
     def __call__(self):
+        if self.parameterization == "direct":
+            if self.learn_delta_volume:
+                delta_coords = self.delta_coords.get_value()[None, ...]
+                delta_values = self.delta_values.get_value()[None, ...]
+            else:
+                delta_coords = jnp.zeros_like(self.coords)
+                delta_values = jnp.zeros_like(self.reference_values)
+            values = nnx.relu(self.reference_values + delta_values)
+            coords = self.factor * (self.coords + delta_coords)
+            return coords, values
+
         x = self.coords.flatten()[None, ...]
 
         if self.learn_delta_volume:
@@ -588,16 +671,13 @@ class HetVolumeDecoder(nnx.Module):
         return grids
 
 class PhysDecoder:
-    def __init__(self, xsize):
+    def __init__(self, xsize, render_chunk_size=0):
         self.xsize = xsize
+        self.render_chunk_size = int(render_chunk_size or 0)
 
-    def __call__(self, x, values, coords, xsize, rotations, shifts, ctf, ctf_type, std, filter=True):
+    def _scatter(self, values, coords, xsize, rotations_flat, shifts_flat, dtype):
         # Volume factor
         factor = 0.5 * xsize
-
-        # Flatten rotations and shifts
-        rotations_flat = rearrange(rotations, "b n m d -> (b n) m d")
-        shifts_flat = rearrange(shifts, "b n m -> (b n) m")
 
         # Apply rotation matrices
         coords = jnp.matmul(coords, rearrange(rotations_flat, "b r c -> b c r"))
@@ -608,7 +688,7 @@ class PhysDecoder:
         # Scatter image
         B = rotations_flat.shape[0]
         c_sampling = jnp.stack([coords[..., 1], coords[..., 0]], axis=2)
-        images = jnp.zeros((B, xsize, xsize), dtype=x.dtype)
+        images = jnp.zeros((B, xsize, xsize), dtype=dtype)
 
         bposf = jnp.floor(c_sampling)
         bposi = bposf.astype(jnp.int32)
@@ -624,11 +704,50 @@ class PhysDecoder:
         def scatter_img(image, bpos_i, bamp_i):
             return image.at[bpos_i[..., 0], bpos_i[..., 1]].add(bamp_i)
 
-        images = jax.vmap(scatter_img)(images, bposi, bamp)
+        return jax.vmap(scatter_img)(images, bposi, bamp)
+
+    def _scatter_chunked(self, values, coords, xsize, rotations_flat, shifts_flat, dtype):
+        """Accumulate Gaussian projections in bounded-memory point blocks."""
+        block = self.render_chunk_size
+        n_points = coords.shape[1]
+        n_blocks, tail = divmod(n_points, block)
+        images = jnp.zeros((rotations_flat.shape[0], xsize, xsize), dtype=dtype)
+
+        def render_block(values_b, coords_b):
+            return self._scatter(values_b, coords_b, xsize, rotations_flat, shifts_flat, dtype)
+
+        if n_blocks:
+            def indexed_block(i):
+                start = i * block
+                values_b = jax.lax.dynamic_slice_in_dim(values, start, block, axis=1)
+                coords_b = jax.lax.dynamic_slice_in_dim(coords, start, block, axis=1)
+                return render_block(values_b, coords_b)
+
+            indexed_block = jax.checkpoint(indexed_block)
+            images, _ = jax.lax.scan(
+                lambda acc, i: (acc + indexed_block(i), None), images, jnp.arange(n_blocks))
+
+        if tail:
+            start = n_blocks * block
+            images = images + jax.checkpoint(render_block)(values[:, start:], coords[:, start:])
+        return images
+
+    def __call__(self, x, values, coords, xsize, rotations, shifts, ctf, ctf_type, std,
+                 filter=True, render_size=None):
+        render_size = xsize if render_size is None else int(render_size)
+        scale = render_size / xsize
+
+        rotations_flat = rearrange(rotations, "b n m d -> (b n) m d")
+        shifts_flat = rearrange(shifts, "b n m -> (b n) m") * scale
+        coords = coords * scale
+
+        blocked = 0 < self.render_chunk_size < coords.shape[1]
+        scatter = self._scatter_chunked if blocked else self._scatter
+        images = scatter(values, coords, render_size, rotations_flat, shifts_flat, x.dtype)
 
         # Gaussian filter (needed by forward interpolation)
         if filter:
-            images = dm_pix.gaussian_blur(images[..., None], std, kernel_size=9)[..., 0]
+            images = dm_pix.gaussian_blur(images[..., None], std * scale, kernel_size=9)[..., 0]
 
         # Apply CTF
         if ctf_type in ["apply", "wiener", "squared"]:
@@ -645,20 +764,48 @@ class ReconSIREN(nnx.Module):
     @save_config
     def __init__(self, coords, values, xsize, sr, bank_size=1024, ctf_type="apply", lat_dim=8, sigma=1.0,
                  symmetry_group="c1", refine_current_assignment=False, learn_delta_volume=True, num_components=18,
-                 use_anchor_rotations=True, *, rngs: nnx.Rngs):
+                 use_anchor_rotations=True, optimization_profile="legacy", pose_head_rank=None,
+                 pose_spatial_pool=None, het_encoder_architecture=None,
+                 consensus_parameterization=None, render_chunk_size=None,
+                 candidate_chunk_size=None, coarse_topk=None, coarse_scale=None, coarse_gaussians=None,
+                 *, rngs: nnx.Rngs):
         super(ReconSIREN, self).__init__()
+        aggressive = optimization_profile == "aggressive"
+        if optimization_profile not in ("legacy", "aggressive"):
+            raise ValueError("optimization_profile must be 'legacy' or 'aggressive'")
+        pose_head_rank = (128 if aggressive else 0) if pose_head_rank is None else int(pose_head_rank)
+        pose_spatial_pool = (4 if aggressive else 1) if pose_spatial_pool is None else int(pose_spatial_pool)
+        het_encoder_architecture = ("convstem" if aggressive else "legacy") if het_encoder_architecture is None else het_encoder_architecture
+        consensus_parameterization = ("direct" if aggressive else "network") if consensus_parameterization is None else consensus_parameterization
+        render_chunk_size = (2048 if aggressive else 0) if render_chunk_size is None else int(render_chunk_size)
+        candidate_chunk_size = (3 if aggressive else 0) if candidate_chunk_size is None else int(candidate_chunk_size)
+        coarse_topk = (4 if aggressive else num_components) if coarse_topk is None else int(coarse_topk)
+        coarse_scale = (0.5 if aggressive else 1.0) if coarse_scale is None else float(coarse_scale)
+        coarse_gaussians = (2048 if aggressive else 0) if coarse_gaussians is None else int(coarse_gaussians)
+
         self.xsize = xsize
         self.ctf_type = ctf_type
         self.sr = sr
+        self.optimization_profile = optimization_profile
+        if coarse_scale <= 0.0 or coarse_scale > 1.0:
+            raise ValueError("coarse_scale must be in (0, 1]")
+        self.coarse_topk = max(1, min(int(coarse_topk), int(num_components)))
+        self.coarse_scale = float(coarse_scale)
+        self.coarse_gaussians = max(0, int(coarse_gaussians))
+        self.candidate_chunk_size = max(0, int(candidate_chunk_size))
         self.symmetry_matrices = symmetry_matrices(symmetry_group)
         self.refine_current_assignment = refine_current_assignment
         self.learn_delta_volume = learn_delta_volume
         self.encoder_pose = EncoderPose(self.xsize, num_components=num_components, refine_current_assignment=refine_current_assignment,
-                                        use_anchor_rotations=use_anchor_rotations, rngs=rngs)
-        self.encoder_het = EncoderHet(self.xsize, lat_dim=lat_dim, rngs=rngs)
-        self.delta_volume_decoder = DeltaVolumeDecoder(coords=coords, values=values, volume_size=self.xsize, learn_delta_volume=learn_delta_volume, rngs=rngs)
+                                        use_anchor_rotations=use_anchor_rotations, low_rank=pose_head_rank,
+                                        spatial_pool=pose_spatial_pool, rngs=rngs)
+        self.encoder_het = EncoderHet(self.xsize, lat_dim=lat_dim,
+                                      architecture=het_encoder_architecture, rngs=rngs)
+        self.delta_volume_decoder = DeltaVolumeDecoder(coords=coords, values=values, volume_size=self.xsize,
+                                                       learn_delta_volume=learn_delta_volume,
+                                                       parameterization=consensus_parameterization, rngs=rngs)
         self.delta_het_decoder = HetVolumeDecoder(coords=coords, values=values, n_gaussians=coords.shape[0], lat_dim=lat_dim, volume_size=self.xsize, rngs=rngs)
-        self.phys_decoder = PhysDecoder(self.xsize)
+        self.phys_decoder = PhysDecoder(self.xsize, render_chunk_size=render_chunk_size)
 
         # Gaussian std
         self.log_std = nnx.Param(jnp.log(sigma))
@@ -678,7 +825,7 @@ class ReconSIREN(nnx.Module):
 
     def decode_image(self, x, labels, md, ctf_type=None):
         # Precompute batch CTFs
-        if self.ctf_type is not None:
+        if self.ctf_type not in (None, "None"):
             defocusU = md["ctfDefocusU"][labels]
             defocusV = md["ctfDefocusV"][labels]
             defocusAngle = md["ctfDefocusAngle"][labels]
@@ -702,8 +849,8 @@ class ReconSIREN(nnx.Module):
         coords, values = self.delta_volume_decoder()
 
         # Generate projections
-        images_corrected = self.phys_decoder(x, values, coords, self.xsize, rotations, shifts, ctf, 
-                                             self.get_std(), ctf_type)
+        images_corrected = self.phys_decoder(x, values, coords, self.xsize, rotations, shifts, ctf,
+                                             ctf_type, self.get_std())
 
         return images_corrected
 
@@ -721,7 +868,64 @@ class ReconSIREN(nnx.Module):
         return vol
 
 
-@partial(jax.jit, static_argnames=("use_tau",))
+def _candidate_reconstruction_losses(images, targets, ctf, ctf_type, normalize_target=True):
+    """Per-particle, per-candidate loss without materialising target copies."""
+    target = targets[..., 0] if targets.shape[-1] == 1 else targets
+    predicted = images[..., 0] if images.shape[-1] == 1 else images
+    n_candidates = predicted.shape[1]
+
+    if ctf_type == "wiener":
+        target = wiener2DFilter(target, ctf, pad_factor=2)
+        ctf_candidates = jnp.broadcast_to(
+            ctf[:, None, :], (ctf.shape[0], n_candidates, ctf.shape[1], ctf.shape[2]))
+        predicted = wiener2DFilter(
+            rearrange(predicted, "b n w h -> (b n) w h"),
+            rearrange(ctf_candidates, "b n w h -> (b n) w h"), pad_factor=2)
+        predicted = rearrange(predicted, "(b n) w h -> b n w h",
+                              b=target.shape[0], n=n_candidates)
+    elif ctf_type == "squared":
+        target = ctfFilter(target, ctf, pad_factor=2)
+        ctf_candidates = jnp.broadcast_to(
+            ctf[:, None, :], (ctf.shape[0], n_candidates, ctf.shape[1], ctf.shape[2]))
+        predicted = ctfFilter(
+            rearrange(predicted, "b n w h -> (b n) w h"),
+            rearrange(ctf_candidates, "b n w h -> (b n) w h"), pad_factor=2)
+        predicted = rearrange(predicted, "(b n) w h -> b n w h",
+                              b=target.shape[0], n=n_candidates)
+
+    # The legacy path normalized identical target copies independently.  Taking
+    # the same reduction once per particle produces the same mathematical value
+    # and lets broadcasting remain a view throughout the fused subtraction.
+    if normalize_target:
+        target = standard_normalization(target)
+    return jnp.mean(jnp.square(predicted - target[:, None, ...]), axis=(-2, -1))
+
+
+def _gather_candidates(values, indices):
+    return values[jnp.arange(values.shape[0])[:, None], indices]
+
+
+def _score_candidates(model, x, values, coords, rotations, shifts, ctf):
+    """Render candidate chunks and retain only their scalar losses."""
+    chunk = model.candidate_chunk_size
+    n_candidates = rotations.shape[1]
+    if chunk <= 0 or chunk >= n_candidates:
+        images = model.phys_decoder(
+            x, values, coords, model.xsize, rotations, shifts, ctf,
+            model.ctf_type, model.get_std())
+        return _candidate_reconstruction_losses(images, x, ctf, model.ctf_type)
+
+    losses = []
+    for start in range(0, n_candidates, chunk):
+        images = model.phys_decoder(
+            x, values, coords, model.xsize,
+            rotations[:, start:start + chunk], shifts[:, start:start + chunk],
+            ctf, model.ctf_type, model.get_std())
+        losses.append(_candidate_reconstruction_losses(images, x, ctf, model.ctf_type))
+    return jnp.concatenate(losses, axis=1)
+
+
+@partial(jax.jit, static_argnames=("use_tau",), donate_argnums=(1,))
 def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_tau=False, lambda_uniform=0.1):
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
 
@@ -755,76 +959,63 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
         random_indices = jax.random.choice(choice_key, jnp.arange(model.symmetry_matrices.shape[0]), shape=(rotations.shape[0],))
         rotations = jnp.matmul(jnp.transpose(model.symmetry_matrices[random_indices], (0, 2, 1))[:, None, :, :], rotations)
 
-        # Generate projections
-        images_corrected = model.phys_decoder(x, values, coords, model.xsize, rotations, shifts, ctf, model.ctf_type, model.get_std())
+        # Coarse-to-fine screening is disabled during stochastic exploration so
+        # the categorical distribution remains exactly the legacy one.
+        rotations_eval, shifts_eval = rotations, shifts
+        if not use_tau and model.coarse_topk < rotations.shape[1]:
+            screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
+            x_screen = jax.image.resize(
+                x, (x.shape[0], screen_size, screen_size, x.shape[-1]), method="bilinear")
+            coords_screen, values_screen = coords, values
+            if 0 < model.coarse_gaussians < coords.shape[1]:
+                keep = model.coarse_gaussians
+                idx = (jnp.arange(keep) * coords.shape[1]) // keep
+                coords_screen = coords[:, idx]
+                values_screen = values[:, idx] * (coords.shape[1] / keep)
+            coarse_images = model.phys_decoder(
+                x_screen, jax.lax.stop_gradient(values_screen),
+                jax.lax.stop_gradient(coords_screen), model.xsize,
+                jax.lax.stop_gradient(rotations), jax.lax.stop_gradient(shifts),
+                coarse_ctf, model.ctf_type, jax.lax.stop_gradient(model.get_std()),
+                render_size=screen_size)
+            coarse_losses = _candidate_reconstruction_losses(
+                coarse_images, x_screen, coarse_ctf, model.ctf_type)
+            _, top_indices = jax.lax.top_k(-coarse_losses, model.coarse_topk)
+            rotations_eval = _gather_candidates(rotations, top_indices)
+            shifts_eval = _gather_candidates(shifts, top_indices)
 
-        # Losses
-        images_corrected_loss = images_corrected[..., 0] if images_corrected.shape[-1] == 1 else images_corrected
-        x_loss_nb = x[..., 0] if x.shape[-1] == 1 else x
-
-        # Consider CTF if Wiener/Squared mode (only for loss)
-        if model.ctf_type == "wiener":
-            ctf_broadcasted = jnp.broadcast_to(ctf[:, None, :], (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
-            ctf_broadcasted = rearrange(ctf_broadcasted, "b n w h -> (b n) w h")
-
-            x_loss_nb = wiener2DFilter(x_loss_nb, ctf, pad_factor=2)
-
-            images_corrected_loss = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
-            images_corrected_loss = wiener2DFilter(images_corrected_loss, ctf_broadcasted, pad_factor=2)
-            images_corrected_loss = rearrange(images_corrected_loss, "(b n) w h -> b n w h")
-        elif model.ctf_type == "squared":
-            ctf_broadcasted = jnp.broadcast_to(ctf[:, None, :], (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
-            ctf_broadcasted = rearrange(ctf_broadcasted, "b n w h -> (b n) w h")
-
-            x_loss_nb = ctfFilter(x_loss_nb, ctf, pad_factor=2)
-
-            images_corrected_loss = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
-            images_corrected_loss = ctfFilter(images_corrected_loss, ctf_broadcasted, pad_factor=2)
-            images_corrected_loss = rearrange(images_corrected_loss, "(b n) w h -> b n w h")
-
-        # Broadcast input images to right size
-        x_loss = jnp.broadcast_to(x_loss_nb[:, None, ...], (x_loss_nb.shape[0], images_corrected.shape[1], x_loss_nb.shape[1], x_loss_nb.shape[2]))
-
-        x_flat = rearrange(x_loss, "b n w h -> (b n) w h")
-        images_corrected_flat = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
-        x_flat = standard_normalization(x_flat)
-
-        # Bandpass (TODO: Make optional to membrane proteins only)
-        # x_flat = bandpass_filter(x_flat, pixel_size_A=model.sr, highpass_A=50.)
-        # images_corrected_flat = bandpass_filter(images_corrected_flat, pixel_size_A=model.sr, highpass_A=50.)
-
-        recon_loss = dm_pix.mse(images_corrected_flat[..., None], x_flat[..., None])
-        recon_loss = rearrange(recon_loss, "(b n) -> b n", b=images_corrected_loss.shape[0], n=images_corrected_loss.shape[1])
+        # Candidate scores do not carry derivatives through argmin/categorical.
+        # Stop them here and rerender only the selected candidate below.
+        candidate_losses = _score_candidates(
+            model, x, jax.lax.stop_gradient(values), jax.lax.stop_gradient(coords),
+            jax.lax.stop_gradient(rotations_eval), jax.lax.stop_gradient(shifts_eval), ctf)
 
         # Get minimum indices
         if use_tau:
-            selection_logits = -recon_loss / tau
+            selection_logits = -candidate_losses / tau
             min_indices = jax.random.categorical(key, selection_logits, axis=-1)
         else:
-            min_indices = jnp.argmin(recon_loss, axis=1)
+            min_indices = jnp.argmin(candidate_losses, axis=1)
+
+        rotations_selected = rotations_eval[jnp.arange(x.shape[0]), min_indices][:, None, ...]
+        shifts_selected = shifts_eval[jnp.arange(x.shape[0]), min_indices][:, None, ...]
+        selected_images = model.phys_decoder(
+            x, values, coords, model.xsize, rotations_selected, shifts_selected,
+            ctf, model.ctf_type, model.get_std())
+        recon_loss = _candidate_reconstruction_losses(
+            selected_images, x, ctf, model.ctf_type).mean()
 
         # Heterogeneity
-        min_indices_het = jnp.argmin(recon_loss, axis=1)
-        rotations_het = rotations[jnp.arange(images_corrected.shape[0]), min_indices_het, :][:, None, ...]
-        shifts_het = shifts[jnp.arange(images_corrected.shape[0]), min_indices_het, :][:, None, ...]
+        min_indices_het = jnp.argmin(candidate_losses, axis=1)
+        rotations_het = rotations_eval[jnp.arange(x.shape[0]), min_indices_het, :][:, None, ...]
+        shifts_het = shifts_eval[jnp.arange(x.shape[0]), min_indices_het, :][:, None, ...]
         # TODO: Test stop gradient in rotations_het and shifts_het
         images_het = model.phys_decoder(x, values_het, coords_het, model.xsize, jax.lax.stop_gradient(rotations_het),
                                         jax.lax.stop_gradient(shifts_het), ctf, model.ctf_type, model.get_std())[:, 0, ...]
-        images_het_loss = images_het[..., 0] if images_het.shape[-1] == 1 else images_het
-        if model.ctf_type == "wiener":
-            images_het_loss = wiener2DFilter(images_het_loss, ctf, pad_factor=2)
-        elif model.ctf_type == "squared":
-            images_het_loss = ctfFilter(images_het_loss, ctf, pad_factor=2)
-        # x_loss_nb = standard_normalization(x_loss_nb)
+        recon_het_loss = _candidate_reconstruction_losses(
+            images_het[:, None, ...], x, ctf, model.ctf_type,
+            normalize_target=False).mean()
 
-        # Bandpass (TODO: Make optional to membran proteins only)
-        # x_loss_nb = bandpass_filter(x_loss_nb, pixel_size_A=model.sr, highpass_A=50.)
-        # images_het_loss = bandpass_filter(images_het_loss, pixel_size_A=model.sr, highpass_A=50.)
-
-        recon_het_loss = dm_pix.mse(images_het_loss[..., None], x_loss_nb[..., None]).mean()
-
-        # Index losses and rotations based on extracted indices
-        recon_loss = recon_loss[jnp.arange(images_corrected.shape[0]), min_indices].mean()
         recon_loss_all = 0.5 * (recon_loss + recon_het_loss)
         
         # Viewing directions from rotations
@@ -864,7 +1055,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
         current_shifts = jnp.zeros((x.shape[0], 2))
 
     # Precompute batch CTFs
-    if model.ctf_type is not None:
+    if model.ctf_type not in (None, "None"):
         defocusU = md["ctfDefocusU"][labels]
         defocusV = md["ctfDefocusV"][labels]
         defocusAngle = md["ctfDefocusAngle"][labels]
@@ -875,6 +1066,18 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_t
                          x.shape[0], True)
     else:
         ctf = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
+
+    coarse_ctf = ctf
+    if not use_tau and model.coarse_topk < model.encoder_pose.num_components:
+        screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
+        if model.ctf_type not in (None, "None"):
+            coarse_ctf = computeCTF(
+                defocusU, defocusV, defocusAngle, cs, kv,
+                model.sr / (screen_size / model.xsize),
+                [2 * screen_size, screen_size + 1], x.shape[0], True)
+        else:
+            coarse_ctf = jnp.ones(
+                [x.shape[0], 2 * screen_size, screen_size + 1], dtype=x.dtype)
 
     if model.ctf_type == "precorrect":
         # Wiener filter
@@ -983,7 +1186,7 @@ def validation_step_reconsiren(graphdef, state, x, labels, md, key):
         current_shifts = jnp.zeros((x.shape[0], 2))
 
     # Precompute batch CTFs
-    if model.ctf_type is not None:
+    if model.ctf_type not in (None, "None"):
         defocusU = md["ctfDefocusU"][labels]
         defocusV = md["ctfDefocusV"][labels]
         defocusAngle = md["ctfDefocusAngle"][labels]
@@ -1023,7 +1226,7 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md, k
         current_shifts = jnp.zeros((x.shape[0], 2))
 
     # Precompute batch CTFs
-    if model.ctf_type is not None:
+    if model.ctf_type not in (None, "None"):
         defocusU = md["ctfDefocusU"][labels]
         defocusV = md["ctfDefocusV"][labels]
         defocusAngle = md["ctfDefocusAngle"][labels]
@@ -1034,6 +1237,18 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md, k
                          x.shape[0], True)
     else:
         ctf = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
+
+    coarse_ctf = ctf
+    if model.coarse_topk < model.encoder_pose.num_components:
+        screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
+        if model.ctf_type not in (None, "None"):
+            coarse_ctf = computeCTF(
+                defocusU, defocusV, defocusAngle, cs, kv,
+                model.sr / (screen_size / model.xsize),
+                [2 * screen_size, screen_size + 1], x.shape[0], True)
+        else:
+            coarse_ctf = jnp.ones(
+                [x.shape[0], 2 * screen_size, screen_size + 1], dtype=x.dtype)
 
     if model.ctf_type == "precorrect":
         # Wiener filter
@@ -1057,50 +1272,33 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md, k
     rotations = jnp.matmul(current_rotations[:, None, :, :], rotations)  # TODO: The two options seem to work?
     shifts = current_shifts[:, None, :] + shifts
 
-    # Generate projections
-    images_corrected = model.phys_decoder(x, values, coords, model.xsize, rotations, shifts, ctf, model.ctf_type, model.get_std())
+    if model.coarse_topk < rotations.shape[1]:
+        screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
+        x_screen = jax.image.resize(
+            x, (x.shape[0], screen_size, screen_size, x.shape[-1]), method="bilinear")
+        coords_screen, values_screen = coords, values
+        if 0 < model.coarse_gaussians < coords.shape[1]:
+            keep = model.coarse_gaussians
+            idx = (jnp.arange(keep) * coords.shape[1]) // keep
+            coords_screen = coords[:, idx]
+            values_screen = values[:, idx] * (coords.shape[1] / keep)
+        coarse_images = model.phys_decoder(
+            x_screen, values_screen, coords_screen, model.xsize, rotations, shifts,
+            coarse_ctf, model.ctf_type, model.get_std(), render_size=screen_size)
+        coarse_losses = _candidate_reconstruction_losses(
+            coarse_images, x_screen, coarse_ctf, model.ctf_type)
+        _, top_indices = jax.lax.top_k(-coarse_losses, model.coarse_topk)
+        rotations = _gather_candidates(rotations, top_indices)
+        shifts = _gather_candidates(shifts, top_indices)
 
-    # Losses
-    images_corrected_loss = images_corrected[..., 0] if images_corrected.shape[-1] == 1 else images_corrected
-    x_loss = x[..., 0] if x.shape[-1] == 1 else x
-
-    # Consider CTF if Wiener/Squared mode (only for loss)
-    if model.ctf_type == "wiener":
-        ctf_broadcasted = jnp.broadcast_to(ctf[:, None, :],
-                                           (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
-        ctf_broadcasted = rearrange(ctf_broadcasted, "b n w h -> (b n) w h")
-
-        x_loss = wiener2DFilter(x_loss, ctf, pad_factor=2)
-
-        images_corrected_loss = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
-        images_corrected_loss = wiener2DFilter(images_corrected_loss, ctf_broadcasted, pad_factor=2)
-        images_corrected_loss = rearrange(images_corrected_loss, "(b n) w h -> b n w h")
-    elif model.ctf_type == "squared":
-        ctf_broadcasted = jnp.broadcast_to(ctf[:, None, :],
-                                           (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
-        ctf_broadcasted = rearrange(ctf_broadcasted, "b n w h -> (b n) w h")
-
-        x_loss = ctfFilter(x_loss, ctf, pad_factor=2)
-
-        images_corrected_loss = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
-        images_corrected_loss = ctfFilter(images_corrected_loss, ctf_broadcasted, pad_factor=2)
-        images_corrected_loss = rearrange(images_corrected_loss, "(b n) w h -> b n w h")
-
-    # Broadcast input images to right size
-    x_loss = jnp.broadcast_to(x_loss[:, None, ...], (x_loss.shape[0], images_corrected.shape[1], x_loss.shape[1], x_loss.shape[2]))
-
-    x_flat = rearrange(x_loss, "b n w h -> (b n) w h")
-    images_corrected_flat = rearrange(images_corrected_loss, "b n w h -> (b n) w h")
-    x_flat = standard_normalization(x_flat)
-    recon_loss = dm_pix.mse(images_corrected_flat[..., None], x_flat[..., None])
-    recon_loss = rearrange(recon_loss, "(b n) -> b n", b=images_corrected_loss.shape[0], n=images_corrected_loss.shape[1])
+    recon_loss = _score_candidates(model, x, values, coords, rotations, shifts, ctf)
 
     # Get minimum indices
     min_indices = jnp.argmin(recon_loss, axis=1)
 
     # Index shifts and rotations based on extracted indices
-    rotations = rotations[jnp.arange(images_corrected.shape[0]), min_indices, :]
-    shifts = shifts[jnp.arange(images_corrected.shape[0]), min_indices, :]
+    rotations = rotations[jnp.arange(x.shape[0]), min_indices, :]
+    shifts = shifts[jnp.arange(x.shape[0]), min_indices, :]
 
     return rotations, shifts, latent
 
@@ -1163,6 +1361,34 @@ def main():
                              f"best-matching one. A larger value covers orientation space more densely, making the pose search more robust to local minima, but increases GPU "
                              f"memory and compute roughly linearly (this is the main driver of ReconSIREN's training footprint). Set it lower to fit a smaller GPU at the cost of a "
                              f"coarser pose search. Default: 18.")
+    parser.add_argument("--optimization_profile", choices=("legacy", "aggressive"), default="aggressive",
+                        help="Execution/model profile. aggressive enables the optimized architecture and "
+                             "coarse-to-fine pose scoring; legacy preserves the historical architecture. "
+                             "Old checkpoints load as legacy automatically.")
+    parser.add_argument("--pose_head_rank", type=int, default=None,
+                        help="Rank of each independent factorized pose-head layer; 0 uses dense layers. "
+                             "Profile default: aggressive=128, legacy=0.")
+    parser.add_argument("--pose_spatial_pool", type=int, default=None,
+                        help="Average-pooling factor before the pose dense trunk. "
+                             "Profile default: aggressive=4, legacy=1.")
+    parser.add_argument("--het_encoder_architecture", choices=("legacy", "convstem"), default=None,
+                        help="Heterogeneity encoder input projection. Profile default: aggressive=convstem.")
+    parser.add_argument("--consensus_parameterization", choices=("network", "direct"), default=None,
+                        help="Consensus Gaussian delta parameterization. Profile default: aggressive=direct.")
+    parser.add_argument("--render_chunk_size", type=int, default=None,
+                        help="Gaussians per rematerialized scatter block; 0 disables point chunking. "
+                             "Profile default: aggressive=2048, legacy=0.")
+    parser.add_argument("--candidate_chunk_size", type=int, default=None,
+                        help="Full-resolution pose candidates scored together; 0 scores all together. "
+                             "Profile default: aggressive=3, legacy=0.")
+    parser.add_argument("--coarse_topk", type=int, default=None,
+                        help="Coarse-ranked candidates evaluated at full resolution. "
+                             "Profile default: aggressive=4, legacy=all.")
+    parser.add_argument("--coarse_scale", type=float, default=None,
+                        help="Linear image scale for coarse pose ranking. Profile default: aggressive=0.5.")
+    parser.add_argument("--coarse_gaussians", type=int, default=None,
+                        help="Deterministic Gaussian subset for coarse ranking; 0 uses the full cloud. "
+                             "Profile default: aggressive=2048, legacy=all.")
     ca.add_ctf_type(parser)
     ca.add_mode(parser)
     ca.add_epochs(parser)
@@ -1269,7 +1495,18 @@ def main():
                             refine_current_assignment=args.refine_current_assignment, lat_dim=8, sigma=sigma,
                             bank_size=10000, learn_delta_volume=not args.do_not_learn_volume,
                             num_components=args.num_components,
-                            use_anchor_rotations=not args.do_not_use_anchor_rotations, rngs=nnx.Rngs(model_key))
+                            use_anchor_rotations=not args.do_not_use_anchor_rotations,
+                            optimization_profile=args.optimization_profile,
+                            pose_head_rank=args.pose_head_rank,
+                            pose_spatial_pool=args.pose_spatial_pool,
+                            het_encoder_architecture=args.het_encoder_architecture,
+                            consensus_parameterization=args.consensus_parameterization,
+                            render_chunk_size=args.render_chunk_size,
+                            candidate_chunk_size=args.candidate_chunk_size,
+                            coarse_topk=args.coarse_topk,
+                            coarse_scale=args.coarse_scale,
+                            coarse_gaussians=args.coarse_gaussians,
+                            rngs=nnx.Rngs(model_key))
 
     # Reload network
     if args.reload is not None:
