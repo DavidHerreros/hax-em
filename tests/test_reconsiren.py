@@ -13,6 +13,7 @@ networks.  Coverage:
 * ``--num_gaussians``          : size of the Gaussian point cloud
 * optimized/legacy profiles    : independent low-rank heads, direct consensus,
                                   candidate and Gaussian render chunking
+* heterogeneity profiles       : legacy and staged anti-collapse residual training
 * ``--do_not_learn_volume``    : pose/shift-only refinement against a reference
 * ``--refine_current_assignment`` / ``--symmetry_group``
 * ``--load_images_to_ram`` (on) and the memory-mapped path (off) + ``--ssd_scratch_folder``
@@ -110,7 +111,8 @@ def scenarios(workdir, data):
     base = ["--sr", str(SR), "--epochs", str(EPOCHS),
             "--num_gaussians", str(NUM_GAUSS), "--load_images_to_ram",
             "--optimization_profile", "aggressive",
-            "--render_chunk_size", "128", "--candidate_chunk_size", "3"]
+            "--render_chunk_size", "128", "--candidate_chunk_size", "3",
+            "--heterogeneity_profile", "anti_collapse", "--het_start_epoch", "1"]
 
     scn = []
 
@@ -151,6 +153,7 @@ def scenarios(workdir, data):
               "--dataset_split_fraction", "0.7,0.3",
               "--num_gaussians", str(NUM_GAUSS),
               "--optimization_profile", "legacy",
+              "--heterogeneity_profile", "legacy",
               "--ssd_scratch_folder", out("train_apply_mmap_scratch"),
               "--sr", str(SR), "--epochs", str(EPOCHS),
               "--output_path", out("train_apply_mmap")],
