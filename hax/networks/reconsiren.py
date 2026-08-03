@@ -1629,14 +1629,10 @@ def main():
     parser.add_argument("--het_encoder_size", type=int, default=None,
                         help="Anti-aliased encoder image size for the resize architecture. "
                              "Must be a multiple of 16; anti-collapse default: min(128, box size).")
-    parser.add_argument("--het_residual_to_consensus", action="store_true", default=None,
-                        help="Decode heterogeneous states as residuals from the learned consensus.")
-    parser.add_argument("--no-het_residual_to_consensus", action="store_true",
-                        dest="disable_het_residual_to_consensus", help=argparse.SUPPRESS)
-    parser.add_argument("--het_center_decoder", action="store_true", default=None,
-                        help="Subtract decoder(z=0), making zero latent exactly the consensus state.")
-    parser.add_argument("--no-het_center_decoder", action="store_true",
-                        dest="disable_het_center_decoder", help=argparse.SUPPRESS)
+    parser.add_argument("--het_disable_consensus_residual", action="store_true",
+                        help="Disable decoding heterogeneous states as residuals from the learned consensus.")
+    parser.add_argument("--het_disable_decoder_centering", action="store_true",
+                        help="Disable subtracting decoder(z=0) from heterogeneous states.")
     parser.add_argument("--het_coordinate_scale", type=float, default=1.0,
                         help="Multiplier for heterogeneous coordinate residuals.")
     parser.add_argument("--het_amplitude_scale", type=float, default=1.0,
@@ -1648,10 +1644,8 @@ def main():
                         help="Comma-separated weights matching --het_loss_scales; normalized internally.")
     parser.add_argument("--het_mask_radius", type=float, default=None,
                         help="Circular heterogeneity-loss radius as a box fraction in [0, 0.5].")
-    parser.add_argument("--het_normalize_target", action="store_true", default=None,
-                        help="Use the same per-particle target standardization as consensus training.")
-    parser.add_argument("--no-het_normalize_target", action="store_true",
-                        dest="disable_het_normalize_target", help=argparse.SUPPRESS)
+    parser.add_argument("--het_disable_target_normalization", action="store_true",
+                        help="Disable the per-particle target standardization used by consensus training.")
     parser.add_argument("--het_variance_weight", type=float, default=None,
                         help="Weight of the latent standard-deviation floor penalty.")
     parser.add_argument("--het_covariance_weight", type=float, default=None,
@@ -1660,10 +1654,8 @@ def main():
                         help="Minimum latent standard deviation targeted by the variance penalty.")
     parser.add_argument("--het_start_epoch", type=int, default=None,
                         help="First epoch that trains heterogeneity; anti-collapse default: 5.")
-    parser.add_argument("--het_freeze_consensus", action="store_true", default=None,
-                        help="Freeze pose and consensus once staged heterogeneity training begins.")
-    parser.add_argument("--no-het_freeze_consensus", action="store_true",
-                        dest="disable_het_freeze_consensus", help=argparse.SUPPRESS)
+    parser.add_argument("--het_train_consensus", action="store_true",
+                        help="Continue training pose and consensus after heterogeneity training begins.")
     parser.add_argument("--het_latent_bank_size", type=int, default=2048,
                         help="Number of prior latent vectors used for stable variance/covariance statistics.")
     parser.add_argument("--consensus_parameterization", choices=("network", "direct"), default=None,
@@ -1694,17 +1686,12 @@ def main():
                   help="Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data).")
     ca.add_ssd_scratch_folder(parser)
     args = ca.parse_with_config(parser)
-    for flag in ("het_residual_to_consensus", "het_center_decoder",
-                 "het_normalize_target", "het_freeze_consensus"):
-        disable_flag = f"disable_{flag}"
-        if getattr(args, disable_flag):
-            if getattr(args, flag) is True:
-                parser.error(f"--{flag} and --no-{flag} cannot be used together")
-            setattr(args, flag, False)
-        delattr(args, disable_flag)
-    # parse_with_config saves before the paired store_true flags are resolved.
-    # Save again so an explicit --no-* option is recorded as the effective False.
-    ca.save_run_config(args)
+    # None keeps the selected profile's default; the store_true overrides only
+    # opt out of individual anti-collapse behaviours.
+    args.het_residual_to_consensus = (False if args.het_disable_consensus_residual else None)
+    args.het_center_decoder = (False if args.het_disable_decoder_centering else None)
+    args.het_normalize_target = (False if args.het_disable_target_normalization else None)
+    args.het_freeze_consensus = (False if args.het_train_consensus else None)
     if args.heterogeneity_profile == "legacy" and args.het_encoder_architecture is None:
         # A single profile switch should reproduce the historical heterogeneity
         # architecture even when execution optimizations remain enabled.
