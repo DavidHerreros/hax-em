@@ -13,6 +13,8 @@ networks.  Coverage:
 * ``--num_gaussians``          : size of the Gaussian point cloud
 * optimized/legacy profiles    : independent low-rank heads, direct consensus,
                                   candidate and Gaussian render chunking
+* pose-search profiles         : adaptive soft assignment, temperature, jitter,
+                                  balancing, winner diagnostics and reproducible seed
 * heterogeneity profiles       : legacy and staged anti-collapse residual training
 * ``--do_not_learn_volume``    : pose/shift-only refinement against a reference
 * ``--refine_current_assignment`` / ``--symmetry_group``
@@ -112,6 +114,11 @@ def scenarios(workdir, data):
             "--num_gaussians", str(NUM_GAUSS), "--load_images_to_ram",
             "--optimization_profile", "aggressive",
             "--render_chunk_size", "128", "--candidate_chunk_size", "3",
+            "--pose_search_profile", "adaptive", "--pose_explore_epochs", "1",
+            "--pose_assignment", "soft", "--pose_temperature_start", "1.0",
+            "--pose_temperature_end", "0.2", "--pose_jitter_degrees", "5",
+            "--pose_balance_weight", "0.01", "--pose_uniform_scope", "winners",
+            "--pose_uniform_weight", "0.01", "--pose_bank_scope", "winners", "--seed", "7",
             "--heterogeneity_profile", "anti_collapse", "--het_start_epoch", "1"]
 
     scn = []

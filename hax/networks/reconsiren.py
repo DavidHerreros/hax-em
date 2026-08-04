@@ -178,6 +178,57 @@ def repulsion_loss(
     return jnp.mean(energy)
 
 
+def _assignment_probabilities(losses, temperature, adaptive=True, eps=1e-6):
+    """Turn per-candidate losses into stable responsibilities.
+
+    In adaptive mode ``temperature`` is dimensionless: every particle's loss
+    differences are divided by their own standard deviation first.  This makes
+    the exploration schedule insensitive to map amplitude, box size and CTF
+    mode, unlike the historical absolute ``tau``.
+    """
+    centered = losses - jnp.min(losses, axis=1, keepdims=True)
+    if adaptive:
+        scale = jnp.std(centered, axis=1, keepdims=True)
+        centered = centered / jnp.maximum(scale, eps)
+    temperature = jnp.maximum(jnp.asarray(temperature, dtype=losses.dtype), eps)
+    return jax.nn.softmax(-centered / temperature, axis=1)
+
+
+def _head_balance_loss(probabilities, eps=1e-8):
+    """KL(mean assignment || uniform), zero when all heads are equally used."""
+    usage = jnp.mean(probabilities, axis=0)
+    usage = usage / jnp.maximum(jnp.sum(usage), eps)
+    n_heads = probabilities.shape[1]
+    return jnp.sum(usage * jnp.log(jnp.maximum(usage * n_heads, eps)))
+
+
+def _rotation_matrices_from_rotvec(rotation_vectors):
+    """Differentiable Rodrigues map for arrays ending in a 3-D rotation vector."""
+    wx, wy, wz = [rotation_vectors[..., i] for i in range(3)]
+    zeros = jnp.zeros_like(wx)
+    skew = jnp.stack([
+        zeros, -wz, wy,
+        wz, zeros, -wx,
+        -wy, wx, zeros,
+    ], axis=-1).reshape(rotation_vectors.shape[:-1] + (3, 3))
+    angle = jnp.linalg.norm(rotation_vectors, axis=-1)
+    first = jnp.sinc(angle / jnp.pi)[..., None, None]
+    second = ((1.0 - jnp.cos(angle)) / jnp.maximum(angle ** 2, 1e-8))[..., None, None]
+    identity = jnp.broadcast_to(jnp.eye(3, dtype=rotation_vectors.dtype), skew.shape)
+    return identity + first * skew + second * jnp.matmul(skew, skew)
+
+
+def _jitter_rotations(rotations, key, standard_deviation_degrees):
+    """Apply isotropic SO(3) proposal noise, expressed as angular std in degrees."""
+    axis_key, angle_key = jax.random.split(key)
+    axes = jax.random.normal(axis_key, rotations.shape[:-2] + (3,), dtype=rotations.dtype)
+    axes = axes / jnp.maximum(jnp.linalg.norm(axes, axis=-1, keepdims=True), 1e-8)
+    angles = jax.random.normal(angle_key, rotations.shape[:-2], dtype=rotations.dtype)
+    angles = angles * jnp.deg2rad(jnp.asarray(standard_deviation_degrees, rotations.dtype))
+    perturbations = _rotation_matrices_from_rotvec(axes * angles[..., None])
+    return jnp.matmul(perturbations, rotations)
+
+
 class LowRankLinear(nnx.Module):
     """Independent low-rank replacement for a square dense layer.
 
@@ -1118,17 +1169,31 @@ def _score_candidates(model, x, values, coords, rotations, shifts, ctf):
     return jnp.concatenate(losses, axis=1)
 
 
-@partial(jax.jit, static_argnames=("use_tau", "train_pose_volume", "train_heterogeneity",
-                                   "return_metrics"),
+@partial(jax.jit, static_argnames=("use_tau", "assignment_mode", "adaptive_temperature",
+                                   "apply_pose_jitter", "uniform_scope", "bank_scope",
+                                   "train_pose_volume", "train_heterogeneity", "return_metrics"),
          donate_argnums=(1,))
 def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           use_tau=False, lambda_uniform=0.1,
+                          assignment_mode="legacy", adaptive_temperature=False,
+                          apply_pose_jitter=False, pose_jitter_degrees=0.0,
+                          pose_balance_weight=0.0,
+                          uniform_scope="candidates", bank_scope="candidates",
                           train_pose_volume=True, train_heterogeneity=True,
                           return_metrics=False):
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
 
+    if assignment_mode == "legacy":
+        assignment_mode = "categorical" if use_tau else "hard"
+    if assignment_mode not in ("hard", "categorical", "soft"):
+        raise ValueError("assignment_mode must be 'legacy', 'hard', 'categorical' or 'soft'")
+    if uniform_scope not in ("off", "candidates", "winners"):
+        raise ValueError("uniform_scope must be 'off', 'candidates' or 'winners'")
+    if bank_scope not in ("candidates", "winners"):
+        raise ValueError("bank_scope must be 'candidates' or 'winners'")
+
     # Random keys
-    key, swd_key, uniform_key, choice_key, distributions_key = jax.random.split(key, 5)
+    key, jitter_key, swd_key, choice_key, distributions_key = jax.random.split(key, 5)
 
     def loss_fn(model, x):
         # Correct CTF in images for encoder if needed
@@ -1143,6 +1208,11 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         rotations, shifts = model.encoder_pose(x_ctf_corrected)
         coords, values = model.delta_volume_decoder()
 
+        # Exploration is injected explicitly in SO(3), rather than relying on a
+        # fortunate random neural-network initialization to move off the anchors.
+        if apply_pose_jitter:
+            rotations = _jitter_rotations(rotations, jitter_key, pose_jitter_degrees)
+
         # Refine current assignment (if provided)
         # rotations = jnp.matmul(rotations, current_rotations[:, None, :, :])
         rotations = jnp.matmul(current_rotations[:, None, :, :], rotations)  # TODO: The two options seem to work?
@@ -1155,7 +1225,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         # Coarse-to-fine screening is disabled during stochastic exploration so
         # the categorical distribution remains exactly the legacy one.
         rotations_eval, shifts_eval = rotations, shifts
-        if not use_tau and model.coarse_topk < rotations.shape[1]:
+        if assignment_mode == "hard" and model.coarse_topk < rotations.shape[1]:
             screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
             x_screen = jax.image.resize(
                 x, (x.shape[0], screen_size, screen_size, x.shape[-1]), method="bilinear")
@@ -1177,27 +1247,51 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             rotations_eval = _gather_candidates(rotations, top_indices)
             shifts_eval = _gather_candidates(shifts, top_indices)
 
-        # Candidate scores do not carry derivatives through argmin/categorical.
-        # Stop them here and rerender only the selected candidate below.
-        candidate_losses = _score_candidates(
-            model, x, jax.lax.stop_gradient(values), jax.lax.stop_gradient(coords),
-            jax.lax.stop_gradient(rotations_eval), jax.lax.stop_gradient(shifts_eval), ctf)
-
-        # Get minimum indices
-        if use_tau:
-            selection_logits = -candidate_losses / tau
-            min_indices = jax.random.categorical(key, selection_logits, axis=-1)
+        # Hard/categorical modes keep the optimized detached scoring pass and
+        # rerender one candidate.  Soft mode instead retains gradients through
+        # the same chunked scoring pass, then detaches only its responsibilities.
+        differentiable_losses = None
+        if assignment_mode == "soft" and train_pose_volume:
+            differentiable_losses = _score_candidates(
+                model, x, values, coords, rotations_eval, shifts_eval, ctf)
+            candidate_losses = jax.lax.stop_gradient(differentiable_losses)
         else:
+            candidate_losses = _score_candidates(
+                model, x, jax.lax.stop_gradient(values), jax.lax.stop_gradient(coords),
+                jax.lax.stop_gradient(rotations_eval), jax.lax.stop_gradient(shifts_eval), ctf)
+
+        # Candidate responsibilities.  The adaptive mode makes tau relative to
+        # each particle's current loss spread; soft mode then gives every
+        # plausible head a reconstruction gradient.
+        if assignment_mode == "hard":
             min_indices = jnp.argmin(candidate_losses, axis=1)
+            responsibilities = jax.nn.one_hot(
+                min_indices, candidate_losses.shape[1], dtype=candidate_losses.dtype)
+        else:
+            responsibilities = _assignment_probabilities(
+                candidate_losses, tau, adaptive=adaptive_temperature)
+            if assignment_mode == "categorical":
+                min_indices = jax.random.categorical(
+                    key, jnp.log(jnp.maximum(responsibilities, 1e-12)), axis=-1)
+            else:
+                min_indices = jnp.argmin(candidate_losses, axis=1)
 
         rotations_selected = rotations_eval[jnp.arange(x.shape[0]), min_indices][:, None, ...]
         shifts_selected = shifts_eval[jnp.arange(x.shape[0]), min_indices][:, None, ...]
+        balance_loss = jnp.asarray(0.0, dtype=candidate_losses.dtype)
         if train_pose_volume:
-            selected_images = model.phys_decoder(
-                x, values, coords, model.xsize, rotations_selected, shifts_selected,
-                ctf, model.ctf_type, model.get_std())
-            recon_loss = _candidate_reconstruction_losses(
-                selected_images, x, ctf, model.ctf_type).mean()
+            if assignment_mode == "soft":
+                recon_loss = jnp.mean(jnp.sum(
+                    jax.lax.stop_gradient(responsibilities) * differentiable_losses, axis=1))
+                differentiable_responsibilities = _assignment_probabilities(
+                    differentiable_losses, tau, adaptive=adaptive_temperature)
+                balance_loss = _head_balance_loss(differentiable_responsibilities)
+            else:
+                selected_images = model.phys_decoder(
+                    x, values, coords, model.xsize, rotations_selected, shifts_selected,
+                    ctf, model.ctf_type, model.get_std())
+                recon_loss = _candidate_reconstruction_losses(
+                    selected_images, x, ctf, model.ctf_type).mean()
         else:
             recon_loss = candidate_losses[jnp.arange(x.shape[0]), min_indices].mean()
 
@@ -1249,26 +1343,37 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             coordinate_rms = jnp.sqrt(jnp.mean(jnp.square(coords_het - reference_coords)))
             amplitude_rms = jnp.sqrt(jnp.mean(jnp.square(values_het - reference_values)))
         
-        # Viewing directions from rotations
-        rotations = rearrange(rotations, "b n w h -> (b n) w h")
-        directions = rotations[:, :, 2]
+        # Keep proposal and selected-pose distributions separate.  Fixed anchors
+        # already satisfy candidate uniformity, whereas winner uniformity can
+        # regularize the actual assignment during the bootstrap stage.
+        rotations_flat = rearrange(rotations, "b n w h -> (b n) w h")
+        candidate_directions = rotations_flat[:, :, 2]
+        winner_directions = rotations_selected[:, 0, :, 2]
 
         loss_uniform = jnp.asarray(0.0, dtype=recon_loss.dtype)
-        if train_pose_volume:
-            loss_swd = sliced_wasserstein_sphere(directions, rng=key, n_projections=64)
-            loss_repulsion = repulsion_loss(directions, s=2.)
-            loss_uniform = lambda_uniform * loss_swd + 0.0 * loss_repulsion
+        if train_pose_volume and uniform_scope != "off":
+            uniform_directions = (winner_directions if uniform_scope == "winners"
+                                  else candidate_directions)
+            loss_swd = sliced_wasserstein_sphere(uniform_directions, rng=swd_key, n_projections=64)
+            loss_uniform = lambda_uniform * loss_swd
+
+        normalized_entropy = -jnp.mean(jnp.sum(
+            responsibilities * jnp.log(jnp.maximum(responsibilities, 1e-12)), axis=1))
+        normalized_entropy = normalized_entropy / jnp.maximum(
+            jnp.log(jnp.asarray(responsibilities.shape[1], responsibilities.dtype)), 1.0)
 
         loss = jnp.asarray(0.0, dtype=recon_loss.dtype)
         if train_pose_volume:
-            loss = loss + 0.5 * recon_loss + loss_uniform
+            loss = (loss + 0.5 * recon_loss + loss_uniform
+                    + pose_balance_weight * balance_loss)
         if train_heterogeneity:
             loss = (loss + 0.5 * recon_het_loss
                     + model.het_variance_weight * variance_loss
                     + model.het_covariance_weight * covariance_loss)
-        metrics = (recon_loss, recon_het_loss, loss_uniform, variance_loss,
-                   covariance_loss, latent_std, coordinate_rms, amplitude_rms)
-        return loss, (metrics, directions, latent)
+        metrics = (recon_loss, recon_het_loss, loss_uniform, balance_loss,
+                   normalized_entropy, variance_loss, covariance_loss, latent_std,
+                   coordinate_rms, amplitude_rms)
+        return loss, (metrics, candidate_directions, winner_directions, latent)
 
     # Optimizer parameters
     params_pose = nnx.All(nnx.Param, nnx.PathContains('encoder_pose'))
@@ -1300,7 +1405,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         ctf = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
 
     coarse_ctf = ctf
-    if not use_tau and model.coarse_topk < model.encoder_pose.num_components:
+    if assignment_mode == "hard" and model.coarse_topk < model.encoder_pose.num_components:
         screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
         if model.ctf_type not in (None, "None"):
             coarse_ctf = computeCTF(
@@ -1316,7 +1421,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
     grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, (params_pose, params_volume, params_het)), has_aux=True)
-    (loss, (metrics, directions, latent)), grads_combined = grad_fn(model, x)
+    (loss, (metrics, candidate_directions, winner_directions, latent)), grads_combined = grad_fn(model, x)
 
     grads_pose, grads_volume, grads_het = grads_combined.split(params_pose, params_volume, params_het)
 
@@ -1327,7 +1432,9 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         optimizer_het.update(model, grads_het)
 
     if train_pose_volume:
-        model.memory_bank.enqueue(directions)
+        directions_to_bank = (winner_directions if bank_scope == "winners"
+                              else candidate_directions)
+        model.memory_bank.enqueue(directions_to_bank)
     if train_heterogeneity and model.heterogeneity_profile == "anti_collapse":
         model.latent_memory_bank.enqueue(jax.lax.stop_gradient(latent))
         model.latent_bank_count.value = jnp.minimum(
@@ -1618,6 +1725,36 @@ def main():
     parser.add_argument("--pose_spatial_pool", type=int, default=None,
                         help="Average-pooling factor before the pose dense trunk. "
                              "Profile default: aggressive=4, legacy=1.")
+    parser.add_argument("--pose_search_profile", choices=("legacy", "adaptive"), default="legacy",
+                        help="Pose exploration curriculum. legacy preserves the historical 1,500-step "
+                             "absolute-temperature sampling; adaptive enables epoch-based soft assignments, "
+                             "scale-normalized temperature and annealed SO(3) proposal jitter.")
+    parser.add_argument("--pose_explore_epochs", type=float, default=5.0,
+                        help="Adaptive-profile exploration duration in epochs; 0 disables the warm-up.")
+    parser.add_argument("--pose_assignment", choices=("soft", "categorical", "hard"), default="soft",
+                        help="Candidate assignment used during adaptive exploration. soft gives all plausible "
+                             "heads gradients; categorical samples one; hard uses the best candidate.")
+    parser.add_argument("--pose_temperature_start", type=float, default=1.0,
+                        help="Initial adaptive assignment temperature (dimensionless by default).")
+    parser.add_argument("--pose_temperature_end", type=float, default=0.1,
+                        help="Final adaptive assignment temperature at the end of exploration.")
+    parser.add_argument("--pose_absolute_temperature", action="store_true",
+                        help="Do not normalize candidate loss differences per particle before applying the "
+                             "adaptive-profile temperatures.")
+    parser.add_argument("--pose_jitter_degrees", type=float, default=15.0,
+                        help="Initial SO(3) proposal-jitter standard deviation in degrees; annealed to zero. "
+                             "Set to 0 to disable.")
+    parser.add_argument("--pose_balance_weight", type=float, default=0.01,
+                        help="Weight of mean candidate-utilization KL during soft exploration; 0 disables it.")
+    parser.add_argument("--pose_uniform_scope", choices=("off", "candidates", "winners"), default="winners",
+                        help="Angular distribution regularized during adaptive exploration. winners targets "
+                             "actual assignments; use off for preferred-orientation datasets.")
+    parser.add_argument("--pose_uniform_weight", type=float, default=0.01,
+                        help="Initial angular regularization weight, annealed to zero after exploration.")
+    parser.add_argument("--pose_bank_scope", choices=("candidates", "winners"), default="winners",
+                        help="Directions stored in the angular-distribution diagnostic memory bank.")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Optional reproducible seed for Gaussian-cloud and network initialization.")
     parser.add_argument("--heterogeneity_profile", choices=("legacy", "anti_collapse"),
                         default="anti_collapse",
                         help="Heterogeneity training profile. anti_collapse enables staged residual "
@@ -1653,7 +1790,8 @@ def main():
     parser.add_argument("--het_min_std", type=float, default=0.1,
                         help="Minimum latent standard deviation targeted by the variance penalty.")
     parser.add_argument("--het_start_epoch", type=int, default=None,
-                        help="First epoch that trains heterogeneity; anti-collapse default: 5.")
+                        help="First epoch that trains heterogeneity, providing a consensus-only warm-up. "
+                             "Profile defaults: anti-collapse=5, legacy=0.")
     parser.add_argument("--het_train_consensus", action="store_true",
                         help="Continue training pose and consensus after heterogeneity training begins.")
     parser.add_argument("--het_latent_bank_size", type=int, default=2048,
@@ -1696,6 +1834,19 @@ def main():
         # A single profile switch should reproduce the historical heterogeneity
         # architecture even when execution optimizations remain enabled.
         args.het_encoder_architecture = "legacy"
+    if args.pose_explore_epochs < 0.0:
+        parser.error("--pose_explore_epochs must be non-negative")
+    if args.pose_temperature_start <= 0.0 or args.pose_temperature_end <= 0.0:
+        parser.error("pose temperatures must be positive")
+    if args.pose_jitter_degrees < 0.0:
+        parser.error("--pose_jitter_degrees must be non-negative")
+    if args.pose_balance_weight < 0.0 or args.pose_uniform_weight < 0.0:
+        parser.error("pose regularization weights must be non-negative")
+    if args.seed is not None:
+        if args.seed < 0:
+            parser.error("--seed must be non-negative")
+        random.seed(args.seed)
+        np.random.seed(args.seed % (2 ** 32))
 
     # Matplotlib plot style
     plt.style.use('dark_background')  # This sets many defaults for a dark theme
@@ -1782,7 +1933,8 @@ def main():
     #     shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap"))
 
     # Random keys
-    rng = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
+    rng_seed = args.seed if args.seed is not None else random.randint(0, 2 ** 32 - 1)
+    rng = jax.random.PRNGKey(rng_seed)
     rng, model_key, choice_key = jax.random.split(rng, 3)
 
     # Prepare network (ReconSIREN)
@@ -1883,6 +2035,8 @@ def main():
         heterogeneity_profile = reconsiren.heterogeneity_profile
         het_start_epoch = reconsiren.het_start_epoch
         het_freeze_consensus = reconsiren.het_freeze_consensus
+        diagnostic_bank_scope = ("candidates" if args.pose_search_profile == "legacy"
+                                 else args.pose_bank_scope)
         graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_volume, optimizer_het))
 
         # Resume if checkpoint exists
@@ -1919,6 +2073,8 @@ def main():
                     total_loss = 0
                     total_recon_loss = 0
                     total_recon_het_loss = 0
+                    total_pose_balance_loss = 0
+                    total_assignment_entropy = 0
                     total_variance_loss = 0
                     total_covariance_loss = 0
                     total_latent_std = 0
@@ -1961,11 +2117,12 @@ def main():
                             alpha = jnp.arctan2(dir_y, dir_x)
                             euler_angles = jnp.stack([alpha, beta], axis=-1)
                             fig, _ = plot_angular_distribution(euler_angles)
-                            writer.add_figure("Angular distribution density", fig, global_step=i)
+                            writer.add_figure(
+                                f"Angular distribution density ({diagnostic_bank_scope})",
+                                fig, global_step=i)
 
                             decoded_centers = []
-                            if (heterogeneity_profile == "legacy"
-                                    or epoch_index >= het_start_epoch):
+                            if epoch_index >= het_start_epoch:
                                 n_latent_steps = int(min(
                                     steps_per_epoch,
                                     np.ceil(LATENTS_FOR_CLUSTERING / args.batch_size)))
@@ -1996,28 +2153,71 @@ def main():
 
                     i += 1
 
-                if total_steps <= 1500:
-                    tau = 1e-3
-                    use_tau = True
+                if args.pose_search_profile == "legacy":
+                    if total_steps <= 1500:
+                        tau = 1e-3
+                        use_tau = True
+                    else:
+                        tau = 0.0
+                        use_tau = False
+                    assignment_mode = "legacy"
+                    adaptive_temperature = False
+                    apply_pose_jitter = False
+                    pose_jitter_degrees = 0.0
+                    pose_balance_weight = 0.0
+                    uniform_scope = "candidates"
+                    uniform_weight = 0.1
+                    bank_scope = "candidates"
                 else:
-                    tau = 0.0
+                    exploration_steps = args.pose_explore_epochs * steps_per_epoch
+                    exploring = exploration_steps > 0 and total_steps < exploration_steps
+                    progress = (min(total_steps / exploration_steps, 1.0)
+                                if exploration_steps > 0 else 1.0)
+                    if exploring:
+                        # Geometric temperature interpolation is smooth in log-space.
+                        tau = (args.pose_temperature_start
+                               * (args.pose_temperature_end / args.pose_temperature_start) ** progress)
+                        assignment_mode = args.pose_assignment
+                        anneal = 1.0 - progress
+                        pose_jitter_degrees = args.pose_jitter_degrees * anneal
+                        pose_balance_weight = args.pose_balance_weight * anneal
+                        uniform_scope = args.pose_uniform_scope
+                        uniform_weight = args.pose_uniform_weight * anneal
+                    else:
+                        tau = args.pose_temperature_end
+                        assignment_mode = "hard"
+                        pose_jitter_degrees = 0.0
+                        pose_balance_weight = 0.0
+                        uniform_scope = "off"
+                        uniform_weight = 0.0
                     use_tau = False
-                train_heterogeneity = (heterogeneity_profile == "legacy"
-                                       or epoch_index >= het_start_epoch)
+                    adaptive_temperature = not args.pose_absolute_temperature
+                    apply_pose_jitter = exploring and args.pose_jitter_degrees > 0.0
+                    bank_scope = args.pose_bank_scope
+                train_heterogeneity = epoch_index >= het_start_epoch
                 train_pose_volume = not (
                     heterogeneity_profile == "anti_collapse"
                     and train_heterogeneity and het_freeze_consensus)
                 loss, metrics, state, rng = train_step_reconsiren(
                     graphdef, state, x, labels, md_columns, rng,
-                    lambda_uniform=0.1, tau=tau, use_tau=use_tau,
+                    lambda_uniform=uniform_weight, tau=tau, use_tau=use_tau,
+                    assignment_mode=assignment_mode,
+                    adaptive_temperature=adaptive_temperature,
+                    apply_pose_jitter=apply_pose_jitter,
+                    pose_jitter_degrees=pose_jitter_degrees,
+                    pose_balance_weight=pose_balance_weight,
+                    uniform_scope=uniform_scope, bank_scope=bank_scope,
                     train_pose_volume=train_pose_volume,
                     train_heterogeneity=train_heterogeneity,
                     return_metrics=True)
-                (recon_loss, recon_het_loss, loss_uniform, variance_loss,
-                 covariance_loss, latent_std, coordinate_rms, amplitude_rms) = metrics
+                (recon_loss, recon_het_loss, loss_uniform, balance_loss,
+                 assignment_entropy, variance_loss, covariance_loss, latent_std,
+                 coordinate_rms, amplitude_rms) = metrics
                 total_loss += loss
                 total_recon_loss += recon_loss
                 total_recon_het_loss += recon_het_loss
+                total_pose_balance_loss += balance_loss
+                total_assignment_entropy += assignment_entropy
                 total_variance_loss += variance_loss
                 total_covariance_loss += covariance_loss
                 total_latent_std += latent_std
@@ -2045,6 +2245,13 @@ def main():
                                         "amplitude_rms": float(total_amplitude_rms) / step,
                                         "variance_penalty": float(total_variance_loss) / step,
                                         "covariance_penalty": float(total_covariance_loss) / step},
+                                       i * steps_per_epoch + step)
+
+                    writer.add_scalars('Pose exploration diagnostics (ReconSIREN)',
+                                       {"assignment_entropy": float(total_assignment_entropy) / step,
+                                        "head_balance_kl": float(total_pose_balance_loss) / step,
+                                        "temperature": float(tau),
+                                        "jitter_degrees": float(pose_jitter_degrees)},
                                        i * steps_per_epoch + step)
 
                     # Progress bar update  (TQDM)
