@@ -5,8 +5,8 @@ import numpy as np
 from hax.networks.reconsiren import (
     _assignment_probabilities,
     _bound_candidate_view_directions,
-    _jitter_rotations,
-    _local_rotation_proposals,
+    _candidate_coverage_loss,
+    _fibonacci_sphere_directions,
     _rotation_matrices_from_rotvec,
 )
 
@@ -22,32 +22,38 @@ def test_adaptive_responsibilities_are_affine_loss_invariant():
     assert np.all(np.asarray(expected) > 0.0)
 
 
-def test_rotation_jitter_is_optional_and_stays_on_so3():
-    rotations = jnp.broadcast_to(jnp.eye(3), (4, 6, 3, 3))
-    key = jax.random.PRNGKey(3)
+def test_candidate_coverage_penalizes_anchor_quantization():
+    dense = _fibonacci_sphere_directions(256)
+    anchors = _fibonacci_sphere_directions(16)
+    quantized = jnp.repeat(anchors, 16, axis=0)
+    empty_bank = jnp.zeros((512, 3), dtype=jnp.float32)
+    key = jax.random.PRNGKey(4)
 
-    unchanged = _jitter_rotations(rotations, key, 0.0)
-    jittered = _jitter_rotations(rotations, key, 12.0)
+    dense_loss = _candidate_coverage_loss(
+        dense, empty_bank, 0, key, n_bins=128, kappa=32.0,
+        bank_samples=128, bank_mix=0.5)
+    quantized_loss = _candidate_coverage_loss(
+        quantized, empty_bank, 0, key, n_bins=128, kappa=32.0,
+        bank_samples=128, bank_mix=0.5)
 
-    np.testing.assert_allclose(unchanged, rotations, atol=1e-6)
-    assert not np.allclose(np.asarray(jittered), np.asarray(rotations))
-    products = jnp.matmul(jnp.swapaxes(jittered, -1, -2), jittered)
-    expected_identity = jnp.broadcast_to(jnp.eye(3), products.shape)
-    np.testing.assert_allclose(products, expected_identity, rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(jnp.linalg.det(jittered), 1.0, rtol=1e-5, atol=1e-5)
+    assert float(quantized_loss) > float(dense_loss)
+    assert float(dense_loss) >= -1e-6
 
 
-def test_local_proposals_include_current_pose_and_valid_rotations():
-    rotations = jnp.broadcast_to(jnp.eye(3), (2, 4, 3, 3))
-    proposals = _local_rotation_proposals(
-        rotations, jax.random.PRNGKey(4), n_proposals=3, jitter_degrees=8.0)
+def test_candidate_coverage_has_finite_direction_gradients():
+    directions = _fibonacci_sphere_directions(32)
+    bank = _fibonacci_sphere_directions(64)
 
-    assert proposals.shape == (2, 4, 3, 3, 3)
-    np.testing.assert_allclose(proposals[:, :, 0], rotations, atol=1e-6)
-    products = jnp.matmul(jnp.swapaxes(proposals, -1, -2), proposals)
-    np.testing.assert_allclose(
-        products, jnp.broadcast_to(jnp.eye(3), products.shape), rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(jnp.linalg.det(proposals), 1.0, rtol=1e-5, atol=1e-5)
+    def loss_fn(raw_directions):
+        unit_directions = raw_directions / jnp.linalg.norm(
+            raw_directions, axis=-1, keepdims=True)
+        return _candidate_coverage_loss(
+            unit_directions, bank, bank.shape[0], jax.random.PRNGKey(6),
+            n_bins=64, kappa=24.0, bank_samples=32, bank_mix=0.5)
+
+    gradients = jax.grad(loss_fn)(directions)
+    assert np.all(np.isfinite(np.asarray(gradients)))
+    assert float(jnp.linalg.norm(gradients)) > 0.0
 
 
 def test_candidate_view_direction_is_bounded_and_rotation_stays_valid():
