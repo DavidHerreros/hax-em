@@ -1422,6 +1422,32 @@ def _gather_candidates(values, indices):
     return values[jnp.arange(values.shape[0])[:, None], indices]
 
 
+def _select_candidates_with_head_hysteresis(
+        losses, candidate_head_indices, previous_heads, threshold_std, eps=1e-8):
+    """Keep a prior head when the new best candidate is only marginally better."""
+    batch_indices = jnp.arange(losses.shape[0])
+    best_local_indices = jnp.argmin(losses, axis=1)
+    best_heads = candidate_head_indices[batch_indices, best_local_indices]
+    best_losses = losses[batch_indices, best_local_indices]
+
+    previous_matches = candidate_head_indices == previous_heads[:, None]
+    previous_available = jnp.any(previous_matches, axis=1) & (previous_heads >= 0)
+    previous_local_indices = jnp.argmax(previous_matches, axis=1)
+    previous_losses = losses[batch_indices, previous_local_indices]
+    candidate_scale = jnp.std(losses, axis=1)
+    challenger_advantage_std = jnp.maximum(previous_losses - best_losses, 0.0) / (
+        jnp.maximum(candidate_scale, eps))
+
+    contested = previous_available & (best_heads != previous_heads)
+    retained_previous = contested & (
+        challenger_advantage_std < jnp.asarray(threshold_std, dtype=losses.dtype))
+    accepted_new_best = contested & ~retained_previous
+    selected_local_indices = jnp.where(
+        retained_previous, previous_local_indices, best_local_indices)
+    return (selected_local_indices, retained_previous, accepted_new_best,
+            previous_available, contested, challenger_advantage_std)
+
+
 def _score_candidates(model, x, values, coords, rotations, shifts, ctf,
                       scoring="mse"):
     """Render candidate chunks and retain only their scalar losses."""
@@ -1450,7 +1476,7 @@ def _score_candidates(model, x, values, coords, rotations, shifts, ctf,
                                    "candidate_bank_samples",
                                    "uniform_scope", "candidate_scoring",
                                    "train_pose_volume", "train_heterogeneity", "return_metrics",
-                                   "return_pose_diagnostics"),
+                                   "return_pose_diagnostics", "apply_candidate_hysteresis"),
          donate_argnums=(1,))
 def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           use_tau=False, lambda_uniform=0.1,
@@ -1463,6 +1489,9 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           candidate_bank_mix=0.5,
                           uniform_scope="candidates",
                           candidate_scoring="mse",
+                          previous_candidate_heads=None,
+                          apply_candidate_hysteresis=False,
+                          candidate_hysteresis_std=0.25,
                           train_pose_volume=True, train_heterogeneity=True,
                           return_metrics=False, return_pose_diagnostics=False):
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
@@ -1475,6 +1504,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         raise ValueError("uniform_scope must be 'off', 'candidates' or 'winners'")
     if candidate_scoring not in ("mse", "ncc"):
         raise ValueError("candidate_scoring must be 'mse' or 'ncc'")
+    if apply_candidate_hysteresis and assignment_mode != "hard":
+        raise ValueError("candidate-head hysteresis requires hard assignment")
 
     # Random keys
     key, coverage_key, swd_key, choice_key, distributions_key = jax.random.split(key, 5)
@@ -1549,8 +1580,30 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         # Candidate responsibilities are used only to pick a single global
         # winner.  Categorical exploration therefore remains safe for volume
         # amplitudes while allowing the winning head to vary over time.
+        hysteresis_retained_fraction = jnp.asarray(0.0, dtype=x.dtype)
+        hysteresis_accepted_switch_fraction = jnp.asarray(0.0, dtype=x.dtype)
+        hysteresis_previous_available_fraction = jnp.asarray(0.0, dtype=x.dtype)
+        hysteresis_challenger_advantage_std = jnp.asarray(0.0, dtype=x.dtype)
         if assignment_mode == "hard":
-            min_indices = jnp.argmin(candidate_losses, axis=1)
+            if apply_candidate_hysteresis:
+                (min_indices, retained_previous, accepted_new_best,
+                 previous_available, contested, challenger_advantage_std) = (
+                    _select_candidates_with_head_hysteresis(
+                        candidate_losses, candidate_head_indices,
+                        previous_candidate_heads, candidate_hysteresis_std))
+                contested_count = jnp.sum(contested)
+                available_count = jnp.sum(previous_candidate_heads >= 0)
+                hysteresis_retained_fraction = (
+                    jnp.sum(retained_previous) / jnp.maximum(contested_count, 1))
+                hysteresis_accepted_switch_fraction = (
+                    jnp.sum(accepted_new_best) / jnp.maximum(contested_count, 1))
+                hysteresis_previous_available_fraction = (
+                    jnp.sum(previous_available) / jnp.maximum(available_count, 1))
+                hysteresis_challenger_advantage_std = jnp.sum(
+                    jnp.where(contested, challenger_advantage_std, 0.0)) / jnp.maximum(
+                        contested_count, 1)
+            else:
+                min_indices = jnp.argmin(candidate_losses, axis=1)
             responsibilities = jax.nn.one_hot(
                 min_indices, candidate_losses.shape[1], dtype=candidate_losses.dtype)
         else:
@@ -1695,7 +1748,11 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                    coordinate_rms, amplitude_rms, projection_rms,
                    normalized_target_rms, consensus_amplitude_mean,
                    consensus_amplitude_rms, consensus_amplitude_max,
-                   consensus_active_amplitude_fraction)
+                   consensus_active_amplitude_fraction,
+                   hysteresis_retained_fraction,
+                   hysteresis_accepted_switch_fraction,
+                   hysteresis_previous_available_fraction,
+                   hysteresis_challenger_advantage_std)
         pose_diagnostics = tuple(jax.lax.stop_gradient(value) for value in (
             rotations_selected[:, 0], selected_head_indices, best_head_indices,
             absolute_margin, relative_margin, standardized_margin,
@@ -2110,6 +2167,14 @@ def main():
                         help="Loss used only to rank pose candidates after stochastic exploration. "
                              "ncc removes per-projection offset and scale; the selected winner still "
                              "uses the legacy MSE to train pose and volume. Default: mse.")
+    parser.add_argument("--candidate_head_hysteresis_std", type=float, default=0.0,
+                        help="Keep a particle's previous candidate head unless the new best head improves "
+                             "its score by this many within-particle candidate-loss standard deviations. "
+                             "Applied only after stochastic exploration; 0 disables it. No extra candidates "
+                             "are rendered, so a previous head removed by coarse screening cannot be kept.")
+    parser.add_argument("--candidate_head_hysteresis_start_epoch", type=int, default=0,
+                        help="Earliest epoch at which candidate-head hysteresis may run; stochastic "
+                             "exploration always takes precedence. Default: 0.")
     parser.add_argument("--pose_diagnostics", action="store_true",
                         help="Track per-particle winner rotations and top-two loss margins. Adds a small "
                              "device-to-host transfer per batch but does not affect training.")
@@ -2219,6 +2284,10 @@ def main():
         parser.error("pose regularization weights must be non-negative")
     if args.candidate_anchor_cap_degrees < 0.0:
         parser.error("--candidate_anchor_cap_degrees must be non-negative")
+    if args.candidate_head_hysteresis_std < 0.0:
+        parser.error("--candidate_head_hysteresis_std must be non-negative")
+    if args.candidate_head_hysteresis_start_epoch < 0:
+        parser.error("--candidate_head_hysteresis_start_epoch must be non-negative")
     if (args.pose_search_profile == "adaptive"
             and args.heterogeneity_profile == "anti_collapse"
             and args.het_freeze_consensus is not False
@@ -2424,6 +2493,11 @@ def main():
         pose_diagnostics_tracker = (
             _PoseDiagnosticsTracker(len(generator.md), reconsiren.symmetry_matrices)
             if args.pose_diagnostics else None)
+        track_candidate_heads = (
+            args.pose_diagnostics or args.candidate_head_hysteresis_std > 0.0)
+        candidate_head_history = (
+            np.full(len(generator.md), -1, dtype=np.int32)
+            if track_candidate_heads else None)
         graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_volume, optimizer_het))
 
         # Resume if checkpoint exists
@@ -2474,6 +2548,10 @@ def main():
                     total_consensus_amplitude_rms = 0
                     total_consensus_amplitude_max = 0
                     total_consensus_active_amplitude_fraction = 0
+                    total_hysteresis_retained_fraction = 0
+                    total_hysteresis_accepted_switch_fraction = 0
+                    total_hysteresis_previous_available_fraction = 0
+                    total_hysteresis_challenger_advantage_std = 0
                     projection_diagnostic_steps = 0
                     total_validation_loss = 0
 
@@ -2605,6 +2683,20 @@ def main():
                 train_pose_volume = not (
                     heterogeneity_profile == "anti_collapse"
                     and train_heterogeneity and het_freeze_consensus)
+                hard_winner_selection = (
+                    (args.pose_search_profile == "legacy" and not use_tau)
+                    or (args.pose_search_profile == "adaptive"
+                        and assignment_mode == "hard"))
+                apply_candidate_hysteresis = (
+                    args.candidate_head_hysteresis_std > 0.0
+                    and epoch_index >= args.candidate_head_hysteresis_start_epoch
+                    and hard_winner_selection)
+                if track_candidate_heads:
+                    labels_host = np.asarray(labels, dtype=np.int64)
+                    previous_candidate_heads = jnp.asarray(
+                        candidate_head_history[labels_host])
+                else:
+                    previous_candidate_heads = jnp.full_like(labels, -1)
                 train_result = train_step_reconsiren(
                     graphdef, state, x, labels, md_columns, rng,
                     lambda_uniform=uniform_weight, tau=tau, use_tau=use_tau,
@@ -2618,19 +2710,24 @@ def main():
                     candidate_bank_mix=args.candidate_bank_mix,
                     uniform_scope=uniform_scope,
                     candidate_scoring=active_candidate_scoring,
+                    previous_candidate_heads=previous_candidate_heads,
+                    apply_candidate_hysteresis=apply_candidate_hysteresis,
+                    candidate_hysteresis_std=args.candidate_head_hysteresis_std,
                     train_pose_volume=train_pose_volume,
                     train_heterogeneity=train_heterogeneity,
                     return_metrics=True,
-                    return_pose_diagnostics=args.pose_diagnostics)
-                if args.pose_diagnostics:
+                    return_pose_diagnostics=track_candidate_heads)
+                if track_candidate_heads:
                     loss, metrics, pose_diagnostics, state, rng = train_result
                     (winner_rotations, selected_heads, best_heads,
                      absolute_margins, relative_margins, standardized_margins,
                      median_normalized_margins, score_entropies) = pose_diagnostics
-                    pose_diagnostics_tracker.update(
-                        labels, winner_rotations, selected_heads, best_heads,
-                        absolute_margins, relative_margins, standardized_margins,
-                        median_normalized_margins, score_entropies, epoch_index)
+                    candidate_head_history[labels_host] = np.asarray(selected_heads)
+                    if pose_diagnostics_tracker is not None:
+                        pose_diagnostics_tracker.update(
+                            labels, winner_rotations, selected_heads, best_heads,
+                            absolute_margins, relative_margins, standardized_margins,
+                            median_normalized_margins, score_entropies, epoch_index)
                 else:
                     loss, metrics, state, rng = train_result
                 (recon_loss, recon_het_loss, loss_uniform, candidate_coverage_loss,
@@ -2638,7 +2735,11 @@ def main():
                  covariance_loss, latent_std, coordinate_rms, amplitude_rms,
                  projection_rms, normalized_target_rms, consensus_amplitude_mean,
                  consensus_amplitude_rms, consensus_amplitude_max,
-                 consensus_active_amplitude_fraction) = metrics
+                 consensus_active_amplitude_fraction,
+                 hysteresis_retained_fraction,
+                 hysteresis_accepted_switch_fraction,
+                 hysteresis_previous_available_fraction,
+                 hysteresis_challenger_advantage_std) = metrics
                 total_loss += loss
                 total_recon_loss += recon_loss
                 total_recon_het_loss += recon_het_loss
@@ -2654,6 +2755,10 @@ def main():
                 total_consensus_amplitude_rms += consensus_amplitude_rms
                 total_consensus_amplitude_max += consensus_amplitude_max
                 total_consensus_active_amplitude_fraction += consensus_active_amplitude_fraction
+                total_hysteresis_retained_fraction += hysteresis_retained_fraction
+                total_hysteresis_accepted_switch_fraction += hysteresis_accepted_switch_fraction
+                total_hysteresis_previous_available_fraction += hysteresis_previous_available_fraction
+                total_hysteresis_challenger_advantage_std += hysteresis_challenger_advantage_std
                 if train_pose_volume:
                     total_projection_rms += projection_rms
                     total_normalized_target_rms += normalized_target_rms
@@ -2757,6 +2862,20 @@ def main():
                                  "head_switch": pose_summary["head_switch_fraction"],
                                  "comparison_coverage": pose_summary["comparison_coverage_fraction"]},
                                 i * steps_per_epoch + step)
+
+                    if args.candidate_head_hysteresis_std > 0.0:
+                        writer.add_scalars(
+                            'Candidate head hysteresis (ReconSIREN)',
+                            {"retained_previous_fraction": (
+                                 float(total_hysteresis_retained_fraction) / step),
+                             "accepted_new_best_fraction": (
+                                 float(total_hysteresis_accepted_switch_fraction) / step),
+                             "previous_head_available_fraction": (
+                                 float(total_hysteresis_previous_available_fraction) / step),
+                             "challenger_advantage_std": (
+                                 float(total_hysteresis_challenger_advantage_std) / step),
+                             "active": float(apply_candidate_hysteresis)},
+                            i * steps_per_epoch + step)
 
                     # Progress bar update  (TQDM)
                     stage = "joint" if train_pose_volume and train_heterogeneity else (

@@ -13,6 +13,7 @@ from hax.networks.reconsiren import (
     _candidate_reconstruction_losses,
     _fibonacci_sphere_directions,
     _rotation_matrices_from_rotvec,
+    _select_candidates_with_head_hysteresis,
     _symmetry_aware_rotation_change_degrees,
     _top_two_candidate_diagnostics,
     train_step_reconsiren,
@@ -72,6 +73,27 @@ def test_ncc_candidate_scoring_prefers_shape_over_amplitude():
         images, target, ctf, None, scoring="ncc")
 
     assert float(losses[0, 0]) < float(losses[0, 1])
+
+
+def test_candidate_head_hysteresis_keeps_only_ambiguous_previous_winner():
+    losses = jnp.array([
+        [0.10, 0.11, 0.50],
+        [0.10, 0.30, 0.50],
+        [0.20, 0.10, 0.30],
+    ])
+    head_indices = jnp.broadcast_to(jnp.arange(3), losses.shape)
+    previous_heads = jnp.array([1, 1, 7])
+
+    selected, retained, accepted, available, contested, advantage = (
+        _select_candidates_with_head_hysteresis(
+            losses, head_indices, previous_heads, threshold_std=0.25))
+
+    np.testing.assert_array_equal(selected, np.array([1, 0, 1]))
+    np.testing.assert_array_equal(retained, np.array([True, False, False]))
+    np.testing.assert_array_equal(accepted, np.array([False, True, False]))
+    np.testing.assert_array_equal(available, np.array([True, True, False]))
+    np.testing.assert_array_equal(contested, np.array([True, True, False]))
+    assert float(advantage[0]) < 0.25 < float(advantage[1])
 
 
 def test_candidate_coverage_has_finite_direction_gradients():
@@ -188,12 +210,14 @@ def test_train_step_can_return_pose_diagnostics_without_changing_metrics():
 
     loss, metrics, diagnostics, _, _ = train_step_reconsiren(
         graphdef, state, images, labels, {}, jax.random.PRNGKey(8),
-        assignment_mode="hard", uniform_scope="off", candidate_scoring="ncc",
+        assignment_mode="hard", uniform_scope="off",
+        previous_candidate_heads=jnp.array([1, 2]),
+        apply_candidate_hysteresis=True, candidate_hysteresis_std=0.25,
         train_heterogeneity=False, return_metrics=True,
         return_pose_diagnostics=True)
 
     assert np.isfinite(float(loss))
-    assert len(metrics) == 17
+    assert len(metrics) == 21
     assert np.all(np.isfinite(np.asarray(metrics)))
     np.testing.assert_allclose(metrics[12], 1.0, atol=1e-5)
     assert 0.0 <= float(metrics[16]) <= 1.0
