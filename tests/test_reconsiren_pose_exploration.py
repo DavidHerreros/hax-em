@@ -10,6 +10,7 @@ from hax.networks.reconsiren import (
     _assignment_probabilities,
     _bound_candidate_view_directions,
     _candidate_coverage_loss,
+    _candidate_reconstruction_losses,
     _fibonacci_sphere_directions,
     _rotation_matrices_from_rotvec,
     _symmetry_aware_rotation_change_degrees,
@@ -45,6 +46,32 @@ def test_candidate_coverage_penalizes_anchor_quantization():
 
     assert float(quantized_loss) > float(dense_loss)
     assert float(dense_loss) >= -1e-6
+
+
+def test_ncc_candidate_scoring_is_projection_scale_and_offset_invariant():
+    target = jnp.arange(16, dtype=jnp.float32).reshape(1, 4, 4, 1)
+    candidate = target[..., 0][:, None, ...]
+    transformed = 23.0 * candidate - 71.0
+    images = jnp.stack([candidate[:, 0], transformed[:, 0]], axis=1)
+    ctf = jnp.ones((1, 8, 5), dtype=jnp.float32)
+
+    losses = _candidate_reconstruction_losses(
+        images, target, ctf, None, scoring="ncc")
+
+    np.testing.assert_allclose(losses, np.zeros((1, 2)), atol=1e-5)
+
+
+def test_ncc_candidate_scoring_prefers_shape_over_amplitude():
+    target = jnp.arange(16, dtype=jnp.float32).reshape(1, 4, 4, 1)
+    correlated = 0.01 * target[..., 0]
+    anticorrelated = -100.0 * target[..., 0]
+    images = jnp.stack([correlated, anticorrelated], axis=1)
+    ctf = jnp.ones((1, 8, 5), dtype=jnp.float32)
+
+    losses = _candidate_reconstruction_losses(
+        images, target, ctf, None, scoring="ncc")
+
+    assert float(losses[0, 0]) < float(losses[0, 1])
 
 
 def test_candidate_coverage_has_finite_direction_gradients():
@@ -161,7 +188,7 @@ def test_train_step_can_return_pose_diagnostics_without_changing_metrics():
 
     loss, metrics, diagnostics, _, _ = train_step_reconsiren(
         graphdef, state, images, labels, {}, jax.random.PRNGKey(8),
-        assignment_mode="hard", uniform_scope="off",
+        assignment_mode="hard", uniform_scope="off", candidate_scoring="ncc",
         train_heterogeneity=False, return_metrics=True,
         return_pose_diagnostics=True)
 

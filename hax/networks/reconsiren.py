@@ -1277,8 +1277,11 @@ class ReconSIREN(nnx.Module):
 
 
 def _candidate_reconstruction_losses(images, targets, ctf, ctf_type,
-                                     normalize_target=True, return_prepared=False):
+                                     normalize_target=True, return_prepared=False,
+                                     scoring="mse", eps=1e-6):
     """Per-particle, per-candidate loss without materialising target copies."""
+    if scoring not in ("mse", "ncc"):
+        raise ValueError("candidate scoring must be 'mse' or 'ncc'")
     target = targets[..., 0] if targets.shape[-1] == 1 else targets
     predicted = images[..., 0] if images.shape[-1] == 1 else images
     n_candidates = predicted.shape[1]
@@ -1302,12 +1305,23 @@ def _candidate_reconstruction_losses(images, targets, ctf, ctf_type,
         predicted = rearrange(predicted, "(b n) w h -> b n w h",
                               b=target.shape[0], n=n_candidates)
 
-    # The legacy path normalized identical target copies independently.  Taking
-    # the same reduction once per particle produces the same mathematical value
-    # and lets broadcasting remain a view throughout the fused subtraction.
-    if normalize_target:
-        target = standard_normalization(target)
-    losses = jnp.mean(jnp.square(predicted - target[:, None, ...]), axis=(-2, -1))
+    if scoring == "ncc":
+        target = target - jnp.mean(target, axis=(-2, -1), keepdims=True)
+        target = target / jnp.maximum(
+            jnp.sqrt(jnp.mean(jnp.square(target), axis=(-2, -1), keepdims=True)), eps)
+        predicted = predicted - jnp.mean(predicted, axis=(-2, -1), keepdims=True)
+        predicted = predicted / jnp.maximum(
+            jnp.sqrt(jnp.mean(jnp.square(predicted), axis=(-2, -1), keepdims=True)), eps)
+        losses = 1.0 - jnp.mean(
+            predicted * target[:, None, ...], axis=(-2, -1))
+    else:
+        # The legacy path normalized identical target copies independently.
+        # Taking the same reduction once per particle produces the same value
+        # and lets broadcasting remain a view throughout the fused subtraction.
+        if normalize_target:
+            target = standard_normalization(target)
+        losses = jnp.mean(
+            jnp.square(predicted - target[:, None, ...]), axis=(-2, -1))
     if return_prepared:
         return losses, predicted, target[:, None, ...]
     return losses
@@ -1408,7 +1422,8 @@ def _gather_candidates(values, indices):
     return values[jnp.arange(values.shape[0])[:, None], indices]
 
 
-def _score_candidates(model, x, values, coords, rotations, shifts, ctf):
+def _score_candidates(model, x, values, coords, rotations, shifts, ctf,
+                      scoring="mse"):
     """Render candidate chunks and retain only their scalar losses."""
     chunk = model.candidate_chunk_size
     n_candidates = rotations.shape[1]
@@ -1416,7 +1431,8 @@ def _score_candidates(model, x, values, coords, rotations, shifts, ctf):
         images = model.phys_decoder(
             x, values, coords, model.xsize, rotations, shifts, ctf,
             model.ctf_type, model.get_std())
-        return _candidate_reconstruction_losses(images, x, ctf, model.ctf_type)
+        return _candidate_reconstruction_losses(
+            images, x, ctf, model.ctf_type, scoring=scoring)
 
     losses = []
     for start in range(0, n_candidates, chunk):
@@ -1424,14 +1440,15 @@ def _score_candidates(model, x, values, coords, rotations, shifts, ctf):
             x, values, coords, model.xsize,
             rotations[:, start:start + chunk], shifts[:, start:start + chunk],
             ctf, model.ctf_type, model.get_std())
-        losses.append(_candidate_reconstruction_losses(images, x, ctf, model.ctf_type))
+        losses.append(_candidate_reconstruction_losses(
+            images, x, ctf, model.ctf_type, scoring=scoring))
     return jnp.concatenate(losses, axis=1)
 
 
 @partial(jax.jit, static_argnames=("use_tau", "assignment_mode", "adaptive_temperature",
                                    "apply_candidate_coverage", "candidate_coverage_bins",
                                    "candidate_bank_samples",
-                                   "uniform_scope",
+                                   "uniform_scope", "candidate_scoring",
                                    "train_pose_volume", "train_heterogeneity", "return_metrics",
                                    "return_pose_diagnostics"),
          donate_argnums=(1,))
@@ -1445,6 +1462,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           candidate_bank_samples=1024,
                           candidate_bank_mix=0.5,
                           uniform_scope="candidates",
+                          candidate_scoring="mse",
                           train_pose_volume=True, train_heterogeneity=True,
                           return_metrics=False, return_pose_diagnostics=False):
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
@@ -1455,6 +1473,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         raise ValueError("assignment_mode must be 'legacy', 'hard' or 'categorical'")
     if uniform_scope not in ("off", "candidates", "winners"):
         raise ValueError("uniform_scope must be 'off', 'candidates' or 'winners'")
+    if candidate_scoring not in ("mse", "ncc"):
+        raise ValueError("candidate_scoring must be 'mse' or 'ncc'")
 
     # Random keys
     key, coverage_key, swd_key, choice_key, distributions_key = jax.random.split(key, 5)
@@ -1512,7 +1532,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                 coarse_ctf, model.ctf_type, jax.lax.stop_gradient(model.get_std()),
                 render_size=screen_size)
             coarse_losses = _candidate_reconstruction_losses(
-                coarse_images, x_screen, coarse_ctf, model.ctf_type)
+                coarse_images, x_screen, coarse_ctf, model.ctf_type,
+                scoring=candidate_scoring)
             _, top_indices = jax.lax.top_k(-coarse_losses, model.coarse_topk)
             rotations_eval = _gather_candidates(rotations, top_indices)
             shifts_eval = _gather_candidates(shifts, top_indices)
@@ -1522,7 +1543,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         # scoring.  Only its selected pose is rerendered into the consensus.
         candidate_losses = _score_candidates(
             model, x, jax.lax.stop_gradient(values), jax.lax.stop_gradient(coords),
-            jax.lax.stop_gradient(rotations_eval), jax.lax.stop_gradient(shifts_eval), ctf)
+            jax.lax.stop_gradient(rotations_eval), jax.lax.stop_gradient(shifts_eval),
+            ctf, scoring=candidate_scoring)
 
         # Candidate responsibilities are used only to pick a single global
         # winner.  Categorical exploration therefore remains safe for volume
@@ -1869,8 +1891,9 @@ def validation_step_reconsiren(graphdef, state, x, labels, md, key):
     return loss
 
 
-@jax.jit
-def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md, key):
+@partial(jax.jit, static_argnames=("candidate_scoring",))
+def predict_angular_assignment_step_reconsiren(
+        graphdef, state, x, labels, md, key, candidate_scoring="mse"):
     model = nnx.merge(graphdef, state)
 
     distributions_key, key = jax.random.split(key, 2)
@@ -1948,12 +1971,15 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md, k
             x_screen, values_screen, coords_screen, model.xsize, rotations, shifts,
             coarse_ctf, model.ctf_type, model.get_std(), render_size=screen_size)
         coarse_losses = _candidate_reconstruction_losses(
-            coarse_images, x_screen, coarse_ctf, model.ctf_type)
+            coarse_images, x_screen, coarse_ctf, model.ctf_type,
+            scoring=candidate_scoring)
         _, top_indices = jax.lax.top_k(-coarse_losses, model.coarse_topk)
         rotations = _gather_candidates(rotations, top_indices)
         shifts = _gather_candidates(shifts, top_indices)
 
-    recon_loss = _score_candidates(model, x, values, coords, rotations, shifts, ctf)
+    recon_loss = _score_candidates(
+        model, x, values, coords, rotations, shifts, ctf,
+        scoring=candidate_scoring)
 
     # Get minimum indices
     min_indices = jnp.argmin(recon_loss, axis=1)
@@ -2080,6 +2106,10 @@ def main():
                              "The legacy pose profile retains its historical candidate SWD regardless.")
     parser.add_argument("--pose_uniform_weight", type=float, default=0.01,
                         help="Angular coverage weight; 0 disables it.")
+    parser.add_argument("--candidate_scoring", choices=("mse", "ncc"), default="mse",
+                        help="Loss used only to rank pose candidates after stochastic exploration. "
+                             "ncc removes per-projection offset and scale; the selected winner still "
+                             "uses the legacy MSE to train pose and volume. Default: mse.")
     parser.add_argument("--pose_diagnostics", action="store_true",
                         help="Track per-particle winner rotations and top-two loss margins. Adds a small "
                              "device-to-host transfer per batch but does not affect training.")
@@ -2509,7 +2539,8 @@ def main():
                                     (x_latent, labels_latent) = next(iter_data_loader_train)
                                     _, _, latent = predict_angular_assignment_step_reconsiren(
                                         graphdef_aux, state_aux, x_latent, labels_latent,
-                                        md_columns, rng)
+                                        md_columns, rng,
+                                        candidate_scoring=args.candidate_scoring)
                                     latents.append(np.array(latent))
                                 latents = np.concatenate(latents, axis=0)
                                 n_clusters = int(min(10, latents.shape[0]))
@@ -2534,9 +2565,11 @@ def main():
                     if total_steps <= 1500:
                         tau = 1e-3
                         use_tau = True
+                        active_candidate_scoring = "mse"
                     else:
                         tau = 0.0
                         use_tau = False
+                        active_candidate_scoring = args.candidate_scoring
                     assignment_mode = "legacy"
                     adaptive_temperature = False
                     uniform_scope = "candidates"
@@ -2551,9 +2584,11 @@ def main():
                         tau = (args.pose_temperature_start
                                * (args.pose_temperature_end / args.pose_temperature_start) ** progress)
                         assignment_mode = args.pose_assignment
+                        active_candidate_scoring = "mse"
                     else:
                         tau = args.pose_temperature_end
                         assignment_mode = "hard"
+                        active_candidate_scoring = args.candidate_scoring
                     use_tau = False
                     adaptive_temperature = not args.pose_absolute_temperature
                     uniform_scope = args.pose_uniform_scope
@@ -2582,6 +2617,7 @@ def main():
                     candidate_bank_samples=args.candidate_bank_samples,
                     candidate_bank_mix=args.candidate_bank_mix,
                     uniform_scope=uniform_scope,
+                    candidate_scoring=active_candidate_scoring,
                     train_pose_volume=train_pose_volume,
                     train_heterogeneity=train_heterogeneity,
                     return_metrics=True,
@@ -2651,7 +2687,9 @@ def main():
                                         "candidate_coverage_kl": float(total_candidate_coverage_loss) / step,
                                         "mean_anchor_deviation_degrees": float(total_anchor_deviation) / step,
                                         "temperature": float(tau),
-                                        "candidate_coverage_weight": float(candidate_coverage_weight)},
+                                        "candidate_coverage_weight": float(candidate_coverage_weight),
+                                        "candidate_scoring_ncc": float(
+                                            active_candidate_scoring == "ncc")},
                                        i * steps_per_epoch + step)
 
                     if pose_diagnostics_tracker is not None:
@@ -2785,7 +2823,9 @@ def main():
         md_pred = generator.md
         latents = []
         for (x, labels) in pbar:
-            rotations, shifts, latent = predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md_columns, rng)
+            rotations, shifts, latent = predict_angular_assignment_step_reconsiren(
+                graphdef, state, x, labels, md_columns, rng,
+                candidate_scoring=args.candidate_scoring)
 
             # Convert rotation to Euler angles in Xmipp format
             euler_angles = xmippEulerFromMatrix(rotations)
