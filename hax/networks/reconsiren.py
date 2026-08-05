@@ -194,6 +194,119 @@ def _assignment_probabilities(losses, temperature, adaptive=True, eps=1e-6):
     return jax.nn.softmax(-centered / temperature, axis=1)
 
 
+def _top_two_candidate_diagnostics(losses, eps=1e-8):
+    """Return scale-aware confidence diagnostics for candidate competition."""
+    if losses.shape[1] < 2:
+        best_indices = jnp.zeros(losses.shape[0], dtype=jnp.int32)
+        zeros = jnp.zeros(losses.shape[0], dtype=losses.dtype)
+        return best_indices, zeros, zeros
+
+    negative_top_two, top_two_indices = jax.lax.top_k(-losses, 2)
+    best_losses = -negative_top_two[:, 0]
+    second_losses = -negative_top_two[:, 1]
+    absolute_margin = jnp.maximum(second_losses - best_losses, 0.0)
+    # Fraction by which the best candidate improves over the runner-up.  This
+    # remains interpretable when the absolute reconstruction-loss scale drifts.
+    relative_margin = absolute_margin / jnp.maximum(jnp.abs(second_losses), eps)
+    return top_two_indices[:, 0], absolute_margin, relative_margin
+
+
+def _symmetry_aware_rotation_change_degrees(previous, current, symmetries):
+    """Minimum SO(3) geodesic change over equivalent symmetry operations."""
+    previous = np.asarray(previous)
+    current = np.asarray(current)
+    symmetries = np.asarray(symmetries)
+    equivalent_previous = np.einsum("sji,njk->nsik", symmetries, previous)
+    relative = np.einsum("nji,nsjk->nsik", current, equivalent_previous)
+    cosine = np.clip((np.trace(relative, axis1=-2, axis2=-1) - 1.0) * 0.5,
+                     -1.0, 1.0)
+    return np.rad2deg(np.min(np.arccos(cosine), axis=1))
+
+
+class _PoseDiagnosticsTracker:
+    """Host-side per-particle history used only by opt-in diagnostics."""
+
+    def __init__(self, n_particles, symmetries):
+        self.symmetries = np.asarray(symmetries)
+        self.previous_rotations = np.zeros((n_particles, 3, 3), dtype=np.float32)
+        self.previous_heads = np.full(n_particles, -1, dtype=np.int32)
+        self.previous_epochs = np.full(n_particles, -1, dtype=np.int32)
+        self.epoch = None
+        self._reset_epoch()
+
+    def _reset_epoch(self):
+        self.absolute_margins = []
+        self.relative_margins = []
+        self.selected_is_top1 = []
+        self.pose_changes = []
+        self.head_switches = []
+        self.comparable_count = 0
+        self.observed_count = 0
+
+    def update(self, labels, rotations, selected_heads, best_heads,
+               absolute_margins, relative_margins, epoch):
+        if self.epoch != epoch:
+            self.epoch = epoch
+            self._reset_epoch()
+
+        labels = np.asarray(labels, dtype=np.int64)
+        rotations = np.asarray(rotations)
+        selected_heads = np.asarray(selected_heads, dtype=np.int32)
+        best_heads = np.asarray(best_heads, dtype=np.int32)
+        self.absolute_margins.append(np.asarray(absolute_margins))
+        self.relative_margins.append(np.asarray(relative_margins))
+        self.selected_is_top1.append(selected_heads == best_heads)
+        self.observed_count += labels.size
+
+        # Compare only consecutive epochs.  This prevents a particle omitted by
+        # a dropped final batch from contributing a multi-epoch change.
+        comparable = self.previous_epochs[labels] == epoch - 1
+        if np.any(comparable):
+            comparable_labels = labels[comparable]
+            changes = _symmetry_aware_rotation_change_degrees(
+                self.previous_rotations[comparable_labels], rotations[comparable],
+                self.symmetries)
+            self.pose_changes.append(changes)
+            self.head_switches.append(
+                self.previous_heads[comparable_labels] != selected_heads[comparable])
+            self.comparable_count += comparable_labels.size
+
+        self.previous_rotations[labels] = rotations
+        self.previous_heads[labels] = selected_heads
+        self.previous_epochs[labels] = epoch
+
+    def summary(self):
+        absolute = np.concatenate(self.absolute_margins)
+        relative = np.concatenate(self.relative_margins)
+        selected_is_top1 = np.concatenate(self.selected_is_top1)
+        summary = {
+            "absolute_margin_mean": float(np.mean(absolute)),
+            "relative_margin_mean": float(np.mean(relative)),
+            "relative_margin_median": float(np.median(relative)),
+            "relative_margin_p10": float(np.percentile(relative, 10.0)),
+            "relative_margin_below_1pct": float(np.mean(relative < 0.01)),
+            "relative_margin_below_5pct": float(np.mean(relative < 0.05)),
+            "relative_margin_below_10pct": float(np.mean(relative < 0.10)),
+            "selected_is_top1_fraction": float(np.mean(selected_is_top1)),
+            "comparison_coverage_fraction": (
+                float(self.comparable_count / self.observed_count)
+                if self.observed_count else 0.0),
+        }
+        if self.pose_changes:
+            changes = np.concatenate(self.pose_changes)
+            switches = np.concatenate(self.head_switches)
+            summary.update({
+                "pose_change_mean_degrees": float(np.mean(changes)),
+                "pose_change_median_degrees": float(np.median(changes)),
+                "pose_change_p90_degrees": float(np.percentile(changes, 90.0)),
+                "pose_change_over_5deg_fraction": float(np.mean(changes > 5.0)),
+                "pose_change_over_15deg_fraction": float(np.mean(changes > 15.0)),
+                "pose_change_over_30deg_fraction": float(np.mean(changes > 30.0)),
+                "head_switch_fraction": float(np.mean(switches)),
+            })
+        return summary
+
+
 def _rotation_matrices_from_rotvec(rotation_vectors):
     """Differentiable Rodrigues map for arrays ending in a 3-D rotation vector."""
     wx, wy, wz = [rotation_vectors[..., i] for i in range(3)]
@@ -1279,7 +1392,8 @@ def _score_candidates(model, x, values, coords, rotations, shifts, ctf):
                                    "apply_candidate_coverage", "candidate_coverage_bins",
                                    "candidate_bank_samples",
                                    "uniform_scope",
-                                   "train_pose_volume", "train_heterogeneity", "return_metrics"),
+                                   "train_pose_volume", "train_heterogeneity", "return_metrics",
+                                   "return_pose_diagnostics"),
          donate_argnums=(1,))
 def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           use_tau=False, lambda_uniform=0.1,
@@ -1292,7 +1406,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           candidate_bank_mix=0.5,
                           uniform_scope="candidates",
                           train_pose_volume=True, train_heterogeneity=True,
-                          return_metrics=False):
+                          return_metrics=False, return_pose_diagnostics=False):
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
 
     if assignment_mode == "legacy":
@@ -1339,6 +1453,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         # Coarse-to-fine screening is disabled during stochastic exploration so
         # the categorical distribution remains exactly the legacy one.
         rotations_eval, shifts_eval = rotations, shifts
+        candidate_head_indices = jnp.broadcast_to(
+            jnp.arange(rotations.shape[1], dtype=jnp.int32), rotations.shape[:2])
         if assignment_mode == "hard" and model.coarse_topk < rotations.shape[1]:
             screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
             x_screen = jax.image.resize(
@@ -1360,6 +1476,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             _, top_indices = jax.lax.top_k(-coarse_losses, model.coarse_topk)
             rotations_eval = _gather_candidates(rotations, top_indices)
             shifts_eval = _gather_candidates(shifts, top_indices)
+            candidate_head_indices = top_indices
 
         # The global competition never carries gradients through candidate
         # scoring.  Only its selected pose is rerendered into the consensus.
@@ -1380,8 +1497,14 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             min_indices = jax.random.categorical(
                 key, jnp.log(jnp.maximum(responsibilities, 1e-12)), axis=-1)
 
-        rotations_selected = rotations_eval[jnp.arange(x.shape[0]), min_indices][:, None, ...]
-        shifts_selected = shifts_eval[jnp.arange(x.shape[0]), min_indices][:, None, ...]
+        best_indices, absolute_margin, relative_margin = _top_two_candidate_diagnostics(
+            candidate_losses)
+        batch_indices = jnp.arange(x.shape[0])
+        selected_head_indices = candidate_head_indices[batch_indices, min_indices]
+        best_head_indices = candidate_head_indices[batch_indices, best_indices]
+
+        rotations_selected = rotations_eval[batch_indices, min_indices][:, None, ...]
+        shifts_selected = shifts_eval[batch_indices, min_indices][:, None, ...]
         if train_pose_volume:
             selected_images = model.phys_decoder(
                 x, values, coords, model.xsize, rotations_selected, shifts_selected,
@@ -1389,7 +1512,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             recon_loss = _candidate_reconstruction_losses(
                 selected_images, x, ctf, model.ctf_type).mean()
         else:
-            recon_loss = candidate_losses[jnp.arange(x.shape[0]), min_indices].mean()
+            recon_loss = candidate_losses[batch_indices, min_indices].mean()
 
         min_indices_het = jnp.argmin(candidate_losses, axis=1)
         rotations_het = rotations_eval[jnp.arange(x.shape[0]), min_indices_het, :][:, None, ...]
@@ -1480,7 +1603,11 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                    candidate_coverage_loss, normalized_entropy, anchor_deviation,
                    variance_loss, covariance_loss, latent_std,
                    coordinate_rms, amplitude_rms)
-        return loss, (metrics, candidate_directions, winner_directions, latent)
+        pose_diagnostics = tuple(jax.lax.stop_gradient(value) for value in (
+            rotations_selected[:, 0], selected_head_indices, best_head_indices,
+            absolute_margin, relative_margin))
+        return loss, (metrics, candidate_directions, winner_directions, latent,
+                      pose_diagnostics)
 
     # Optimizer parameters
     params_pose = nnx.All(nnx.Param, nnx.PathContains('encoder_pose'))
@@ -1528,7 +1655,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
     grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, (params_pose, params_volume, params_het)), has_aux=True)
-    (loss, (metrics, candidate_directions, winner_directions, latent)), grads_combined = grad_fn(model, x)
+    (loss, (metrics, candidate_directions, winner_directions, latent,
+            pose_diagnostics)), grads_combined = grad_fn(model, x)
 
     grads_pose, grads_volume, grads_het = grads_combined.split(params_pose, params_volume, params_het)
 
@@ -1556,6 +1684,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
     state = nnx.state((model, optimizer_pose, optimizer_volume, optimizer_het))
 
     if return_metrics:
+        if return_pose_diagnostics:
+            return loss, metrics, pose_diagnostics, state, key
         return loss, metrics, state, key
     return loss, metrics[0], state, key
 
@@ -1878,6 +2008,9 @@ def main():
                              "The legacy pose profile retains its historical candidate SWD regardless.")
     parser.add_argument("--pose_uniform_weight", type=float, default=0.01,
                         help="Angular coverage weight; 0 disables it.")
+    parser.add_argument("--pose_diagnostics", action="store_true",
+                        help="Track per-particle winner rotations and top-two loss margins. Adds a small "
+                             "device-to-host transfer per batch but does not affect training.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Optional reproducible seed for Gaussian-cloud and network initialization.")
     parser.add_argument("--heterogeneity_profile", choices=("legacy", "anti_collapse"),
@@ -2186,6 +2319,9 @@ def main():
         heterogeneity_profile = reconsiren.heterogeneity_profile
         het_start_epoch = reconsiren.het_start_epoch
         het_freeze_consensus = reconsiren.het_freeze_consensus
+        pose_diagnostics_tracker = (
+            _PoseDiagnosticsTracker(len(generator.md), reconsiren.symmetry_matrices)
+            if args.pose_diagnostics else None)
         graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_volume, optimizer_het))
 
         # Resume if checkpoint exists
@@ -2355,7 +2491,7 @@ def main():
                 train_pose_volume = not (
                     heterogeneity_profile == "anti_collapse"
                     and train_heterogeneity and het_freeze_consensus)
-                loss, metrics, state, rng = train_step_reconsiren(
+                train_result = train_step_reconsiren(
                     graphdef, state, x, labels, md_columns, rng,
                     lambda_uniform=uniform_weight, tau=tau, use_tau=use_tau,
                     assignment_mode=assignment_mode,
@@ -2369,7 +2505,17 @@ def main():
                     uniform_scope=uniform_scope,
                     train_pose_volume=train_pose_volume,
                     train_heterogeneity=train_heterogeneity,
-                    return_metrics=True)
+                    return_metrics=True,
+                    return_pose_diagnostics=args.pose_diagnostics)
+                if args.pose_diagnostics:
+                    loss, metrics, pose_diagnostics, state, rng = train_result
+                    (winner_rotations, selected_heads, best_heads,
+                     absolute_margins, relative_margins) = pose_diagnostics
+                    pose_diagnostics_tracker.update(
+                        labels, winner_rotations, selected_heads, best_heads,
+                        absolute_margins, relative_margins, epoch_index)
+                else:
+                    loss, metrics, state, rng = train_result
                 (recon_loss, recon_het_loss, loss_uniform, candidate_coverage_loss,
                  assignment_entropy, anchor_deviation, variance_loss,
                  covariance_loss, latent_std, coordinate_rms, amplitude_rms) = metrics
@@ -2415,6 +2561,38 @@ def main():
                                         "temperature": float(tau),
                                         "candidate_coverage_weight": float(candidate_coverage_weight)},
                                        i * steps_per_epoch + step)
+
+                    if pose_diagnostics_tracker is not None:
+                        pose_summary = pose_diagnostics_tracker.summary()
+                        writer.add_scalars(
+                            'Winner loss confidence (ReconSIREN)',
+                            {"relative_margin_mean": pose_summary["relative_margin_mean"],
+                             "relative_margin_median": pose_summary["relative_margin_median"],
+                             "relative_margin_p10": pose_summary["relative_margin_p10"],
+                             "ambiguous_below_1pct": pose_summary["relative_margin_below_1pct"],
+                             "ambiguous_below_5pct": pose_summary["relative_margin_below_5pct"],
+                             "ambiguous_below_10pct": pose_summary["relative_margin_below_10pct"],
+                             "selected_is_top1_fraction": pose_summary["selected_is_top1_fraction"]},
+                            i * steps_per_epoch + step)
+                        writer.add_scalar(
+                            'Winner top1-top2 absolute loss margin (ReconSIREN)',
+                            pose_summary["absolute_margin_mean"],
+                            i * steps_per_epoch + step)
+                        if "pose_change_mean_degrees" in pose_summary:
+                            writer.add_scalars(
+                                'Winner pose change degrees (ReconSIREN)',
+                                {"mean": pose_summary["pose_change_mean_degrees"],
+                                 "median": pose_summary["pose_change_median_degrees"],
+                                 "p90": pose_summary["pose_change_p90_degrees"]},
+                                i * steps_per_epoch + step)
+                            writer.add_scalars(
+                                'Winner instability fractions (ReconSIREN)',
+                                {"pose_change_over_5deg": pose_summary["pose_change_over_5deg_fraction"],
+                                 "pose_change_over_15deg": pose_summary["pose_change_over_15deg_fraction"],
+                                 "pose_change_over_30deg": pose_summary["pose_change_over_30deg_fraction"],
+                                 "head_switch": pose_summary["head_switch_fraction"],
+                                 "comparison_coverage": pose_summary["comparison_coverage_fraction"]},
+                                i * steps_per_epoch + step)
 
                     # Progress bar update  (TQDM)
                     stage = "joint" if train_pose_volume and train_heterogeneity else (

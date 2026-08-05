@@ -1,13 +1,20 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
+from flax import nnx
 
 from hax.networks.reconsiren import (
+    _PoseDiagnosticsTracker,
+    ReconSIREN,
     _assignment_probabilities,
     _bound_candidate_view_directions,
     _candidate_coverage_loss,
     _fibonacci_sphere_directions,
     _rotation_matrices_from_rotvec,
+    _symmetry_aware_rotation_change_degrees,
+    _top_two_candidate_diagnostics,
+    train_step_reconsiren,
 )
 
 
@@ -70,3 +77,81 @@ def test_candidate_view_direction_is_bounded_and_rotation_stays_valid():
         bounded @ jnp.swapaxes(bounded, -1, -2),
         jnp.broadcast_to(jnp.eye(3), bounded.shape), rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(jnp.linalg.det(bounded), 1.0, rtol=1e-5, atol=1e-5)
+
+
+def test_top_two_candidate_diagnostics_report_scale_aware_margin():
+    losses = jnp.array([[0.2, 0.5, 0.8], [3.0, 1.0, 2.0]], dtype=jnp.float32)
+    best, absolute, relative = _top_two_candidate_diagnostics(losses)
+
+    np.testing.assert_array_equal(best, np.array([0, 1]))
+    np.testing.assert_allclose(absolute, np.array([0.3, 1.0]), atol=1e-6)
+    np.testing.assert_allclose(relative, np.array([0.6, 0.5]), atol=1e-6)
+
+
+def test_rotation_change_uses_closest_symmetry_equivalent_pose():
+    identity = np.eye(3, dtype=np.float32)
+    half_turn_z = np.diag([-1.0, -1.0, 1.0]).astype(np.float32)
+    symmetries = np.stack([identity, half_turn_z])
+    previous = identity[None, ...]
+    equivalent_current = half_turn_z[None, ...]
+
+    change = _symmetry_aware_rotation_change_degrees(
+        previous, equivalent_current, symmetries)
+
+    np.testing.assert_allclose(change, 0.0, atol=1e-4)
+
+
+def test_pose_diagnostics_tracker_compares_same_particles_across_epochs():
+    identity = np.eye(3, dtype=np.float32)
+    tracker = _PoseDiagnosticsTracker(2, identity[None, ...])
+    labels = np.array([0, 1])
+    rotations_epoch_zero = np.stack([identity, identity])
+    tracker.update(labels, rotations_epoch_zero, np.array([0, 1]), np.array([0, 1]),
+                   np.array([0.2, 0.3]), np.array([0.1, 0.2]), epoch=0)
+
+    ten_degrees = np.asarray(_rotation_matrices_from_rotvec(
+        jnp.deg2rad(jnp.array([[10.0, 0.0, 0.0]]))))[0]
+    rotations_epoch_one = np.stack([ten_degrees, identity])
+    tracker.update(labels, rotations_epoch_one, np.array([2, 1]), np.array([2, 1]),
+                   np.array([0.4, 0.5]), np.array([0.3, 0.4]), epoch=1)
+    summary = tracker.summary()
+
+    np.testing.assert_allclose(summary["pose_change_mean_degrees"], 5.0, atol=1e-3)
+    np.testing.assert_allclose(summary["head_switch_fraction"], 0.5, atol=1e-6)
+    np.testing.assert_allclose(summary["comparison_coverage_fraction"], 1.0, atol=1e-6)
+
+
+def test_train_step_can_return_pose_diagnostics_without_changing_metrics():
+    model = ReconSIREN(
+        coords=jnp.zeros((4, 3)), values=jnp.full((4,), 0.01),
+        xsize=16, sr=1.0, bank_size=32, ctf_type=None,
+        num_components=3, optimization_profile="aggressive",
+        pose_head_rank=2, pose_spatial_pool=4, consensus_parameterization="direct",
+        render_chunk_size=0, candidate_chunk_size=0, coarse_topk=3,
+        coarse_gaussians=0, heterogeneity_profile="legacy",
+        rngs=nnx.Rngs(3))
+    pose_params = nnx.All(nnx.Param, nnx.PathContains("encoder_pose"))
+    volume_params = nnx.All(nnx.Param, nnx.PathContains("delta_volume_decoder"))
+    het_params = nnx.All(
+        nnx.Param,
+        (nnx.PathContains("encoder_het"), nnx.PathContains("delta_het_decoder")))
+    optimizers = (
+        nnx.Optimizer(model, optax.adam(1e-4), wrt=pose_params),
+        nnx.Optimizer(model, optax.adam(1e-4), wrt=volume_params),
+        nnx.Optimizer(model, optax.adam(1e-4), wrt=het_params),
+    )
+    graphdef, state = nnx.split((model, *optimizers))
+    images = jax.random.normal(jax.random.PRNGKey(7), (2, 16, 16, 1))
+    labels = jnp.array([0, 1])
+
+    loss, metrics, diagnostics, _, _ = train_step_reconsiren(
+        graphdef, state, images, labels, {}, jax.random.PRNGKey(8),
+        assignment_mode="hard", uniform_scope="off",
+        train_heterogeneity=False, return_metrics=True,
+        return_pose_diagnostics=True)
+
+    assert np.isfinite(float(loss))
+    assert len(metrics) == 11
+    winner_rotations, selected_heads, best_heads, absolute, relative = diagnostics
+    assert winner_rotations.shape == (2, 3, 3)
+    assert selected_heads.shape == best_heads.shape == absolute.shape == relative.shape == (2,)
