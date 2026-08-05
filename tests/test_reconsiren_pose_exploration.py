@@ -81,11 +81,22 @@ def test_candidate_view_direction_is_bounded_and_rotation_stays_valid():
 
 def test_top_two_candidate_diagnostics_report_scale_aware_margin():
     losses = jnp.array([[0.2, 0.5, 0.8], [3.0, 1.0, 2.0]], dtype=jnp.float32)
-    best, absolute, relative = _top_two_candidate_diagnostics(losses)
+    (best, absolute, relative, standardized,
+     median_normalized, score_entropy) = _top_two_candidate_diagnostics(losses)
 
     np.testing.assert_array_equal(best, np.array([0, 1]))
     np.testing.assert_allclose(absolute, np.array([0.3, 1.0]), atol=1e-6)
     np.testing.assert_allclose(relative, np.array([0.6, 0.5]), atol=1e-6)
+    np.testing.assert_allclose(
+        standardized, np.array([1.2247449, 1.2247449]), atol=1e-6)
+    np.testing.assert_allclose(median_normalized, np.ones(2), atol=1e-6)
+    assert np.all(np.asarray(score_entropy) > 0.0)
+    assert np.all(np.asarray(score_entropy) < 1.0)
+
+    shifted_scaled = _top_two_candidate_diagnostics(19.0 * losses + 100.0)
+    np.testing.assert_allclose(shifted_scaled[3], standardized, atol=1e-5)
+    np.testing.assert_allclose(shifted_scaled[4], median_normalized, atol=1e-5)
+    np.testing.assert_allclose(shifted_scaled[5], score_entropy, atol=1e-5)
 
 
 def test_rotation_change_uses_closest_symmetry_equivalent_pose():
@@ -107,13 +118,17 @@ def test_pose_diagnostics_tracker_compares_same_particles_across_epochs():
     labels = np.array([0, 1])
     rotations_epoch_zero = np.stack([identity, identity])
     tracker.update(labels, rotations_epoch_zero, np.array([0, 1]), np.array([0, 1]),
-                   np.array([0.2, 0.3]), np.array([0.1, 0.2]), epoch=0)
+                   np.array([0.2, 0.3]), np.array([0.1, 0.2]),
+                   np.array([0.5, 0.6]), np.array([0.7, 0.8]),
+                   np.array([0.9, 0.85]), epoch=0)
 
     ten_degrees = np.asarray(_rotation_matrices_from_rotvec(
         jnp.deg2rad(jnp.array([[10.0, 0.0, 0.0]]))))[0]
     rotations_epoch_one = np.stack([ten_degrees, identity])
     tracker.update(labels, rotations_epoch_one, np.array([2, 1]), np.array([2, 1]),
-                   np.array([0.4, 0.5]), np.array([0.3, 0.4]), epoch=1)
+                   np.array([0.4, 0.5]), np.array([0.3, 0.4]),
+                   np.array([0.7, 0.8]), np.array([0.9, 1.0]),
+                   np.array([0.8, 0.75]), epoch=1)
     summary = tracker.summary()
 
     np.testing.assert_allclose(summary["pose_change_mean_degrees"], 5.0, atol=1e-3)
@@ -151,7 +166,12 @@ def test_train_step_can_return_pose_diagnostics_without_changing_metrics():
         return_pose_diagnostics=True)
 
     assert np.isfinite(float(loss))
-    assert len(metrics) == 11
-    winner_rotations, selected_heads, best_heads, absolute, relative = diagnostics
+    assert len(metrics) == 17
+    assert np.all(np.isfinite(np.asarray(metrics)))
+    np.testing.assert_allclose(metrics[12], 1.0, atol=1e-5)
+    assert 0.0 <= float(metrics[16]) <= 1.0
+    (winner_rotations, selected_heads, best_heads, absolute, relative,
+     standardized, median_normalized, score_entropy) = diagnostics
     assert winner_rotations.shape == (2, 3, 3)
-    assert selected_heads.shape == best_heads.shape == absolute.shape == relative.shape == (2,)
+    assert (selected_heads.shape == best_heads.shape == absolute.shape == relative.shape
+            == standardized.shape == median_normalized.shape == score_entropy.shape == (2,))

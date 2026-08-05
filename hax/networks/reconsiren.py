@@ -195,20 +195,37 @@ def _assignment_probabilities(losses, temperature, adaptive=True, eps=1e-6):
 
 
 def _top_two_candidate_diagnostics(losses, eps=1e-8):
-    """Return scale-aware confidence diagnostics for candidate competition."""
+    """Return complementary confidence diagnostics for candidate competition."""
     if losses.shape[1] < 2:
         best_indices = jnp.zeros(losses.shape[0], dtype=jnp.int32)
         zeros = jnp.zeros(losses.shape[0], dtype=losses.dtype)
-        return best_indices, zeros, zeros
+        return best_indices, zeros, zeros, zeros, zeros, zeros
 
     negative_top_two, top_two_indices = jax.lax.top_k(-losses, 2)
     best_losses = -negative_top_two[:, 0]
     second_losses = -negative_top_two[:, 1]
     absolute_margin = jnp.maximum(second_losses - best_losses, 0.0)
-    # Fraction by which the best candidate improves over the runner-up.  This
-    # remains interpretable when the absolute reconstruction-loss scale drifts.
+    # Historical fraction by which the best candidate improves over the
+    # runner-up.  It is retained for continuity but includes any common loss
+    # baseline, unlike the standardized diagnostics below.
     relative_margin = absolute_margin / jnp.maximum(jnp.abs(second_losses), eps)
-    return top_two_indices[:, 0], absolute_margin, relative_margin
+    candidate_scale = jnp.std(losses, axis=1)
+    standardized_margin = absolute_margin / jnp.maximum(candidate_scale, eps)
+    median_losses = jnp.median(losses, axis=1)
+    median_separation = jnp.maximum(median_losses - best_losses, 0.0)
+    median_normalized_margin = absolute_margin / jnp.maximum(median_separation, eps)
+
+    # Unlike assignment entropy, this remains informative after switching to
+    # hard winners because it is always derived from the full loss landscape.
+    centered_losses = losses - best_losses[:, None]
+    score_probabilities = jax.nn.softmax(
+        -centered_losses / jnp.maximum(candidate_scale[:, None], eps), axis=1)
+    score_entropy = -jnp.sum(
+        score_probabilities * jnp.log(jnp.maximum(score_probabilities, eps)), axis=1)
+    score_entropy = score_entropy / jnp.maximum(
+        jnp.log(jnp.asarray(losses.shape[1], dtype=losses.dtype)), eps)
+    return (top_two_indices[:, 0], absolute_margin, relative_margin,
+            standardized_margin, median_normalized_margin, score_entropy)
 
 
 def _symmetry_aware_rotation_change_degrees(previous, current, symmetries):
@@ -237,6 +254,9 @@ class _PoseDiagnosticsTracker:
     def _reset_epoch(self):
         self.absolute_margins = []
         self.relative_margins = []
+        self.standardized_margins = []
+        self.median_normalized_margins = []
+        self.score_entropies = []
         self.selected_is_top1 = []
         self.pose_changes = []
         self.head_switches = []
@@ -244,7 +264,8 @@ class _PoseDiagnosticsTracker:
         self.observed_count = 0
 
     def update(self, labels, rotations, selected_heads, best_heads,
-               absolute_margins, relative_margins, epoch):
+               absolute_margins, relative_margins, standardized_margins,
+               median_normalized_margins, score_entropies, epoch):
         if self.epoch != epoch:
             self.epoch = epoch
             self._reset_epoch()
@@ -255,6 +276,9 @@ class _PoseDiagnosticsTracker:
         best_heads = np.asarray(best_heads, dtype=np.int32)
         self.absolute_margins.append(np.asarray(absolute_margins))
         self.relative_margins.append(np.asarray(relative_margins))
+        self.standardized_margins.append(np.asarray(standardized_margins))
+        self.median_normalized_margins.append(np.asarray(median_normalized_margins))
+        self.score_entropies.append(np.asarray(score_entropies))
         self.selected_is_top1.append(selected_heads == best_heads)
         self.observed_count += labels.size
 
@@ -278,6 +302,9 @@ class _PoseDiagnosticsTracker:
     def summary(self):
         absolute = np.concatenate(self.absolute_margins)
         relative = np.concatenate(self.relative_margins)
+        standardized = np.concatenate(self.standardized_margins)
+        median_normalized = np.concatenate(self.median_normalized_margins)
+        score_entropy = np.concatenate(self.score_entropies)
         selected_is_top1 = np.concatenate(self.selected_is_top1)
         summary = {
             "absolute_margin_mean": float(np.mean(absolute)),
@@ -287,6 +314,15 @@ class _PoseDiagnosticsTracker:
             "relative_margin_below_1pct": float(np.mean(relative < 0.01)),
             "relative_margin_below_5pct": float(np.mean(relative < 0.05)),
             "relative_margin_below_10pct": float(np.mean(relative < 0.10)),
+            "standardized_margin_mean": float(np.mean(standardized)),
+            "standardized_margin_median": float(np.median(standardized)),
+            "standardized_margin_p10": float(np.percentile(standardized, 10.0)),
+            "standardized_margin_below_0_1": float(np.mean(standardized < 0.1)),
+            "standardized_margin_below_0_25": float(np.mean(standardized < 0.25)),
+            "standardized_margin_below_0_5": float(np.mean(standardized < 0.5)),
+            "median_normalized_margin_mean": float(np.mean(median_normalized)),
+            "median_normalized_margin_median": float(np.median(median_normalized)),
+            "candidate_score_entropy_mean": float(np.mean(score_entropy)),
             "selected_is_top1_fraction": float(np.mean(selected_is_top1)),
             "comparison_coverage_fraction": (
                 float(self.comparable_count / self.observed_count)
@@ -1240,7 +1276,8 @@ class ReconSIREN(nnx.Module):
         return vol
 
 
-def _candidate_reconstruction_losses(images, targets, ctf, ctf_type, normalize_target=True):
+def _candidate_reconstruction_losses(images, targets, ctf, ctf_type,
+                                     normalize_target=True, return_prepared=False):
     """Per-particle, per-candidate loss without materialising target copies."""
     target = targets[..., 0] if targets.shape[-1] == 1 else targets
     predicted = images[..., 0] if images.shape[-1] == 1 else images
@@ -1270,7 +1307,10 @@ def _candidate_reconstruction_losses(images, targets, ctf, ctf_type, normalize_t
     # and lets broadcasting remain a view throughout the fused subtraction.
     if normalize_target:
         target = standard_normalization(target)
-    return jnp.mean(jnp.square(predicted - target[:, None, ...]), axis=(-2, -1))
+    losses = jnp.mean(jnp.square(predicted - target[:, None, ...]), axis=(-2, -1))
+    if return_prepared:
+        return losses, predicted, target[:, None, ...]
+    return losses
 
 
 def _prepare_heterogeneity_images(images, targets, ctf, ctf_type, normalize_target):
@@ -1497,22 +1537,50 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             min_indices = jax.random.categorical(
                 key, jnp.log(jnp.maximum(responsibilities, 1e-12)), axis=-1)
 
-        best_indices, absolute_margin, relative_margin = _top_two_candidate_diagnostics(
-            candidate_losses)
+        if return_pose_diagnostics:
+            (best_indices, absolute_margin, relative_margin, standardized_margin,
+             median_normalized_margin, candidate_score_entropy) = (
+                _top_two_candidate_diagnostics(candidate_losses))
+        else:
+            best_indices = jnp.argmin(candidate_losses, axis=1)
+            diagnostic_zeros = jnp.zeros(candidate_losses.shape[0], dtype=x.dtype)
+            (absolute_margin, relative_margin, standardized_margin,
+             median_normalized_margin, candidate_score_entropy) = (diagnostic_zeros,) * 5
         batch_indices = jnp.arange(x.shape[0])
         selected_head_indices = candidate_head_indices[batch_indices, min_indices]
         best_head_indices = candidate_head_indices[batch_indices, best_indices]
 
         rotations_selected = rotations_eval[batch_indices, min_indices][:, None, ...]
         shifts_selected = shifts_eval[batch_indices, min_indices][:, None, ...]
+        projection_rms = jnp.asarray(0.0, dtype=x.dtype)
+        normalized_target_rms = jnp.asarray(0.0, dtype=x.dtype)
         if train_pose_volume:
             selected_images = model.phys_decoder(
                 x, values, coords, model.xsize, rotations_selected, shifts_selected,
                 ctf, model.ctf_type, model.get_std())
-            recon_loss = _candidate_reconstruction_losses(
-                selected_images, x, ctf, model.ctf_type).mean()
+            if return_pose_diagnostics:
+                selected_losses, selected_predicted, selected_target = (
+                    _candidate_reconstruction_losses(
+                        selected_images, x, ctf, model.ctf_type,
+                        return_prepared=True))
+                recon_loss = selected_losses.mean()
+                projection_rms = jnp.sqrt(jnp.mean(jnp.square(selected_predicted)))
+                normalized_target_rms = jnp.sqrt(jnp.mean(jnp.square(selected_target)))
+            else:
+                recon_loss = _candidate_reconstruction_losses(
+                    selected_images, x, ctf, model.ctf_type).mean()
         else:
             recon_loss = candidate_losses[batch_indices, min_indices].mean()
+
+        consensus_amplitude_mean = jnp.asarray(0.0, dtype=x.dtype)
+        consensus_amplitude_rms = jnp.asarray(0.0, dtype=x.dtype)
+        consensus_amplitude_max = jnp.asarray(0.0, dtype=x.dtype)
+        consensus_active_amplitude_fraction = jnp.asarray(0.0, dtype=x.dtype)
+        if return_pose_diagnostics:
+            consensus_amplitude_mean = jnp.mean(values)
+            consensus_amplitude_rms = jnp.sqrt(jnp.mean(jnp.square(values)))
+            consensus_amplitude_max = jnp.max(values)
+            consensus_active_amplitude_fraction = jnp.mean(values > 1e-8)
 
         min_indices_het = jnp.argmin(candidate_losses, axis=1)
         rotations_het = rotations_eval[jnp.arange(x.shape[0]), min_indices_het, :][:, None, ...]
@@ -1602,10 +1670,14 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         metrics = (recon_loss, recon_het_loss, loss_uniform,
                    candidate_coverage_loss, normalized_entropy, anchor_deviation,
                    variance_loss, covariance_loss, latent_std,
-                   coordinate_rms, amplitude_rms)
+                   coordinate_rms, amplitude_rms, projection_rms,
+                   normalized_target_rms, consensus_amplitude_mean,
+                   consensus_amplitude_rms, consensus_amplitude_max,
+                   consensus_active_amplitude_fraction)
         pose_diagnostics = tuple(jax.lax.stop_gradient(value) for value in (
             rotations_selected[:, 0], selected_head_indices, best_head_indices,
-            absolute_margin, relative_margin))
+            absolute_margin, relative_margin, standardized_margin,
+            median_normalized_margin, candidate_score_entropy))
         return loss, (metrics, candidate_directions, winner_directions, latent,
                       pose_diagnostics)
 
@@ -2366,6 +2438,13 @@ def main():
                     total_latent_std = 0
                     total_coordinate_rms = 0
                     total_amplitude_rms = 0
+                    total_projection_rms = 0
+                    total_normalized_target_rms = 0
+                    total_consensus_amplitude_mean = 0
+                    total_consensus_amplitude_rms = 0
+                    total_consensus_amplitude_max = 0
+                    total_consensus_active_amplitude_fraction = 0
+                    projection_diagnostic_steps = 0
                     total_validation_loss = 0
 
                     # For progress bar (TQDM)
@@ -2510,15 +2589,20 @@ def main():
                 if args.pose_diagnostics:
                     loss, metrics, pose_diagnostics, state, rng = train_result
                     (winner_rotations, selected_heads, best_heads,
-                     absolute_margins, relative_margins) = pose_diagnostics
+                     absolute_margins, relative_margins, standardized_margins,
+                     median_normalized_margins, score_entropies) = pose_diagnostics
                     pose_diagnostics_tracker.update(
                         labels, winner_rotations, selected_heads, best_heads,
-                        absolute_margins, relative_margins, epoch_index)
+                        absolute_margins, relative_margins, standardized_margins,
+                        median_normalized_margins, score_entropies, epoch_index)
                 else:
                     loss, metrics, state, rng = train_result
                 (recon_loss, recon_het_loss, loss_uniform, candidate_coverage_loss,
                  assignment_entropy, anchor_deviation, variance_loss,
-                 covariance_loss, latent_std, coordinate_rms, amplitude_rms) = metrics
+                 covariance_loss, latent_std, coordinate_rms, amplitude_rms,
+                 projection_rms, normalized_target_rms, consensus_amplitude_mean,
+                 consensus_amplitude_rms, consensus_amplitude_max,
+                 consensus_active_amplitude_fraction) = metrics
                 total_loss += loss
                 total_recon_loss += recon_loss
                 total_recon_het_loss += recon_het_loss
@@ -2530,6 +2614,14 @@ def main():
                 total_latent_std += latent_std
                 total_coordinate_rms += coordinate_rms
                 total_amplitude_rms += amplitude_rms
+                total_consensus_amplitude_mean += consensus_amplitude_mean
+                total_consensus_amplitude_rms += consensus_amplitude_rms
+                total_consensus_amplitude_max += consensus_amplitude_max
+                total_consensus_active_amplitude_fraction += consensus_active_amplitude_fraction
+                if train_pose_volume:
+                    total_projection_rms += projection_rms
+                    total_normalized_target_rms += normalized_target_rms
+                    projection_diagnostic_steps += 1
 
                 # Summary writer (training loss)
                 if logger.should_log_scalars(step):
@@ -2565,6 +2657,21 @@ def main():
                     if pose_diagnostics_tracker is not None:
                         pose_summary = pose_diagnostics_tracker.summary()
                         writer.add_scalars(
+                            'Winner standardized confidence (ReconSIREN)',
+                            {"margin_over_candidate_std_mean": pose_summary["standardized_margin_mean"],
+                             "margin_over_candidate_std_median": pose_summary["standardized_margin_median"],
+                             "margin_over_candidate_std_p10": pose_summary["standardized_margin_p10"],
+                             "margin_below_0.1_std": pose_summary["standardized_margin_below_0_1"],
+                             "margin_below_0.25_std": pose_summary["standardized_margin_below_0_25"],
+                             "margin_below_0.5_std": pose_summary["standardized_margin_below_0_5"],
+                             "candidate_score_entropy": pose_summary["candidate_score_entropy_mean"]},
+                            i * steps_per_epoch + step)
+                        writer.add_scalars(
+                            'Winner margin over available separation (ReconSIREN)',
+                            {"mean": pose_summary["median_normalized_margin_mean"],
+                             "median": pose_summary["median_normalized_margin_median"]},
+                            i * steps_per_epoch + step)
+                        writer.add_scalars(
                             'Winner loss confidence (ReconSIREN)',
                             {"relative_margin_mean": pose_summary["relative_margin_mean"],
                              "relative_margin_median": pose_summary["relative_margin_median"],
@@ -2578,6 +2685,25 @@ def main():
                             'Winner top1-top2 absolute loss margin (ReconSIREN)',
                             pose_summary["absolute_margin_mean"],
                             i * steps_per_epoch + step)
+                        writer.add_scalars(
+                            'Consensus Gaussian amplitude scale (ReconSIREN)',
+                            {"mean": float(total_consensus_amplitude_mean) / step,
+                             "rms": float(total_consensus_amplitude_rms) / step,
+                             "max": float(total_consensus_amplitude_max) / step,
+                             "active_fraction": float(total_consensus_active_amplitude_fraction) / step},
+                            i * steps_per_epoch + step)
+                        if projection_diagnostic_steps:
+                            mean_projection_rms = (
+                                float(total_projection_rms) / projection_diagnostic_steps)
+                            mean_target_rms = (
+                                float(total_normalized_target_rms) / projection_diagnostic_steps)
+                            writer.add_scalars(
+                                'Selected projection scale (ReconSIREN)',
+                                {"prediction_rms": mean_projection_rms,
+                                 "normalized_target_rms": mean_target_rms,
+                                 "prediction_to_target_rms": (
+                                     mean_projection_rms / max(mean_target_rms, 1e-8))},
+                                i * steps_per_epoch + step)
                         if "pose_change_mean_degrees" in pose_summary:
                             writer.add_scalars(
                                 'Winner pose change degrees (ReconSIREN)',
