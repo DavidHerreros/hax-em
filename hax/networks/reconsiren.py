@@ -343,6 +343,32 @@ class _PoseDiagnosticsTracker:
         return summary
 
 
+class _TemporalCandidateScoreBank:
+    """Host-side EMA of standardized candidate scores for each particle/head."""
+
+    def __init__(self, n_particles, n_heads):
+        self.scores = np.zeros((n_particles, n_heads), dtype=np.float32)
+        self.valid = np.zeros((n_particles, n_heads), dtype=bool)
+
+    def batch(self, labels):
+        labels = np.asarray(labels, dtype=np.int64)
+        return self.scores[labels], self.valid[labels]
+
+    def update(self, labels, head_indices, current_scores, decay):
+        labels = np.asarray(labels, dtype=np.int64)
+        head_indices = np.asarray(head_indices, dtype=np.int64)
+        current_scores = np.asarray(current_scores, dtype=np.float32)
+        rows = labels[:, None]
+        was_valid = self.valid[rows, head_indices]
+        previous = self.scores[rows, head_indices]
+        updated = np.where(
+            was_valid,
+            decay * previous + (1.0 - decay) * current_scores,
+            current_scores)
+        self.scores[rows, head_indices] = updated
+        self.valid[rows, head_indices] = True
+
+
 def _rotation_matrices_from_rotvec(rotation_vectors):
     """Differentiable Rodrigues map for arrays ending in a 3-D rotation vector."""
     wx, wy, wz = [rotation_vectors[..., i] for i in range(3)]
@@ -1448,6 +1474,28 @@ def _select_candidates_with_head_hysteresis(
             previous_available, contested, challenger_advantage_std)
 
 
+def _standardize_candidate_losses(losses, eps=1e-8):
+    """Express each particle's candidate losses in within-particle std units."""
+    mean = jnp.mean(losses, axis=1, keepdims=True)
+    scale = jnp.maximum(jnp.std(losses, axis=1, keepdims=True), eps)
+    return (losses - mean) / scale
+
+
+def _blend_candidate_scores_with_history(
+        losses, candidate_head_indices, historical_scores,
+        historical_valid, history_weight):
+    """Blend current standardized losses with prior per-head evidence."""
+    current_scores = _standardize_candidate_losses(losses)
+    historical_local = _gather_candidates(historical_scores, candidate_head_indices)
+    valid_local = _gather_candidates(historical_valid, candidate_head_indices)
+    weight = jnp.asarray(history_weight, dtype=losses.dtype)
+    blended_scores = jnp.where(
+        valid_local,
+        (1.0 - weight) * current_scores + weight * historical_local,
+        current_scores)
+    return blended_scores, current_scores, valid_local
+
+
 def _score_candidates(model, x, values, coords, rotations, shifts, ctf,
                       scoring="mse"):
     """Render candidate chunks and retain only their scalar losses."""
@@ -1476,7 +1524,8 @@ def _score_candidates(model, x, values, coords, rotations, shifts, ctf,
                                    "candidate_bank_samples",
                                    "uniform_scope", "candidate_scoring",
                                    "train_pose_volume", "train_heterogeneity", "return_metrics",
-                                   "return_pose_diagnostics", "apply_candidate_hysteresis"),
+                                   "return_pose_diagnostics", "apply_candidate_hysteresis",
+                                   "apply_candidate_temporal_scoring"),
          donate_argnums=(1,))
 def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           use_tau=False, lambda_uniform=0.1,
@@ -1492,6 +1541,10 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           previous_candidate_heads=None,
                           apply_candidate_hysteresis=False,
                           candidate_hysteresis_std=0.25,
+                          historical_candidate_scores=None,
+                          historical_candidate_valid=None,
+                          apply_candidate_temporal_scoring=False,
+                          candidate_temporal_weight=0.5,
                           train_pose_volume=True, train_heterogeneity=True,
                           return_metrics=False, return_pose_diagnostics=False):
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
@@ -1506,6 +1559,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         raise ValueError("candidate_scoring must be 'mse' or 'ncc'")
     if apply_candidate_hysteresis and assignment_mode != "hard":
         raise ValueError("candidate-head hysteresis requires hard assignment")
+    if apply_candidate_temporal_scoring and assignment_mode != "hard":
+        raise ValueError("temporal candidate scoring requires hard assignment")
 
     # Random keys
     key, coverage_key, swd_key, choice_key, distributions_key = jax.random.split(key, 5)
@@ -1584,12 +1639,40 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         hysteresis_accepted_switch_fraction = jnp.asarray(0.0, dtype=x.dtype)
         hysteresis_previous_available_fraction = jnp.asarray(0.0, dtype=x.dtype)
         hysteresis_challenger_advantage_std = jnp.asarray(0.0, dtype=x.dtype)
+        temporal_history_available_fraction = jnp.asarray(0.0, dtype=x.dtype)
+        temporal_selection_changed_fraction = jnp.asarray(0.0, dtype=x.dtype)
+        temporal_current_disadvantage_std = jnp.asarray(0.0, dtype=x.dtype)
+        temporal_score_adjustment = jnp.asarray(0.0, dtype=x.dtype)
+        current_standardized_scores = jnp.zeros_like(candidate_losses)
+        selection_losses = candidate_losses
+        if apply_candidate_temporal_scoring:
+            (selection_losses, current_standardized_scores,
+             temporal_history_valid) = _blend_candidate_scores_with_history(
+                candidate_losses, candidate_head_indices,
+                historical_candidate_scores, historical_candidate_valid,
+                candidate_temporal_weight)
+            current_best_indices = jnp.argmin(candidate_losses, axis=1)
+            temporal_best_indices = jnp.argmin(selection_losses, axis=1)
+            temporal_history_available_fraction = jnp.mean(temporal_history_valid)
+            temporal_selection_changed_fraction = jnp.mean(
+                temporal_best_indices != current_best_indices)
+            batch_indices_temporal = jnp.arange(candidate_losses.shape[0])
+            temporal_current_disadvantage_std = jnp.mean(
+                current_standardized_scores[
+                    batch_indices_temporal, temporal_best_indices]
+                - current_standardized_scores[
+                    batch_indices_temporal, current_best_indices])
+            temporal_score_adjustment = jnp.mean(jnp.abs(
+                selection_losses - current_standardized_scores))
+        elif return_pose_diagnostics:
+            current_standardized_scores = _standardize_candidate_losses(
+                candidate_losses)
         if assignment_mode == "hard":
             if apply_candidate_hysteresis:
                 (min_indices, retained_previous, accepted_new_best,
                  previous_available, contested, challenger_advantage_std) = (
                     _select_candidates_with_head_hysteresis(
-                        candidate_losses, candidate_head_indices,
+                        selection_losses, candidate_head_indices,
                         previous_candidate_heads, candidate_hysteresis_std))
                 contested_count = jnp.sum(contested)
                 available_count = jnp.sum(previous_candidate_heads >= 0)
@@ -1603,7 +1686,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                     jnp.where(contested, challenger_advantage_std, 0.0)) / jnp.maximum(
                         contested_count, 1)
             else:
-                min_indices = jnp.argmin(candidate_losses, axis=1)
+                min_indices = jnp.argmin(selection_losses, axis=1)
             responsibilities = jax.nn.one_hot(
                 min_indices, candidate_losses.shape[1], dtype=candidate_losses.dtype)
         else:
@@ -1752,11 +1835,16 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                    hysteresis_retained_fraction,
                    hysteresis_accepted_switch_fraction,
                    hysteresis_previous_available_fraction,
-                   hysteresis_challenger_advantage_std)
+                   hysteresis_challenger_advantage_std,
+                   temporal_history_available_fraction,
+                   temporal_selection_changed_fraction,
+                   temporal_current_disadvantage_std,
+                   temporal_score_adjustment)
         pose_diagnostics = tuple(jax.lax.stop_gradient(value) for value in (
             rotations_selected[:, 0], selected_head_indices, best_head_indices,
             absolute_margin, relative_margin, standardized_margin,
-            median_normalized_margin, candidate_score_entropy))
+            median_normalized_margin, candidate_score_entropy,
+            candidate_head_indices, current_standardized_scores))
         return loss, (metrics, candidate_directions, winner_directions, latent,
                       pose_diagnostics)
 
@@ -2175,6 +2263,16 @@ def main():
     parser.add_argument("--candidate_head_hysteresis_start_epoch", type=int, default=0,
                         help="Earliest epoch at which candidate-head hysteresis may run; stochastic "
                              "exploration always takes precedence. Default: 0.")
+    parser.add_argument("--candidate_temporal_weight", type=float, default=0.0,
+                        help="Weight in [0,1] assigned to each particle/head's historical standardized "
+                             "candidate score during hard winner selection. 0 disables temporal scoring "
+                             "and exactly preserves legacy selection. Default: 0.")
+    parser.add_argument("--candidate_temporal_decay", type=float, default=0.8,
+                        help="EMA decay in [0,1) for historical standardized candidate scores. "
+                             "A value of 0.8 retains roughly five observations. Default: 0.8.")
+    parser.add_argument("--candidate_temporal_start_epoch", type=int, default=0,
+                        help="Earliest epoch at which temporal scores are accumulated and used; stochastic "
+                             "exploration always takes precedence. Default: 0.")
     parser.add_argument("--pose_diagnostics", action="store_true",
                         help="Track per-particle winner rotations and top-two loss margins. Adds a small "
                              "device-to-host transfer per batch but does not affect training.")
@@ -2288,6 +2386,12 @@ def main():
         parser.error("--candidate_head_hysteresis_std must be non-negative")
     if args.candidate_head_hysteresis_start_epoch < 0:
         parser.error("--candidate_head_hysteresis_start_epoch must be non-negative")
+    if not 0.0 <= args.candidate_temporal_weight <= 1.0:
+        parser.error("--candidate_temporal_weight must be in [0,1]")
+    if not 0.0 <= args.candidate_temporal_decay < 1.0:
+        parser.error("--candidate_temporal_decay must be in [0,1)")
+    if args.candidate_temporal_start_epoch < 0:
+        parser.error("--candidate_temporal_start_epoch must be non-negative")
     if (args.pose_search_profile == "adaptive"
             and args.heterogeneity_profile == "anti_collapse"
             and args.het_freeze_consensus is not False
@@ -2494,10 +2598,15 @@ def main():
             _PoseDiagnosticsTracker(len(generator.md), reconsiren.symmetry_matrices)
             if args.pose_diagnostics else None)
         track_candidate_heads = (
-            args.pose_diagnostics or args.candidate_head_hysteresis_std > 0.0)
+            args.pose_diagnostics or args.candidate_head_hysteresis_std > 0.0
+            or args.candidate_temporal_weight > 0.0)
         candidate_head_history = (
             np.full(len(generator.md), -1, dtype=np.int32)
             if track_candidate_heads else None)
+        temporal_candidate_scores = (
+            _TemporalCandidateScoreBank(
+                len(generator.md), reconsiren.encoder_pose.num_components)
+            if args.candidate_temporal_weight > 0.0 else None)
         graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_volume, optimizer_het))
 
         # Resume if checkpoint exists
@@ -2552,6 +2661,10 @@ def main():
                     total_hysteresis_accepted_switch_fraction = 0
                     total_hysteresis_previous_available_fraction = 0
                     total_hysteresis_challenger_advantage_std = 0
+                    total_temporal_history_available_fraction = 0
+                    total_temporal_selection_changed_fraction = 0
+                    total_temporal_current_disadvantage_std = 0
+                    total_temporal_score_adjustment = 0
                     projection_diagnostic_steps = 0
                     total_validation_loss = 0
 
@@ -2691,12 +2804,27 @@ def main():
                     args.candidate_head_hysteresis_std > 0.0
                     and epoch_index >= args.candidate_head_hysteresis_start_epoch
                     and hard_winner_selection)
+                apply_candidate_temporal_scoring = (
+                    args.candidate_temporal_weight > 0.0
+                    and epoch_index >= args.candidate_temporal_start_epoch
+                    and hard_winner_selection)
                 if track_candidate_heads:
                     labels_host = np.asarray(labels, dtype=np.int64)
                     previous_candidate_heads = jnp.asarray(
                         candidate_head_history[labels_host])
                 else:
                     previous_candidate_heads = jnp.full_like(labels, -1)
+                if temporal_candidate_scores is not None:
+                    historical_scores_host, historical_valid_host = (
+                        temporal_candidate_scores.batch(labels_host))
+                    historical_candidate_scores = jnp.asarray(historical_scores_host)
+                    historical_candidate_valid = jnp.asarray(historical_valid_host)
+                else:
+                    historical_candidate_scores = jnp.zeros(
+                        (labels.shape[0], reconsiren.encoder_pose.num_components),
+                        dtype=x.dtype)
+                    historical_candidate_valid = jnp.zeros(
+                        historical_candidate_scores.shape, dtype=bool)
                 train_result = train_step_reconsiren(
                     graphdef, state, x, labels, md_columns, rng,
                     lambda_uniform=uniform_weight, tau=tau, use_tau=use_tau,
@@ -2713,6 +2841,10 @@ def main():
                     previous_candidate_heads=previous_candidate_heads,
                     apply_candidate_hysteresis=apply_candidate_hysteresis,
                     candidate_hysteresis_std=args.candidate_head_hysteresis_std,
+                    historical_candidate_scores=historical_candidate_scores,
+                    historical_candidate_valid=historical_candidate_valid,
+                    apply_candidate_temporal_scoring=apply_candidate_temporal_scoring,
+                    candidate_temporal_weight=args.candidate_temporal_weight,
                     train_pose_volume=train_pose_volume,
                     train_heterogeneity=train_heterogeneity,
                     return_metrics=True,
@@ -2721,8 +2853,15 @@ def main():
                     loss, metrics, pose_diagnostics, state, rng = train_result
                     (winner_rotations, selected_heads, best_heads,
                      absolute_margins, relative_margins, standardized_margins,
-                     median_normalized_margins, score_entropies) = pose_diagnostics
+                     median_normalized_margins, score_entropies,
+                     evaluated_candidate_heads,
+                     current_standardized_candidate_scores) = pose_diagnostics
                     candidate_head_history[labels_host] = np.asarray(selected_heads)
+                    if apply_candidate_temporal_scoring:
+                        temporal_candidate_scores.update(
+                            labels_host, evaluated_candidate_heads,
+                            current_standardized_candidate_scores,
+                            args.candidate_temporal_decay)
                     if pose_diagnostics_tracker is not None:
                         pose_diagnostics_tracker.update(
                             labels, winner_rotations, selected_heads, best_heads,
@@ -2739,7 +2878,11 @@ def main():
                  hysteresis_retained_fraction,
                  hysteresis_accepted_switch_fraction,
                  hysteresis_previous_available_fraction,
-                 hysteresis_challenger_advantage_std) = metrics
+                 hysteresis_challenger_advantage_std,
+                 temporal_history_available_fraction,
+                 temporal_selection_changed_fraction,
+                 temporal_current_disadvantage_std,
+                 temporal_score_adjustment) = metrics
                 total_loss += loss
                 total_recon_loss += recon_loss
                 total_recon_het_loss += recon_het_loss
@@ -2759,6 +2902,10 @@ def main():
                 total_hysteresis_accepted_switch_fraction += hysteresis_accepted_switch_fraction
                 total_hysteresis_previous_available_fraction += hysteresis_previous_available_fraction
                 total_hysteresis_challenger_advantage_std += hysteresis_challenger_advantage_std
+                total_temporal_history_available_fraction += temporal_history_available_fraction
+                total_temporal_selection_changed_fraction += temporal_selection_changed_fraction
+                total_temporal_current_disadvantage_std += temporal_current_disadvantage_std
+                total_temporal_score_adjustment += temporal_score_adjustment
                 if train_pose_volume:
                     total_projection_rms += projection_rms
                     total_normalized_target_rms += normalized_target_rms
@@ -2875,6 +3022,20 @@ def main():
                              "challenger_advantage_std": (
                                  float(total_hysteresis_challenger_advantage_std) / step),
                              "active": float(apply_candidate_hysteresis)},
+                            i * steps_per_epoch + step)
+
+                    if args.candidate_temporal_weight > 0.0:
+                        writer.add_scalars(
+                            'Candidate temporal evidence (ReconSIREN)',
+                            {"history_available_fraction": (
+                                 float(total_temporal_history_available_fraction) / step),
+                             "selection_changed_fraction": (
+                                 float(total_temporal_selection_changed_fraction) / step),
+                             "selected_current_disadvantage_std": (
+                                 float(total_temporal_current_disadvantage_std) / step),
+                             "mean_score_adjustment": (
+                                 float(total_temporal_score_adjustment) / step),
+                             "active": float(apply_candidate_temporal_scoring)},
                             i * steps_per_epoch + step)
 
                     # Progress bar update  (TQDM)

@@ -6,8 +6,10 @@ from flax import nnx
 
 from hax.networks.reconsiren import (
     _PoseDiagnosticsTracker,
+    _TemporalCandidateScoreBank,
     ReconSIREN,
     _assignment_probabilities,
+    _blend_candidate_scores_with_history,
     _bound_candidate_view_directions,
     _candidate_coverage_loss,
     _candidate_reconstruction_losses,
@@ -94,6 +96,33 @@ def test_candidate_head_hysteresis_keeps_only_ambiguous_previous_winner():
     np.testing.assert_array_equal(available, np.array([True, True, False]))
     np.testing.assert_array_equal(contested, np.array([True, True, False]))
     assert float(advantage[0]) < 0.25 < float(advantage[1])
+
+
+def test_temporal_candidate_scores_prefer_consistent_head():
+    losses = jnp.array([[0.10, 0.09, 0.50]], dtype=jnp.float32)
+    head_indices = jnp.array([[0, 1, 2]])
+    historical_scores = jnp.array([[-1.0, 0.5, 1.5]], dtype=jnp.float32)
+    historical_valid = jnp.ones_like(historical_scores, dtype=bool)
+
+    blended, current, valid = _blend_candidate_scores_with_history(
+        losses, head_indices, historical_scores, historical_valid,
+        history_weight=0.5)
+
+    assert int(jnp.argmin(current, axis=1)[0]) == 1
+    assert int(jnp.argmin(blended, axis=1)[0]) == 0
+    np.testing.assert_array_equal(valid, np.ones((1, 3), dtype=bool))
+
+
+def test_temporal_candidate_score_bank_uses_ema_and_initializes_unseen_heads():
+    bank = _TemporalCandidateScoreBank(n_particles=2, n_heads=3)
+    bank.update(np.array([0]), np.array([[0, 2]]),
+                np.array([[1.0, -1.0]]), decay=0.8)
+    bank.update(np.array([0]), np.array([[0, 1]]),
+                np.array([[0.0, 2.0]]), decay=0.8)
+
+    scores, valid = bank.batch(np.array([0]))
+    np.testing.assert_allclose(scores, np.array([[0.8, 2.0, -1.0]]), atol=1e-6)
+    np.testing.assert_array_equal(valid, np.ones((1, 3), dtype=bool))
 
 
 def test_candidate_coverage_has_finite_direction_gradients():
@@ -213,16 +242,23 @@ def test_train_step_can_return_pose_diagnostics_without_changing_metrics():
         assignment_mode="hard", uniform_scope="off",
         previous_candidate_heads=jnp.array([1, 2]),
         apply_candidate_hysteresis=True, candidate_hysteresis_std=0.25,
+        historical_candidate_scores=jnp.array([
+            [-1.0, 0.0, 1.0], [1.0, 0.0, -1.0]], dtype=jnp.float32),
+        historical_candidate_valid=jnp.ones((2, 3), dtype=bool),
+        apply_candidate_temporal_scoring=True, candidate_temporal_weight=0.5,
         train_heterogeneity=False, return_metrics=True,
         return_pose_diagnostics=True)
 
     assert np.isfinite(float(loss))
-    assert len(metrics) == 21
+    assert len(metrics) == 25
     assert np.all(np.isfinite(np.asarray(metrics)))
     np.testing.assert_allclose(metrics[12], 1.0, atol=1e-5)
     assert 0.0 <= float(metrics[16]) <= 1.0
+    np.testing.assert_allclose(metrics[21], 1.0, atol=1e-5)
     (winner_rotations, selected_heads, best_heads, absolute, relative,
-     standardized, median_normalized, score_entropy) = diagnostics
+     standardized, median_normalized, score_entropy,
+     evaluated_heads, current_standardized_scores) = diagnostics
     assert winner_rotations.shape == (2, 3, 3)
     assert (selected_heads.shape == best_heads.shape == absolute.shape == relative.shape
             == standardized.shape == median_normalized.shape == score_entropy.shape == (2,))
+    assert evaluated_heads.shape == current_standardized_scores.shape == (2, 3)
