@@ -178,22 +178,6 @@ def repulsion_loss(
     return jnp.mean(energy)
 
 
-def _assignment_probabilities(losses, temperature, adaptive=True, eps=1e-6):
-    """Turn per-candidate losses into stable responsibilities.
-
-    In adaptive mode ``temperature`` is dimensionless: every particle's loss
-    differences are divided by their own standard deviation first.  This makes
-    the exploration schedule insensitive to map amplitude, box size and CTF
-    mode, unlike the historical absolute ``tau``.
-    """
-    centered = losses - jnp.min(losses, axis=1, keepdims=True)
-    if adaptive:
-        scale = jnp.std(centered, axis=1, keepdims=True)
-        centered = centered / jnp.maximum(scale, eps)
-    temperature = jnp.maximum(jnp.asarray(temperature, dtype=losses.dtype), eps)
-    return jax.nn.softmax(-centered / temperature, axis=1)
-
-
 def _top_two_candidate_diagnostics(losses, eps=1e-8):
     """Return complementary confidence diagnostics for candidate competition."""
     if losses.shape[1] < 2:
@@ -343,48 +327,6 @@ class _PoseDiagnosticsTracker:
         return summary
 
 
-class _TemporalCandidateScoreBank:
-    """Host-side EMA of standardized candidate scores for each particle/head."""
-
-    def __init__(self, n_particles, n_heads):
-        self.scores = np.zeros((n_particles, n_heads), dtype=np.float32)
-        self.valid = np.zeros((n_particles, n_heads), dtype=bool)
-
-    def batch(self, labels):
-        labels = np.asarray(labels, dtype=np.int64)
-        return self.scores[labels], self.valid[labels]
-
-    def update(self, labels, head_indices, current_scores, decay):
-        labels = np.asarray(labels, dtype=np.int64)
-        head_indices = np.asarray(head_indices, dtype=np.int64)
-        current_scores = np.asarray(current_scores, dtype=np.float32)
-        rows = labels[:, None]
-        was_valid = self.valid[rows, head_indices]
-        previous = self.scores[rows, head_indices]
-        updated = np.where(
-            was_valid,
-            decay * previous + (1.0 - decay) * current_scores,
-            current_scores)
-        self.scores[rows, head_indices] = updated
-        self.valid[rows, head_indices] = True
-
-
-def _rotation_matrices_from_rotvec(rotation_vectors):
-    """Differentiable Rodrigues map for arrays ending in a 3-D rotation vector."""
-    wx, wy, wz = [rotation_vectors[..., i] for i in range(3)]
-    zeros = jnp.zeros_like(wx)
-    skew = jnp.stack([
-        zeros, -wz, wy,
-        wz, zeros, -wx,
-        -wy, wx, zeros,
-    ], axis=-1).reshape(rotation_vectors.shape[:-1] + (3, 3))
-    angle = jnp.linalg.norm(rotation_vectors, axis=-1)
-    first = jnp.sinc(angle / jnp.pi)[..., None, None]
-    second = ((1.0 - jnp.cos(angle)) / jnp.maximum(angle ** 2, 1e-8))[..., None, None]
-    identity = jnp.broadcast_to(jnp.eye(3, dtype=rotation_vectors.dtype), skew.shape)
-    return identity + first * skew + second * jnp.matmul(skew, skew)
-
-
 def _fibonacci_sphere_directions(n_directions, dtype=jnp.float32):
     """Deterministic equal-area bin centers on S2."""
     indices = jnp.arange(n_directions, dtype=dtype) + 0.5
@@ -446,56 +388,6 @@ def _candidate_coverage_loss(directions, memory_bank, bank_count, key,
 
     occupancy = occupancy / jnp.maximum(jnp.sum(occupancy), eps)
     return jnp.sum(occupancy * jnp.log(jnp.maximum(occupancy * n_bins, eps)))
-
-
-def _bound_candidate_view_directions(rotations, anchor_rotations,
-                                     maximum_deviation_degrees):
-    """Keep viewing directions inside spherical caps around their anchors.
-
-    Only the viewing direction is bounded.  A minimal corrective rotation is
-    left-multiplied onto the proposed matrix, preserving its in-plane rotation
-    as much as possible.  A zero or negative limit disables the constraint.
-    """
-    if maximum_deviation_degrees <= 0.0:
-        return rotations
-
-    anchors = jnp.broadcast_to(anchor_rotations[None, ...], rotations.shape)
-    anchor_directions = anchors[..., :, 2]
-    directions = rotations[..., :, 2]
-    dot = jnp.clip(jnp.sum(anchor_directions * directions, axis=-1), -1.0, 1.0)
-    angles = jnp.arccos(dot)
-    maximum_angle = jnp.deg2rad(jnp.asarray(
-        maximum_deviation_degrees, dtype=rotations.dtype))
-    # A high-order smooth cap is effectively identity for small refinements,
-    # approaches the requested limit from below, and avoids the zero radial
-    # gradient introduced by a hard ``minimum`` at the cap boundary.
-    cap_ratio = angles / jnp.maximum(maximum_angle, 1e-7)
-    bounded_angles = angles / jnp.power(1.0 + cap_ratio ** 8, 1.0 / 8.0)
-
-    tangent = directions - dot[..., None] * anchor_directions
-    tangent_norm = jnp.linalg.norm(tangent, axis=-1, keepdims=True)
-    fallback = anchors[..., :, 0]
-    tangent = jnp.where(
-        tangent_norm > 1e-7,
-        tangent / jnp.maximum(tangent_norm, 1e-7),
-        fallback)
-    bounded_directions = (
-        jnp.cos(bounded_angles)[..., None] * anchor_directions
-        + jnp.sin(bounded_angles)[..., None] * tangent)
-
-    correction_axis = jnp.cross(directions, bounded_directions, axis=-1)
-    correction_sine = jnp.linalg.norm(correction_axis, axis=-1)
-    correction_cosine = jnp.clip(
-        jnp.sum(directions * bounded_directions, axis=-1), -1.0, 1.0)
-    correction_angle = jnp.arctan2(correction_sine, correction_cosine)
-    correction_axis = correction_axis / jnp.maximum(
-        correction_sine[..., None], 1e-7)
-    correction_vectors = jnp.where(
-        correction_sine[..., None] > 1e-7,
-        correction_axis * correction_angle[..., None],
-        jnp.zeros_like(correction_axis))
-    correction = _rotation_matrices_from_rotvec(correction_vectors)
-    return jnp.matmul(correction, rotations)
 
 
 class LowRankLinear(nnx.Module):
@@ -571,8 +463,7 @@ class PoseHeadEnsemble(nnx.Module):
 
 class EncoderPose(nnx.Module):
     def __init__(self, input_dim, pyramid_levels=4, num_components=18, refine_current_assignment=False,
-                 use_anchor_rotations=True, low_rank=0, spatial_pool=1,
-                 anchor_cap_degrees=0.0, *, rngs: nnx.Rngs):
+                 use_anchor_rotations=True, low_rank=0, spatial_pool=1, *, rngs: nnx.Rngs):
         self.input_dim = input_dim
         self.input_conv_dim = 64  # Original was 64
         self.out_conv_dim = int(self.input_conv_dim / (2 ** 3))
@@ -581,7 +472,6 @@ class EncoderPose(nnx.Module):
         self.refine_current_assignment = refine_current_assignment
         self.use_anchor_rotations = use_anchor_rotations
         self.spatial_pool = max(1, int(spatial_pool))
-        self.anchor_cap_degrees = float(anchor_cap_degrees)
 
         # Hidden layers
         hidden_layers_conv = [Conv(self.pyramid_levels, 64, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16)]
@@ -678,8 +568,6 @@ class EncoderPose(nnx.Module):
         rotations = rotations.reshape(x.shape[0], self.num_components, 3, 3)
         if self.use_anchor_rotations and not self.refine_current_assignment:
             rotations = jnp.einsum('bnhk,nkw->bnhw', rotations, self.anchor_rotations)
-            rotations = _bound_candidate_view_directions(
-                rotations, self.anchor_rotations, self.anchor_cap_degrees)
 
         # Third output: in plane shifts
         in_plane_shifts = nnx.gelu(self.hidden_shifts[0](x))
@@ -1119,7 +1007,7 @@ class ReconSIREN(nnx.Module):
     def __init__(self, coords, values, xsize, sr, bank_size=1024, ctf_type="apply", lat_dim=8, sigma=1.0,
                  symmetry_group="c1", refine_current_assignment=False, learn_delta_volume=True, num_components=18,
                  use_anchor_rotations=True, optimization_profile="legacy", pose_head_rank=None,
-                 pose_spatial_pool=None, pose_anchor_cap_degrees=0.0,
+                 pose_spatial_pool=None,
                  het_encoder_architecture=None,
                  consensus_parameterization=None, render_chunk_size=None,
                  candidate_chunk_size=None, coarse_topk=None, coarse_scale=None, coarse_gaussians=None,
@@ -1131,7 +1019,7 @@ class ReconSIREN(nnx.Module):
                  het_covariance_weight=None, het_min_std=0.1,
                  het_start_epoch=None, het_freeze_consensus=None,
                  het_latent_bank_size=2048,
-                 *, rngs: nnx.Rngs):
+                 *, rngs: nnx.Rngs, **kwargs):
         super(ReconSIREN, self).__init__()
         aggressive = optimization_profile == "aggressive"
         anti_collapse = heterogeneity_profile == "anti_collapse"
@@ -1210,8 +1098,7 @@ class ReconSIREN(nnx.Module):
         self.learn_delta_volume = learn_delta_volume
         self.encoder_pose = EncoderPose(self.xsize, num_components=num_components, refine_current_assignment=refine_current_assignment,
                                         use_anchor_rotations=use_anchor_rotations, low_rank=pose_head_rank,
-                                        spatial_pool=pose_spatial_pool,
-                                        anchor_cap_degrees=pose_anchor_cap_degrees, rngs=rngs)
+                                        spatial_pool=pose_spatial_pool, rngs=rngs)
         self.encoder_het = EncoderHet(self.xsize, lat_dim=lat_dim,
                                       architecture=het_encoder_architecture,
                                       encoder_size=het_encoder_size, rngs=rngs)
@@ -1304,10 +1191,8 @@ class ReconSIREN(nnx.Module):
 
 def _candidate_reconstruction_losses(images, targets, ctf, ctf_type,
                                      normalize_target=True, return_prepared=False,
-                                     scoring="mse", eps=1e-6):
+                                     scoring_size=None):
     """Per-particle, per-candidate loss without materialising target copies."""
-    if scoring not in ("mse", "ncc"):
-        raise ValueError("candidate scoring must be 'mse' or 'ncc'")
     target = targets[..., 0] if targets.shape[-1] == 1 else targets
     predicted = images[..., 0] if images.shape[-1] == 1 else images
     n_candidates = predicted.shape[1]
@@ -1331,23 +1216,17 @@ def _candidate_reconstruction_losses(images, targets, ctf, ctf_type,
         predicted = rearrange(predicted, "(b n) w h -> b n w h",
                               b=target.shape[0], n=n_candidates)
 
-    if scoring == "ncc":
-        target = target - jnp.mean(target, axis=(-2, -1), keepdims=True)
-        target = target / jnp.maximum(
-            jnp.sqrt(jnp.mean(jnp.square(target), axis=(-2, -1), keepdims=True)), eps)
-        predicted = predicted - jnp.mean(predicted, axis=(-2, -1), keepdims=True)
-        predicted = predicted / jnp.maximum(
-            jnp.sqrt(jnp.mean(jnp.square(predicted), axis=(-2, -1), keepdims=True)), eps)
-        losses = 1.0 - jnp.mean(
-            predicted * target[:, None, ...], axis=(-2, -1))
-    else:
-        # The legacy path normalized identical target copies independently.
-        # Taking the same reduction once per particle produces the same value
-        # and lets broadcasting remain a view throughout the fused subtraction.
-        if normalize_target:
-            target = standard_normalization(target)
-        losses = jnp.mean(
-            jnp.square(predicted - target[:, None, ...]), axis=(-2, -1))
+    if scoring_size is not None and scoring_size < target.shape[-1]:
+        predicted = _resize_candidate_images(predicted, scoring_size)
+        target = _resize_candidate_images(target[:, None, ...], scoring_size)[:, 0]
+
+    # The legacy path normalized identical target copies independently.  Taking
+    # the same reduction once per particle produces the same value and lets
+    # broadcasting remain a view throughout the fused subtraction.
+    if normalize_target:
+        target = standard_normalization(target)
+    losses = jnp.mean(
+        jnp.square(predicted - target[:, None, ...]), axis=(-2, -1))
     if return_prepared:
         return losses, predicted, target[:, None, ...]
     return losses
@@ -1448,119 +1327,74 @@ def _gather_candidates(values, indices):
     return values[jnp.arange(values.shape[0])[:, None], indices]
 
 
-def _select_candidates_with_head_hysteresis(
-        losses, candidate_head_indices, previous_heads, threshold_std, eps=1e-8):
-    """Keep a prior head when the new best candidate is only marginally better."""
-    batch_indices = jnp.arange(losses.shape[0])
-    best_local_indices = jnp.argmin(losses, axis=1)
-    best_heads = candidate_head_indices[batch_indices, best_local_indices]
-    best_losses = losses[batch_indices, best_local_indices]
-
-    previous_matches = candidate_head_indices == previous_heads[:, None]
-    previous_available = jnp.any(previous_matches, axis=1) & (previous_heads >= 0)
-    previous_local_indices = jnp.argmax(previous_matches, axis=1)
-    previous_losses = losses[batch_indices, previous_local_indices]
-    candidate_scale = jnp.std(losses, axis=1)
-    challenger_advantage_std = jnp.maximum(previous_losses - best_losses, 0.0) / (
-        jnp.maximum(candidate_scale, eps))
-
-    contested = previous_available & (best_heads != previous_heads)
-    retained_previous = contested & (
-        challenger_advantage_std < jnp.asarray(threshold_std, dtype=losses.dtype))
-    accepted_new_best = contested & ~retained_previous
-    selected_local_indices = jnp.where(
-        retained_previous, previous_local_indices, best_local_indices)
-    return (selected_local_indices, retained_previous, accepted_new_best,
-            previous_available, contested, challenger_advantage_std)
-
-
-def _standardize_candidate_losses(losses, eps=1e-8):
-    """Express each particle's candidate losses in within-particle std units."""
-    mean = jnp.mean(losses, axis=1, keepdims=True)
-    scale = jnp.maximum(jnp.std(losses, axis=1, keepdims=True), eps)
-    return (losses - mean) / scale
-
-
-def _blend_candidate_scores_with_history(
-        losses, candidate_head_indices, historical_scores,
-        historical_valid, history_weight):
-    """Blend current standardized losses with prior per-head evidence."""
-    current_scores = _standardize_candidate_losses(losses)
-    historical_local = _gather_candidates(historical_scores, candidate_head_indices)
-    valid_local = _gather_candidates(historical_valid, candidate_head_indices)
-    weight = jnp.asarray(history_weight, dtype=losses.dtype)
-    blended_scores = jnp.where(
-        valid_local,
-        (1.0 - weight) * current_scores + weight * historical_local,
-        current_scores)
-    return blended_scores, current_scores, valid_local
-
-
 def _score_candidates(model, x, values, coords, rotations, shifts, ctf,
-                      scoring="mse"):
-    """Render candidate chunks and retain only their scalar losses."""
+                      scoring_size):
+    """Render candidates once and return curriculum and full-resolution losses."""
     chunk = model.candidate_chunk_size
     n_candidates = rotations.shape[1]
     if chunk <= 0 or chunk >= n_candidates:
         images = model.phys_decoder(
             x, values, coords, model.xsize, rotations, shifts, ctf,
             model.ctf_type, model.get_std())
-        return _candidate_reconstruction_losses(
-            images, x, ctf, model.ctf_type, scoring=scoring)
+        full_losses = _candidate_reconstruction_losses(
+            images, x, ctf, model.ctf_type)
+        if scoring_size >= model.xsize:
+            return full_losses, full_losses
+        scoring_losses = _candidate_reconstruction_losses(
+            images, x, ctf, model.ctf_type, scoring_size=scoring_size)
+        return scoring_losses, full_losses
 
-    losses = []
+    scoring_losses = []
+    full_losses = []
     for start in range(0, n_candidates, chunk):
         images = model.phys_decoder(
             x, values, coords, model.xsize,
             rotations[:, start:start + chunk], shifts[:, start:start + chunk],
             ctf, model.ctf_type, model.get_std())
-        losses.append(_candidate_reconstruction_losses(
-            images, x, ctf, model.ctf_type, scoring=scoring))
-    return jnp.concatenate(losses, axis=1)
+        full_chunk = _candidate_reconstruction_losses(
+            images, x, ctf, model.ctf_type)
+        full_losses.append(full_chunk)
+        if scoring_size >= model.xsize:
+            scoring_losses.append(full_chunk)
+        else:
+            scoring_losses.append(_candidate_reconstruction_losses(
+                images, x, ctf, model.ctf_type, scoring_size=scoring_size))
+    return (jnp.concatenate(scoring_losses, axis=1),
+            jnp.concatenate(full_losses, axis=1))
 
 
-@partial(jax.jit, static_argnames=("use_tau", "assignment_mode", "adaptive_temperature",
+def _candidate_frequency_scoring_size(
+        image_size, hard_step, steps_per_epoch, curriculum_epochs, scales):
+    """Select one of a few low-pass scoring sizes without per-epoch recompiles."""
+    curriculum_steps = float(curriculum_epochs) * int(steps_per_epoch)
+    if curriculum_steps <= 0.0 or hard_step >= curriculum_steps:
+        return int(image_size)
+    progress = max(float(hard_step), 0.0) / curriculum_steps
+    stage = min(int(progress * len(scales)), len(scales) - 1)
+    return min(int(image_size), max(8, int(round(image_size * scales[stage]))))
+
+
+@partial(jax.jit, static_argnames=("use_tau",
                                    "apply_candidate_coverage", "candidate_coverage_bins",
                                    "candidate_bank_samples",
-                                   "uniform_scope", "candidate_scoring",
+                                   "candidate_scoring_size",
                                    "train_pose_volume", "train_heterogeneity", "return_metrics",
-                                   "return_pose_diagnostics", "apply_candidate_hysteresis",
-                                   "apply_candidate_temporal_scoring"),
+                                   "return_pose_diagnostics"),
          donate_argnums=(1,))
 def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           use_tau=False, lambda_uniform=0.1,
-                          assignment_mode="legacy", adaptive_temperature=False,
                           apply_candidate_coverage=False,
                           candidate_coverage_weight=0.0,
                           candidate_coverage_bins=256,
                           candidate_coverage_kappa=32.0,
                           candidate_bank_samples=1024,
                           candidate_bank_mix=0.5,
-                          uniform_scope="candidates",
-                          candidate_scoring="mse",
-                          previous_candidate_heads=None,
-                          apply_candidate_hysteresis=False,
-                          candidate_hysteresis_std=0.25,
-                          historical_candidate_scores=None,
-                          historical_candidate_valid=None,
-                          apply_candidate_temporal_scoring=False,
-                          candidate_temporal_weight=0.5,
+                          candidate_scoring_size=0,
                           train_pose_volume=True, train_heterogeneity=True,
                           return_metrics=False, return_pose_diagnostics=False):
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
-
-    if assignment_mode == "legacy":
-        assignment_mode = "categorical" if use_tau else "hard"
-    if assignment_mode not in ("hard", "categorical"):
-        raise ValueError("assignment_mode must be 'legacy', 'hard' or 'categorical'")
-    if uniform_scope not in ("off", "candidates", "winners"):
-        raise ValueError("uniform_scope must be 'off', 'candidates' or 'winners'")
-    if candidate_scoring not in ("mse", "ncc"):
-        raise ValueError("candidate_scoring must be 'mse' or 'ncc'")
-    if apply_candidate_hysteresis and assignment_mode != "hard":
-        raise ValueError("candidate-head hysteresis requires hard assignment")
-    if apply_candidate_temporal_scoring and assignment_mode != "hard":
-        raise ValueError("temporal candidate scoring requires hard assignment")
+    scoring_size = (model.xsize if candidate_scoring_size <= 0
+                    else min(int(candidate_scoring_size), model.xsize))
 
     # Random keys
     key, coverage_key, swd_key, choice_key, distributions_key = jax.random.split(key, 5)
@@ -1596,12 +1430,14 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         random_indices = jax.random.choice(choice_key, jnp.arange(model.symmetry_matrices.shape[0]), shape=(rotations.shape[0],))
         rotations = jnp.matmul(jnp.transpose(model.symmetry_matrices[random_indices], (0, 2, 1))[:, None, :, :], rotations)
 
-        # Coarse-to-fine screening is disabled during stochastic exploration so
-        # the categorical distribution remains exactly the legacy one.
+        # Low-frequency curriculum scoring evaluates all candidates.  The
+        # optional coarse screen remains available once full-resolution scoring
+        # resumes, and is disabled during legacy stochastic exploration.
         rotations_eval, shifts_eval = rotations, shifts
         candidate_head_indices = jnp.broadcast_to(
             jnp.arange(rotations.shape[1], dtype=jnp.int32), rotations.shape[:2])
-        if assignment_mode == "hard" and model.coarse_topk < rotations.shape[1]:
+        if (not use_tau and scoring_size >= model.xsize
+                and model.coarse_topk < rotations.shape[1]):
             screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
             x_screen = jax.image.resize(
                 x, (x.shape[0], screen_size, screen_size, x.shape[-1]), method="bilinear")
@@ -1618,8 +1454,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                 coarse_ctf, model.ctf_type, jax.lax.stop_gradient(model.get_std()),
                 render_size=screen_size)
             coarse_losses = _candidate_reconstruction_losses(
-                coarse_images, x_screen, coarse_ctf, model.ctf_type,
-                scoring=candidate_scoring)
+                coarse_images, x_screen, coarse_ctf, model.ctf_type)
             _, top_indices = jax.lax.top_k(-coarse_losses, model.coarse_topk)
             rotations_eval = _gather_candidates(rotations, top_indices)
             shifts_eval = _gather_candidates(shifts, top_indices)
@@ -1627,73 +1462,32 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
 
         # The global competition never carries gradients through candidate
         # scoring.  Only its selected pose is rerendered into the consensus.
-        candidate_losses = _score_candidates(
+        candidate_losses, full_candidate_losses = _score_candidates(
             model, x, jax.lax.stop_gradient(values), jax.lax.stop_gradient(coords),
             jax.lax.stop_gradient(rotations_eval), jax.lax.stop_gradient(shifts_eval),
-            ctf, scoring=candidate_scoring)
+            ctf, scoring_size=scoring_size)
 
         # Candidate responsibilities are used only to pick a single global
         # winner.  Categorical exploration therefore remains safe for volume
         # amplitudes while allowing the winning head to vary over time.
-        hysteresis_retained_fraction = jnp.asarray(0.0, dtype=x.dtype)
-        hysteresis_accepted_switch_fraction = jnp.asarray(0.0, dtype=x.dtype)
-        hysteresis_previous_available_fraction = jnp.asarray(0.0, dtype=x.dtype)
-        hysteresis_challenger_advantage_std = jnp.asarray(0.0, dtype=x.dtype)
-        temporal_history_available_fraction = jnp.asarray(0.0, dtype=x.dtype)
-        temporal_selection_changed_fraction = jnp.asarray(0.0, dtype=x.dtype)
-        temporal_current_disadvantage_std = jnp.asarray(0.0, dtype=x.dtype)
-        temporal_score_adjustment = jnp.asarray(0.0, dtype=x.dtype)
-        current_standardized_scores = jnp.zeros_like(candidate_losses)
-        selection_losses = candidate_losses
-        if apply_candidate_temporal_scoring:
-            (selection_losses, current_standardized_scores,
-             temporal_history_valid) = _blend_candidate_scores_with_history(
-                candidate_losses, candidate_head_indices,
-                historical_candidate_scores, historical_candidate_valid,
-                candidate_temporal_weight)
-            current_best_indices = jnp.argmin(candidate_losses, axis=1)
-            temporal_best_indices = jnp.argmin(selection_losses, axis=1)
-            temporal_history_available_fraction = jnp.mean(temporal_history_valid)
-            temporal_selection_changed_fraction = jnp.mean(
-                temporal_best_indices != current_best_indices)
-            batch_indices_temporal = jnp.arange(candidate_losses.shape[0])
-            temporal_current_disadvantage_std = jnp.mean(
-                current_standardized_scores[
-                    batch_indices_temporal, temporal_best_indices]
-                - current_standardized_scores[
-                    batch_indices_temporal, current_best_indices])
-            temporal_score_adjustment = jnp.mean(jnp.abs(
-                selection_losses - current_standardized_scores))
-        elif return_pose_diagnostics:
-            current_standardized_scores = _standardize_candidate_losses(
-                candidate_losses)
-        if assignment_mode == "hard":
-            if apply_candidate_hysteresis:
-                (min_indices, retained_previous, accepted_new_best,
-                 previous_available, contested, challenger_advantage_std) = (
-                    _select_candidates_with_head_hysteresis(
-                        selection_losses, candidate_head_indices,
-                        previous_candidate_heads, candidate_hysteresis_std))
-                contested_count = jnp.sum(contested)
-                available_count = jnp.sum(previous_candidate_heads >= 0)
-                hysteresis_retained_fraction = (
-                    jnp.sum(retained_previous) / jnp.maximum(contested_count, 1))
-                hysteresis_accepted_switch_fraction = (
-                    jnp.sum(accepted_new_best) / jnp.maximum(contested_count, 1))
-                hysteresis_previous_available_fraction = (
-                    jnp.sum(previous_available) / jnp.maximum(available_count, 1))
-                hysteresis_challenger_advantage_std = jnp.sum(
-                    jnp.where(contested, challenger_advantage_std, 0.0)) / jnp.maximum(
-                        contested_count, 1)
-            else:
-                min_indices = jnp.argmin(selection_losses, axis=1)
-            responsibilities = jax.nn.one_hot(
-                min_indices, candidate_losses.shape[1], dtype=candidate_losses.dtype)
-        else:
-            responsibilities = _assignment_probabilities(
-                candidate_losses, tau, adaptive=adaptive_temperature)
+        if use_tau:
+            responsibilities = jax.nn.softmax(-candidate_losses / tau, axis=1)
             min_indices = jax.random.categorical(
                 key, jnp.log(jnp.maximum(responsibilities, 1e-12)), axis=-1)
+        else:
+            min_indices = jnp.argmin(candidate_losses, axis=1)
+            responsibilities = jax.nn.one_hot(
+                min_indices, candidate_losses.shape[1], dtype=candidate_losses.dtype)
+
+        scoring_best_indices = jnp.argmin(candidate_losses, axis=1)
+        full_best_indices = jnp.argmin(full_candidate_losses, axis=1)
+        low_frequency_full_agreement = jnp.mean(
+            scoring_best_indices == full_best_indices)
+        full_scale = jnp.maximum(jnp.std(full_candidate_losses, axis=1), 1e-8)
+        batch_indices = jnp.arange(x.shape[0])
+        low_frequency_full_disadvantage_std = jnp.mean(
+            (full_candidate_losses[batch_indices, scoring_best_indices]
+             - full_candidate_losses[batch_indices, full_best_indices]) / full_scale)
 
         if return_pose_diagnostics:
             (best_indices, absolute_margin, relative_margin, standardized_margin,
@@ -1704,7 +1498,6 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             diagnostic_zeros = jnp.zeros(candidate_losses.shape[0], dtype=x.dtype)
             (absolute_margin, relative_margin, standardized_margin,
              median_normalized_margin, candidate_score_entropy) = (diagnostic_zeros,) * 5
-        batch_indices = jnp.arange(x.shape[0])
         selected_head_indices = candidate_head_indices[batch_indices, min_indices]
         best_head_indices = candidate_head_indices[batch_indices, best_indices]
 
@@ -1728,7 +1521,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                 recon_loss = _candidate_reconstruction_losses(
                     selected_images, x, ctf, model.ctf_type).mean()
         else:
-            recon_loss = candidate_losses[batch_indices, min_indices].mean()
+            recon_loss = full_candidate_losses[batch_indices, min_indices].mean()
 
         consensus_amplitude_mean = jnp.asarray(0.0, dtype=x.dtype)
         consensus_amplitude_rms = jnp.asarray(0.0, dtype=x.dtype)
@@ -1796,10 +1589,9 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         winner_directions = rotations_selected[:, 0, :, 2]
 
         loss_uniform = jnp.asarray(0.0, dtype=recon_loss.dtype)
-        if train_pose_volume and uniform_scope != "off":
-            uniform_directions = (winner_directions if uniform_scope == "winners"
-                                  else candidate_directions)
-            loss_swd = sliced_wasserstein_sphere(uniform_directions, rng=swd_key, n_projections=64)
+        if train_pose_volume:
+            loss_swd = sliced_wasserstein_sphere(
+                candidate_directions, rng=swd_key, n_projections=64)
             loss_uniform = lambda_uniform * loss_swd
 
         candidate_coverage_loss = jnp.asarray(0.0, dtype=recon_loss.dtype)
@@ -1832,19 +1624,12 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                    normalized_target_rms, consensus_amplitude_mean,
                    consensus_amplitude_rms, consensus_amplitude_max,
                    consensus_active_amplitude_fraction,
-                   hysteresis_retained_fraction,
-                   hysteresis_accepted_switch_fraction,
-                   hysteresis_previous_available_fraction,
-                   hysteresis_challenger_advantage_std,
-                   temporal_history_available_fraction,
-                   temporal_selection_changed_fraction,
-                   temporal_current_disadvantage_std,
-                   temporal_score_adjustment)
+                   low_frequency_full_agreement,
+                   low_frequency_full_disadvantage_std)
         pose_diagnostics = tuple(jax.lax.stop_gradient(value) for value in (
             rotations_selected[:, 0], selected_head_indices, best_head_indices,
             absolute_margin, relative_margin, standardized_margin,
-            median_normalized_margin, candidate_score_entropy,
-            candidate_head_indices, current_standardized_scores))
+            median_normalized_margin, candidate_score_entropy))
         return loss, (metrics, candidate_directions, winner_directions, latent,
                       pose_diagnostics)
 
@@ -1878,7 +1663,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         ctf = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
 
     coarse_ctf = ctf
-    if assignment_mode == "hard" and model.coarse_topk < model.encoder_pose.num_components:
+    if (not use_tau and scoring_size >= model.xsize
+            and model.coarse_topk < model.encoder_pose.num_components):
         screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
         if model.ctf_type not in (None, "None"):
             coarse_ctf = computeCTF(
@@ -2036,9 +1822,8 @@ def validation_step_reconsiren(graphdef, state, x, labels, md, key):
     return loss
 
 
-@partial(jax.jit, static_argnames=("candidate_scoring",))
-def predict_angular_assignment_step_reconsiren(
-        graphdef, state, x, labels, md, key, candidate_scoring="mse"):
+@jax.jit
+def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md, key):
     model = nnx.merge(graphdef, state)
 
     distributions_key, key = jax.random.split(key, 2)
@@ -2116,15 +1901,14 @@ def predict_angular_assignment_step_reconsiren(
             x_screen, values_screen, coords_screen, model.xsize, rotations, shifts,
             coarse_ctf, model.ctf_type, model.get_std(), render_size=screen_size)
         coarse_losses = _candidate_reconstruction_losses(
-            coarse_images, x_screen, coarse_ctf, model.ctf_type,
-            scoring=candidate_scoring)
+            coarse_images, x_screen, coarse_ctf, model.ctf_type)
         _, top_indices = jax.lax.top_k(-coarse_losses, model.coarse_topk)
         rotations = _gather_candidates(rotations, top_indices)
         shifts = _gather_candidates(shifts, top_indices)
 
-    recon_loss = _score_candidates(
+    recon_loss, _ = _score_candidates(
         model, x, values, coords, rotations, shifts, ctf,
-        scoring=candidate_scoring)
+        scoring_size=model.xsize)
 
     # Get minimum indices
     min_indices = jnp.argmin(recon_loss, axis=1)
@@ -2210,28 +1994,11 @@ def main():
     parser.add_argument("--pose_spatial_pool", type=int, default=None,
                         help="Average-pooling factor before the pose dense trunk. "
                              "Profile default: aggressive=4, legacy=1.")
-    parser.add_argument("--pose_search_profile", choices=("legacy", "adaptive"), default="legacy",
-                        help="Pose exploration curriculum. legacy preserves the historical 1,500-step "
-                             "absolute-temperature sampling; adaptive uses scale-normalized categorical "
-                             "assignment plus bank-aware geometric candidate coverage.")
-    parser.add_argument("--pose_explore_epochs", type=float, default=5.0,
-                        help="Adaptive-profile exploration duration in epochs; 0 disables the warm-up.")
-    parser.add_argument("--pose_assignment", choices=("categorical", "hard"), default="categorical",
-                        help="Global candidate assignment during adaptive exploration. Only its winner "
-                             "updates the consensus volume.")
-    parser.add_argument("--pose_temperature_start", type=float, default=1.0,
-                        help="Initial adaptive assignment temperature (dimensionless by default).")
-    parser.add_argument("--pose_temperature_end", type=float, default=0.1,
-                        help="Final adaptive assignment temperature at the end of exploration.")
-    parser.add_argument("--pose_absolute_temperature", action="store_true",
-                        help="Do not normalize candidate loss differences per particle before applying the "
-                             "adaptive-profile temperatures.")
     parser.add_argument("--candidate_coverage_epochs", type=float, default=10.0,
                         help="Epochs during which the bank-aware candidate sphere-coverage loss is active; "
                              "0 disables it.")
-    parser.add_argument("--candidate_coverage_weight", type=float, default=None,
-                        help="Weight of the bank-aware spherical occupancy KL. Profile defaults: "
-                             "adaptive=0.01, legacy=0 (pass a value to add it to legacy training).")
+    parser.add_argument("--candidate_coverage_weight", type=float, default=0.0,
+                        help="Weight of the bank-aware spherical occupancy KL; 0 disables it.")
     parser.add_argument("--candidate_coverage_bins", type=int, default=256,
                         help="Number of equal-area soft occupancy bins on the projection sphere.")
     parser.add_argument("--candidate_coverage_kappa", type=float, default=32.0,
@@ -2242,37 +2009,13 @@ def main():
     parser.add_argument("--candidate_bank_mix", type=float, default=0.5,
                         help="Historical occupancy fraction in [0,1); current candidates retain the "
                              "remaining mass so their gradients are not diluted by bank size.")
-    parser.add_argument("--candidate_anchor_cap_degrees", type=float, default=None,
-                        help="Maximum viewing-direction deviation from each anchor. For 18 anchors, 20--25 "
-                             "degrees preserves coverage with slight overlap. Profile defaults: adaptive=25, "
-                             "legacy=0; explicitly pass 0 to disable.")
-    parser.add_argument("--pose_uniform_scope", choices=("off", "candidates", "winners"), default="off",
-                        help="Optional legacy sliced-Wasserstein angular regularizer for adaptive training. "
-                             "The legacy pose profile retains its historical candidate SWD regardless.")
-    parser.add_argument("--pose_uniform_weight", type=float, default=0.01,
-                        help="Angular coverage weight; 0 disables it.")
-    parser.add_argument("--candidate_scoring", choices=("mse", "ncc"), default="mse",
-                        help="Loss used only to rank pose candidates after stochastic exploration. "
-                             "ncc removes per-projection offset and scale; the selected winner still "
-                             "uses the legacy MSE to train pose and volume. Default: mse.")
-    parser.add_argument("--candidate_head_hysteresis_std", type=float, default=0.0,
-                        help="Keep a particle's previous candidate head unless the new best head improves "
-                             "its score by this many within-particle candidate-loss standard deviations. "
-                             "Applied only after stochastic exploration; 0 disables it. No extra candidates "
-                             "are rendered, so a previous head removed by coarse screening cannot be kept.")
-    parser.add_argument("--candidate_head_hysteresis_start_epoch", type=int, default=0,
-                        help="Earliest epoch at which candidate-head hysteresis may run; stochastic "
-                             "exploration always takes precedence. Default: 0.")
-    parser.add_argument("--candidate_temporal_weight", type=float, default=0.0,
-                        help="Weight in [0,1] assigned to each particle/head's historical standardized "
-                             "candidate score during hard winner selection. 0 disables temporal scoring "
-                             "and exactly preserves legacy selection. Default: 0.")
-    parser.add_argument("--candidate_temporal_decay", type=float, default=0.8,
-                        help="EMA decay in [0,1) for historical standardized candidate scores. "
-                             "A value of 0.8 retains roughly five observations. Default: 0.8.")
-    parser.add_argument("--candidate_temporal_start_epoch", type=int, default=0,
-                        help="Earliest epoch at which temporal scores are accumulated and used; stochastic "
-                             "exploration always takes precedence. Default: 0.")
+    parser.add_argument("--candidate_frequency_curriculum_epochs", type=float, default=0.0,
+                        help="Hard-assignment epochs spent ranking every candidate at progressively higher "
+                             "low-pass resolutions. 0 keeps full-resolution legacy MSE scoring.")
+    parser.add_argument("--candidate_frequency_scales", type=comma_separated_floats,
+                        default=(0.25, 0.5, 0.75),
+                        help="Comma-separated image-size fractions used in equal stages during the candidate "
+                             "frequency curriculum. Full resolution is restored afterward.")
     parser.add_argument("--pose_diagnostics", action="store_true",
                         help="Track per-particle winner rotations and top-two loss margins. Adds a small "
                              "device-to-host transfer per batch but does not affect training.")
@@ -2314,8 +2057,7 @@ def main():
                         help="Minimum latent standard deviation targeted by the variance penalty.")
     parser.add_argument("--het_start_epoch", type=int, default=None,
                         help="First epoch that trains heterogeneity, providing a consensus-only warm-up. "
-                             "Defaults: legacy heterogeneity=0, anti-collapse=5, or five epochs after "
-                             "adaptive candidate exploration when that pose profile is enabled.")
+                             "Profile defaults: legacy heterogeneity=0, anti-collapse=5.")
     parser.add_argument("--het_train_consensus", action="store_true",
                         help="Continue training pose and consensus after heterogeneity training begins.")
     parser.add_argument("--het_latent_bank_size", type=int, default=2048,
@@ -2358,48 +2100,28 @@ def main():
         # A single profile switch should reproduce the historical heterogeneity
         # architecture even when execution optimizations remain enabled.
         args.het_encoder_architecture = "legacy"
-    if args.pose_explore_epochs < 0.0:
-        parser.error("--pose_explore_epochs must be non-negative")
-    if args.candidate_coverage_weight is None:
-        args.candidate_coverage_weight = (
-            0.01 if args.pose_search_profile == "adaptive" else 0.0)
-    if args.candidate_anchor_cap_degrees is None:
-        args.candidate_anchor_cap_degrees = (
-            25.0 if args.pose_search_profile == "adaptive" else 0.0)
     if args.candidate_coverage_epochs < 0.0:
         parser.error("--candidate_coverage_epochs must be non-negative")
     if args.candidate_coverage_bins < 2:
         parser.error("--candidate_coverage_bins must be at least 2")
     if args.candidate_bank_samples < 0:
         parser.error("--candidate_bank_samples must be non-negative")
-    if args.pose_temperature_start <= 0.0 or args.pose_temperature_end <= 0.0:
-        parser.error("pose temperatures must be positive")
     if args.candidate_coverage_kappa <= 0.0:
         parser.error("--candidate_coverage_kappa must be positive")
     if not 0.0 <= args.candidate_bank_mix < 1.0:
         parser.error("--candidate_bank_mix must be in [0,1)")
-    if args.candidate_coverage_weight < 0.0 or args.pose_uniform_weight < 0.0:
-        parser.error("pose regularization weights must be non-negative")
-    if args.candidate_anchor_cap_degrees < 0.0:
-        parser.error("--candidate_anchor_cap_degrees must be non-negative")
-    if args.candidate_head_hysteresis_std < 0.0:
-        parser.error("--candidate_head_hysteresis_std must be non-negative")
-    if args.candidate_head_hysteresis_start_epoch < 0:
-        parser.error("--candidate_head_hysteresis_start_epoch must be non-negative")
-    if not 0.0 <= args.candidate_temporal_weight <= 1.0:
-        parser.error("--candidate_temporal_weight must be in [0,1]")
-    if not 0.0 <= args.candidate_temporal_decay < 1.0:
-        parser.error("--candidate_temporal_decay must be in [0,1)")
-    if args.candidate_temporal_start_epoch < 0:
-        parser.error("--candidate_temporal_start_epoch must be non-negative")
-    if (args.pose_search_profile == "adaptive"
-            and args.heterogeneity_profile == "anti_collapse"
-            and args.het_freeze_consensus is not False
-            and args.het_start_epoch is None):
-        args.het_start_epoch = int(np.ceil(max(
-            args.pose_explore_epochs,
-            args.candidate_coverage_epochs
-            if args.candidate_coverage_weight > 0.0 else 0.0) + 5.0))
+    if args.candidate_coverage_weight < 0.0:
+        parser.error("--candidate_coverage_weight must be non-negative")
+    if args.candidate_frequency_curriculum_epochs < 0.0:
+        parser.error("--candidate_frequency_curriculum_epochs must be non-negative")
+    if (not args.candidate_frequency_scales
+            or any(scale <= 0.0 or scale > 1.0
+                   for scale in args.candidate_frequency_scales)):
+        parser.error("--candidate_frequency_scales values must be in (0,1]")
+    if any(right <= left for left, right in zip(
+            args.candidate_frequency_scales,
+            args.candidate_frequency_scales[1:])):
+        parser.error("--candidate_frequency_scales must be strictly increasing")
     if args.seed is not None:
         if args.seed < 0:
             parser.error("--seed must be non-negative")
@@ -2504,7 +2226,6 @@ def main():
                             optimization_profile=args.optimization_profile,
                             pose_head_rank=args.pose_head_rank,
                             pose_spatial_pool=args.pose_spatial_pool,
-                            pose_anchor_cap_degrees=args.candidate_anchor_cap_degrees,
                             het_encoder_architecture=args.het_encoder_architecture,
                             consensus_parameterization=args.consensus_parameterization,
                             render_chunk_size=args.render_chunk_size,
@@ -2597,16 +2318,6 @@ def main():
         pose_diagnostics_tracker = (
             _PoseDiagnosticsTracker(len(generator.md), reconsiren.symmetry_matrices)
             if args.pose_diagnostics else None)
-        track_candidate_heads = (
-            args.pose_diagnostics or args.candidate_head_hysteresis_std > 0.0
-            or args.candidate_temporal_weight > 0.0)
-        candidate_head_history = (
-            np.full(len(generator.md), -1, dtype=np.int32)
-            if track_candidate_heads else None)
-        temporal_candidate_scores = (
-            _TemporalCandidateScoreBank(
-                len(generator.md), reconsiren.encoder_pose.num_components)
-            if args.candidate_temporal_weight > 0.0 else None)
         graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_volume, optimizer_het))
 
         # Resume if checkpoint exists
@@ -2657,14 +2368,8 @@ def main():
                     total_consensus_amplitude_rms = 0
                     total_consensus_amplitude_max = 0
                     total_consensus_active_amplitude_fraction = 0
-                    total_hysteresis_retained_fraction = 0
-                    total_hysteresis_accepted_switch_fraction = 0
-                    total_hysteresis_previous_available_fraction = 0
-                    total_hysteresis_challenger_advantage_std = 0
-                    total_temporal_history_available_fraction = 0
-                    total_temporal_selection_changed_fraction = 0
-                    total_temporal_current_disadvantage_std = 0
-                    total_temporal_score_adjustment = 0
+                    total_frequency_full_agreement = 0
+                    total_frequency_full_disadvantage_std = 0
                     projection_diagnostic_steps = 0
                     total_validation_loss = 0
 
@@ -2730,8 +2435,7 @@ def main():
                                     (x_latent, labels_latent) = next(iter_data_loader_train)
                                     _, _, latent = predict_angular_assignment_step_reconsiren(
                                         graphdef_aux, state_aux, x_latent, labels_latent,
-                                        md_columns, rng,
-                                        candidate_scoring=args.candidate_scoring)
+                                        md_columns, rng)
                                     latents.append(np.array(latent))
                                 latents = np.concatenate(latents, axis=0)
                                 n_clusters = int(min(10, latents.shape[0]))
@@ -2752,38 +2456,20 @@ def main():
 
                     i += 1
 
-                if args.pose_search_profile == "legacy":
-                    if total_steps <= 1500:
-                        tau = 1e-3
-                        use_tau = True
-                        active_candidate_scoring = "mse"
-                    else:
-                        tau = 0.0
-                        use_tau = False
-                        active_candidate_scoring = args.candidate_scoring
-                    assignment_mode = "legacy"
-                    adaptive_temperature = False
-                    uniform_scope = "candidates"
-                    uniform_weight = 0.1
+                # Preserve the historical 1,500-step stochastic warm-up.  The
+                # frequency curriculum begins only once hard assignment starts.
+                if total_steps <= 1500:
+                    tau = 1e-3
+                    use_tau = True
+                    candidate_scoring_size = xsize
                 else:
-                    exploration_steps = args.pose_explore_epochs * steps_per_epoch
-                    exploring = exploration_steps > 0 and total_steps < exploration_steps
-                    progress = (min(total_steps / exploration_steps, 1.0)
-                                if exploration_steps > 0 else 1.0)
-                    if exploring:
-                        # Geometric temperature interpolation is smooth in log-space.
-                        tau = (args.pose_temperature_start
-                               * (args.pose_temperature_end / args.pose_temperature_start) ** progress)
-                        assignment_mode = args.pose_assignment
-                        active_candidate_scoring = "mse"
-                    else:
-                        tau = args.pose_temperature_end
-                        assignment_mode = "hard"
-                        active_candidate_scoring = args.candidate_scoring
+                    tau = 0.0
                     use_tau = False
-                    adaptive_temperature = not args.pose_absolute_temperature
-                    uniform_scope = args.pose_uniform_scope
-                    uniform_weight = args.pose_uniform_weight
+                    candidate_scoring_size = _candidate_frequency_scoring_size(
+                        xsize, total_steps - 1501, steps_per_epoch,
+                        args.candidate_frequency_curriculum_epochs,
+                        args.candidate_frequency_scales)
+                uniform_weight = 0.1
 
                 coverage_steps = args.candidate_coverage_epochs * steps_per_epoch
                 apply_candidate_coverage = (
@@ -2796,77 +2482,29 @@ def main():
                 train_pose_volume = not (
                     heterogeneity_profile == "anti_collapse"
                     and train_heterogeneity and het_freeze_consensus)
-                hard_winner_selection = (
-                    (args.pose_search_profile == "legacy" and not use_tau)
-                    or (args.pose_search_profile == "adaptive"
-                        and assignment_mode == "hard"))
-                apply_candidate_hysteresis = (
-                    args.candidate_head_hysteresis_std > 0.0
-                    and epoch_index >= args.candidate_head_hysteresis_start_epoch
-                    and hard_winner_selection)
-                apply_candidate_temporal_scoring = (
-                    args.candidate_temporal_weight > 0.0
-                    and epoch_index >= args.candidate_temporal_start_epoch
-                    and hard_winner_selection)
-                if track_candidate_heads:
-                    labels_host = np.asarray(labels, dtype=np.int64)
-                    previous_candidate_heads = jnp.asarray(
-                        candidate_head_history[labels_host])
-                else:
-                    previous_candidate_heads = jnp.full_like(labels, -1)
-                if temporal_candidate_scores is not None:
-                    historical_scores_host, historical_valid_host = (
-                        temporal_candidate_scores.batch(labels_host))
-                    historical_candidate_scores = jnp.asarray(historical_scores_host)
-                    historical_candidate_valid = jnp.asarray(historical_valid_host)
-                else:
-                    historical_candidate_scores = jnp.zeros(
-                        (labels.shape[0], reconsiren.encoder_pose.num_components),
-                        dtype=x.dtype)
-                    historical_candidate_valid = jnp.zeros(
-                        historical_candidate_scores.shape, dtype=bool)
                 train_result = train_step_reconsiren(
                     graphdef, state, x, labels, md_columns, rng,
                     lambda_uniform=uniform_weight, tau=tau, use_tau=use_tau,
-                    assignment_mode=assignment_mode,
-                    adaptive_temperature=adaptive_temperature,
                     apply_candidate_coverage=apply_candidate_coverage,
                     candidate_coverage_weight=candidate_coverage_weight,
                     candidate_coverage_bins=args.candidate_coverage_bins,
                     candidate_coverage_kappa=args.candidate_coverage_kappa,
                     candidate_bank_samples=args.candidate_bank_samples,
                     candidate_bank_mix=args.candidate_bank_mix,
-                    uniform_scope=uniform_scope,
-                    candidate_scoring=active_candidate_scoring,
-                    previous_candidate_heads=previous_candidate_heads,
-                    apply_candidate_hysteresis=apply_candidate_hysteresis,
-                    candidate_hysteresis_std=args.candidate_head_hysteresis_std,
-                    historical_candidate_scores=historical_candidate_scores,
-                    historical_candidate_valid=historical_candidate_valid,
-                    apply_candidate_temporal_scoring=apply_candidate_temporal_scoring,
-                    candidate_temporal_weight=args.candidate_temporal_weight,
+                    candidate_scoring_size=candidate_scoring_size,
                     train_pose_volume=train_pose_volume,
                     train_heterogeneity=train_heterogeneity,
                     return_metrics=True,
-                    return_pose_diagnostics=track_candidate_heads)
-                if track_candidate_heads:
+                    return_pose_diagnostics=args.pose_diagnostics)
+                if args.pose_diagnostics:
                     loss, metrics, pose_diagnostics, state, rng = train_result
                     (winner_rotations, selected_heads, best_heads,
                      absolute_margins, relative_margins, standardized_margins,
-                     median_normalized_margins, score_entropies,
-                     evaluated_candidate_heads,
-                     current_standardized_candidate_scores) = pose_diagnostics
-                    candidate_head_history[labels_host] = np.asarray(selected_heads)
-                    if apply_candidate_temporal_scoring:
-                        temporal_candidate_scores.update(
-                            labels_host, evaluated_candidate_heads,
-                            current_standardized_candidate_scores,
-                            args.candidate_temporal_decay)
-                    if pose_diagnostics_tracker is not None:
-                        pose_diagnostics_tracker.update(
-                            labels, winner_rotations, selected_heads, best_heads,
-                            absolute_margins, relative_margins, standardized_margins,
-                            median_normalized_margins, score_entropies, epoch_index)
+                     median_normalized_margins, score_entropies) = pose_diagnostics
+                    pose_diagnostics_tracker.update(
+                        labels, winner_rotations, selected_heads, best_heads,
+                        absolute_margins, relative_margins, standardized_margins,
+                        median_normalized_margins, score_entropies, epoch_index)
                 else:
                     loss, metrics, state, rng = train_result
                 (recon_loss, recon_het_loss, loss_uniform, candidate_coverage_loss,
@@ -2875,14 +2513,8 @@ def main():
                  projection_rms, normalized_target_rms, consensus_amplitude_mean,
                  consensus_amplitude_rms, consensus_amplitude_max,
                  consensus_active_amplitude_fraction,
-                 hysteresis_retained_fraction,
-                 hysteresis_accepted_switch_fraction,
-                 hysteresis_previous_available_fraction,
-                 hysteresis_challenger_advantage_std,
-                 temporal_history_available_fraction,
-                 temporal_selection_changed_fraction,
-                 temporal_current_disadvantage_std,
-                 temporal_score_adjustment) = metrics
+                 frequency_full_agreement,
+                 frequency_full_disadvantage_std) = metrics
                 total_loss += loss
                 total_recon_loss += recon_loss
                 total_recon_het_loss += recon_het_loss
@@ -2898,14 +2530,8 @@ def main():
                 total_consensus_amplitude_rms += consensus_amplitude_rms
                 total_consensus_amplitude_max += consensus_amplitude_max
                 total_consensus_active_amplitude_fraction += consensus_active_amplitude_fraction
-                total_hysteresis_retained_fraction += hysteresis_retained_fraction
-                total_hysteresis_accepted_switch_fraction += hysteresis_accepted_switch_fraction
-                total_hysteresis_previous_available_fraction += hysteresis_previous_available_fraction
-                total_hysteresis_challenger_advantage_std += hysteresis_challenger_advantage_std
-                total_temporal_history_available_fraction += temporal_history_available_fraction
-                total_temporal_selection_changed_fraction += temporal_selection_changed_fraction
-                total_temporal_current_disadvantage_std += temporal_current_disadvantage_std
-                total_temporal_score_adjustment += temporal_score_adjustment
+                total_frequency_full_agreement += frequency_full_agreement
+                total_frequency_full_disadvantage_std += frequency_full_disadvantage_std
                 if train_pose_volume:
                     total_projection_rms += projection_rms
                     total_normalized_target_rms += normalized_target_rms
@@ -2939,10 +2565,20 @@ def main():
                                         "candidate_coverage_kl": float(total_candidate_coverage_loss) / step,
                                         "mean_anchor_deviation_degrees": float(total_anchor_deviation) / step,
                                         "temperature": float(tau),
-                                        "candidate_coverage_weight": float(candidate_coverage_weight),
-                                        "candidate_scoring_ncc": float(
-                                            active_candidate_scoring == "ncc")},
+                                        "candidate_coverage_weight": float(candidate_coverage_weight)},
                                        i * steps_per_epoch + step)
+
+                    writer.add_scalars(
+                        'Candidate frequency curriculum (ReconSIREN)',
+                        {"scoring_resolution_pixels": float(candidate_scoring_size),
+                         "scoring_resolution_fraction": (
+                             float(candidate_scoring_size) / xsize),
+                         "low_frequency_full_winner_agreement": (
+                             float(total_frequency_full_agreement) / step),
+                         "selected_full_loss_disadvantage_std": (
+                             float(total_frequency_full_disadvantage_std) / step),
+                         "active": float(candidate_scoring_size < xsize)},
+                        i * steps_per_epoch + step)
 
                     if pose_diagnostics_tracker is not None:
                         pose_summary = pose_diagnostics_tracker.summary()
@@ -3010,34 +2646,6 @@ def main():
                                  "comparison_coverage": pose_summary["comparison_coverage_fraction"]},
                                 i * steps_per_epoch + step)
 
-                    if args.candidate_head_hysteresis_std > 0.0:
-                        writer.add_scalars(
-                            'Candidate head hysteresis (ReconSIREN)',
-                            {"retained_previous_fraction": (
-                                 float(total_hysteresis_retained_fraction) / step),
-                             "accepted_new_best_fraction": (
-                                 float(total_hysteresis_accepted_switch_fraction) / step),
-                             "previous_head_available_fraction": (
-                                 float(total_hysteresis_previous_available_fraction) / step),
-                             "challenger_advantage_std": (
-                                 float(total_hysteresis_challenger_advantage_std) / step),
-                             "active": float(apply_candidate_hysteresis)},
-                            i * steps_per_epoch + step)
-
-                    if args.candidate_temporal_weight > 0.0:
-                        writer.add_scalars(
-                            'Candidate temporal evidence (ReconSIREN)',
-                            {"history_available_fraction": (
-                                 float(total_temporal_history_available_fraction) / step),
-                             "selection_changed_fraction": (
-                                 float(total_temporal_selection_changed_fraction) / step),
-                             "selected_current_disadvantage_std": (
-                                 float(total_temporal_current_disadvantage_std) / step),
-                             "mean_score_adjustment": (
-                                 float(total_temporal_score_adjustment) / step),
-                             "active": float(apply_candidate_temporal_scoring)},
-                            i * steps_per_epoch + step)
-
                     # Progress bar update  (TQDM)
                     stage = "joint" if train_pose_volume and train_heterogeneity else (
                         "heterogeneity" if train_heterogeneity else "consensus")
@@ -3104,8 +2712,7 @@ def main():
         latents = []
         for (x, labels) in pbar:
             rotations, shifts, latent = predict_angular_assignment_step_reconsiren(
-                graphdef, state, x, labels, md_columns, rng,
-                candidate_scoring=args.candidate_scoring)
+                graphdef, state, x, labels, md_columns, rng)
 
             # Convert rotation to Euler angles in Xmipp format
             euler_angles = xmippEulerFromMatrix(rotations)

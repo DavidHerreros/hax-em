@@ -13,8 +13,8 @@ networks.  Coverage:
 * ``--num_gaussians``          : size of the Gaussian point cloud
 * optimized/legacy profiles    : independent low-rank heads, direct consensus,
                                   candidate and Gaussian render chunking
-* pose-search profiles         : adaptive categorical assignment, bank-aware
-                                  candidate coverage, anchor caps and reproducible seed
+* pose exploration             : bank-aware candidate coverage, low-frequency
+                                  candidate scoring curriculum and reproducible seed
 * heterogeneity profiles       : legacy and staged anti-collapse residual training
 * ``--do_not_learn_volume``    : pose/shift-only refinement against a reference
 * ``--refine_current_assignment`` / ``--symmetry_group``
@@ -114,14 +114,12 @@ def scenarios(workdir, data):
             "--num_gaussians", str(NUM_GAUSS), "--load_images_to_ram",
             "--optimization_profile", "aggressive",
             "--render_chunk_size", "128", "--candidate_chunk_size", "3",
-            "--pose_search_profile", "adaptive", "--pose_explore_epochs", "1",
-            "--pose_assignment", "categorical", "--pose_temperature_start", "1.0",
-            "--pose_temperature_end", "0.2", "--candidate_coverage_epochs", "1",
+            "--candidate_coverage_epochs", "1",
             "--candidate_coverage_weight", "0.01", "--candidate_coverage_bins", "64",
             "--candidate_coverage_kappa", "24", "--candidate_bank_samples", "64",
             "--candidate_bank_mix", "0.5",
-            "--candidate_anchor_cap_degrees", "25", "--pose_uniform_scope", "candidates",
-            "--pose_uniform_weight", "0.01", "--seed", "7",
+            "--candidate_frequency_curriculum_epochs", "1",
+            "--candidate_frequency_scales", "0.25,0.5,0.75", "--seed", "7",
             "--heterogeneity_profile", "anti_collapse", "--het_start_epoch", "1"]
 
     scn = []
@@ -163,14 +161,12 @@ def scenarios(workdir, data):
               "--dataset_split_fraction", "0.7,0.3",
               "--num_gaussians", str(NUM_GAUSS),
               "--optimization_profile", "legacy",
-              "--pose_search_profile", "legacy",
               "--candidate_coverage_epochs", "1",
               "--candidate_coverage_weight", "0.01",
               "--candidate_coverage_bins", "64",
               "--candidate_coverage_kappa", "24",
               "--candidate_bank_samples", "64",
               "--candidate_bank_mix", "0.5",
-              "--candidate_anchor_cap_degrees", "0",
               "--heterogeneity_profile", "legacy",
               "--ssd_scratch_folder", out("train_apply_mmap_scratch"),
               "--sr", str(SR), "--epochs", str(EPOCHS),
