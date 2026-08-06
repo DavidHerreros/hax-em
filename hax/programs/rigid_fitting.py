@@ -123,8 +123,15 @@ def matrix_to_quaternion(R):
 
     return lax.cond(tr > 0, trace_positive, branch_negative)
 
+@jit
+def normalize_volume(vol):
+    p_min, p_max = jnp.percentile(vol, 1), jnp.percentile(vol, 99.9)
+    vol_norm = (vol - p_min) / (p_max - p_min + 1e-8)
+    volume = jnp.clip(vol_norm, 0.0, 1.0)
+    return volume
+
 @partial(jit, static_argnames=("apix",))
-def precompute_target_gradients(vol, apix):
+def precompute_target_gradients(vol, apix, sigma_s):
     nx, ny, nz = vol.shape
     fft_t = jnp.fft.rfftn(vol)
 
@@ -133,9 +140,11 @@ def precompute_target_gradients(vol, apix):
     freq_z = jnp.fft.rfftfreq(nz, d=apix)
     kx, ky, kz = jnp.meshgrid(freq_x, freq_y, freq_z, indexing='ij')
 
-    fft_t_dx = 1j * kx * fft_t
-    fft_t_dy = 1j * ky * fft_t
-    fft_t_dz = 1j * kz * fft_t
+    k2 = kx ** 2 + ky ** 2 + kz ** 2
+    envelope = jnp.exp(-2.0 * jnp.pi ** 2 * k2 * sigma_s ** 2)
+    fft_t_dx = 1j * kx * fft_t * envelope
+    fft_t_dy = 1j * ky * fft_t * envelope
+    fft_t_dz = 1j * kz * fft_t * envelope
 
     return fft_t_dx, fft_t_dy, fft_t_dz
 
@@ -177,10 +186,10 @@ class SparseGaussianRasterizer(eqx.Module):
     sigma: jnp.ndarray
     mesh: jnp.ndarray
 
-    def __init__(self, grid_shape, voxel_size, sigma_vec, kernel_width=7):
+    def __init__(self, grid_shape, voxel_size, sigma_s, kernel_width=7):
         self.grid_shape = grid_shape
         self.voxel_size = voxel_size
-        self.sigma = jnp.maximum(sigma_vec, voxel_size * 0.5)
+        self.sigma = jnp.maximum(sigma_s, voxel_size * 0.5)
 
         r = jnp.arange(-kernel_width // 2, kernel_width // 2 + 1)
         self.mesh = jnp.meshgrid(r, r, r, indexing='ij')
@@ -390,7 +399,7 @@ class RigidEngine:
 
         self.transformation = RigidTransformation()
         self.coords = RigidCoords(topo)
-        self.rasterizer = SparseGaussianRasterizer(self.vol_shape, self.apix, sigma_vec=self.apix, kernel_width=5)
+        self.rasterizer = SparseGaussianRasterizer(self.vol_shape, self.apix, sigma_s=self.apix, kernel_width=5)
 
     def get_transformed_coords(self, transformation):
         g_q, g_s = transformation()
@@ -399,21 +408,19 @@ class RigidEngine:
     def global_grid_search(self, vol_s_orig, vol_s_flip, downsample_factor=4, n_rots=4000, batch_size=100):
         center_proj = jnp.array(self.vol_shape) * self.apix / 2.0
         apix_s = self.apix * downsample_factor
+        sigma_s = jnp.maximum(apix_s * 0.5, 2.5)
 
-        fft_dx_o, fft_dy_o, fft_dz_o = precompute_target_gradients(vol_s_orig, apix_s)
-        fft_dx_f, fft_dy_f, fft_dz_f = precompute_target_gradients(vol_s_flip, apix_s)
+        fft_dx_o, fft_dy_o, fft_dz_o = precompute_target_gradients(vol_s_orig, apix_s, sigma_s)
+        fft_dx_f, fft_dy_f, fft_dz_f = precompute_target_gradients(vol_s_flip, apix_s, sigma_s)
 
-        raster_s = SparseGaussianRasterizer(vol_s_orig.shape, apix_s, sigma_vec=apix_s * 1.5, kernel_width=5)
+        raster_s = SparseGaussianRasterizer(vol_s_orig.shape, apix_s, sigma_s=sigma_s, kernel_width=5)
         rots = generate_uniform_rotations(n_rots)
 
         @jit
         def process_batch(rot_batch, coords, center, weights):
             coords_rot = jnp.einsum('bij,nj->bni', rot_batch, coords) + center
             sim_vol = vmap(lambda c: raster_s(c, weights))(coords_rot)
-
-            sim_centered = sim_vol - jnp.mean(sim_vol)
-            sim_var = jnp.sum(sim_centered ** 2) + EPS
-            probe = sim_centered / jnp.sqrt(sim_var)
+            probe = vmap(normalize_volume)(sim_vol)
 
             res_o = vmap(lambda v: vectorial_rots_shifts(v, fft_dx_o, fft_dy_o, fft_dz_o, vol_s_orig.shape, apix_s))(probe)
             res_f = vmap(lambda v: vectorial_rots_shifts(v, fft_dx_f, fft_dy_f, fft_dz_f, vol_s_orig.shape, apix_s))(probe)
@@ -447,40 +454,37 @@ class RigidEngine:
         top_cc_o, top_idx_o = lax.top_k(all_cc_o, top_k)
         top_cc_f, top_idx_f = lax.top_k(all_cc_f, top_k)
 
+        best_vec_cc_o = top_cc_o[0]
+        best_vec_cc_f = top_cc_f[0]
+
         @eqx.filter_jit
-        def score_pose_native(rot_m, shift_v, target_vol):
+        def get_scalar_cc(rot_m, shift_v, target_vol):
             coords = jnp.dot(self.topo.all_coords, rot_m.T) + center_proj + shift_v
             sim_vol = self.rasterizer(coords, self.topo.atom_weights)
             sim_centered = sim_vol - jnp.mean(sim_vol)
             sim_norm = sim_centered / (jnp.sqrt(jnp.sum(sim_centered ** 2)) + EPS)
             return jnp.sum(sim_norm * target_vol)
 
-        scores_o = jax.vmap(lambda r, s: score_pose_native(r, s, vol_s_orig))(rots[top_idx_o], all_sh_o[top_idx_o])
-        scores_f = jax.vmap(lambda r, s: score_pose_native(r, s, vol_s_flip))(rots[top_idx_f], all_sh_f[top_idx_f])
-        best_idx_o, best_idx_f = jnp.argmax(scores_o), jnp.argmax(scores_f)
+        vol_raw_flip = jnp.flip(self.vol_raw, axis=0)
 
-        if scores_f[best_idx_f] > scores_o[best_idx_o]:
-            print(f">>> FLIPPED Volume Selected (High-Res CC: {float(scores_f[best_idx_f]):.4f})")
-            self.vol_raw = jnp.flip(self.vol_raw, axis=0)
-            final_rot, final_shift = rots[top_idx_f][best_idx_f], all_sh_f[top_idx_f][best_idx_f]
-            self.cc_global = float(scores_f[best_idx_f])
-            final_vol_target = vol_s_flip
+        scalar_cc_o = get_scalar_cc(rots[top_idx_o[0]], all_sh_o[top_idx_o[0]], self.vol_raw)
+        scalar_cc_f = get_scalar_cc(rots[top_idx_f[0]], all_sh_f[top_idx_f[0]], vol_raw_flip)
+
+        if best_vec_cc_f > best_vec_cc_o:
+            print(f">>> FLIPPED Volume Selected")
+            print(f"    - Vectorial CC (Topology) : {float(best_vec_cc_f):.4e}")
+            print(f"    - Original CC  (Scalar)   : {float(scalar_cc_f):.4f}")
+            self.vol_raw = vol_raw_flip
+            final_rot, final_shift = rots[top_idx_f[0]], all_sh_f[top_idx_f[0]]
         else:
-            print(f">>> ORIGINAL Volume Selected (High-Res CC: {float(scores_o[best_idx_o]):.4f})")
-            final_rot, final_shift = rots[top_idx_o][best_idx_o], all_sh_o[top_idx_o][best_idx_o]
-            self.cc_global = float(scores_o[best_idx_o])
-            final_vol_target = vol_s_orig
+            print(f">>> ORIGINAL Volume Selected")
+            print(f"    - Vectorial CC (Topology) : {float(best_vec_cc_o):.4e}")
+            print(f"    - Original CC  (Scalar)   : {float(scalar_cc_o):.4f}")
+            final_rot, final_shift = rots[top_idx_o[0]], all_sh_o[top_idx_o[0]]
 
         final_global_shift = final_shift + center_proj
         self.transformation = eqx.tree_at(lambda m: m.global_rot_quat, self.transformation, matrix_to_quaternion(final_rot))
         self.transformation = eqx.tree_at(lambda m: m.global_shift, self.transformation, final_global_shift)
-
-        final_coords_raw = self.get_transformed_coords(self.transformation)
-        sim_native = self.rasterizer(final_coords_raw, self.topo.atom_weights)
-        sim_centered = sim_native - jnp.mean(sim_native)
-        sim_target = sim_centered / (jnp.sqrt(jnp.sum(sim_centered ** 2)) + EPS)
-        native_cc = jnp.sum(sim_target * final_vol_target)
-        print(f">>> Final Native CC: {native_cc:.4f}\n")
 
     def optimize_rigid_pose(self, epochs=1000, is_aligned=False):
         diff, static = eqx.partition(self.transformation, eqx.is_inexact_array)
@@ -508,9 +512,6 @@ class RigidEngine:
             new_diff = eqx.apply_updates(diff, updates)
             return new_diff, new_state, loss, cc
 
-        vol_centered = self.vol_raw - jnp.mean(self.vol_raw)
-        vol_target = vol_centered / (jnp.sqrt(jnp.sum(vol_centered ** 2)) + EPS)
-
         pbar = tqdm(range(epochs), desc='Local Refinement')
         ccs = []
         for i in pbar:
@@ -519,7 +520,7 @@ class RigidEngine:
                 current_sigma = jnp.array(self.apix * (8.0 - 7.0 * progress))
             else:
                 current_sigma = jnp.array(self.apix * 1.0)
-            diff, opt_state, loss, cc = step(diff, static, opt_state, vol_target, self.rasterizer, self.topo.atom_weights, current_sigma)
+            diff, opt_state, loss, cc = step(diff, static, opt_state, self.vol_raw, self.rasterizer, self.topo.atom_weights, current_sigma)
             ccs.append(cc)
             pbar.set_postfix(Loss=f"{loss:.4f}", CC=f"{cc:.4f}", Sigma=f"{current_sigma:.4f}")
 
@@ -634,16 +635,16 @@ def main():
     topo = ProteinTopology(args.pdb)
     with mrcfile.open(args.vol, permissive=True) as mrc:
         vol = jnp.array(mrc.data.T)
-        vol = jnp.array((vol - jnp.min(vol)) / (jnp.max(vol) - jnp.min(vol) + EPS))
+        vol = vol - jnp.mean(vol)
+        vol_orig = vol / jnp.sqrt(jnp.sum(vol ** 2) + EPS)
         apix = float(mrc.voxel_size.x) if args.sr == 1.0 else args.sr
 
-    engine = RigidEngine(topo, vol, apix, args.out_dir)
+    engine = RigidEngine(topo, vol_orig, apix, args.out_dir)
 
     vol_s_orig = rescale(vol, 1 / args.downfactor, anti_aliasing=True, preserve_range=True)
-    vol_centered = vol_s_orig - jnp.mean(vol_s_orig)
-    vol_centered = vol_centered / jnp.sqrt(jnp.sum(vol_centered ** 2) + EPS)
-    vol_s_flip = jnp.flip(vol_centered, axis=0)
-    engine.global_grid_search(vol_centered, vol_s_flip, downsample_factor=args.downfactor, n_rots=1000, batch_size=10)
+    vol_s_norm = normalize_volume(vol_s_orig)
+    vol_s_flip = jnp.flip(vol_s_norm, axis=0)
+    engine.global_grid_search(vol_s_norm, vol_s_flip, downsample_factor=args.downfactor, n_rots=1000, batch_size=10)
 
     if not args.is_aligned:
         engine.save("final_rigid", is_aligned=args.is_aligned)
