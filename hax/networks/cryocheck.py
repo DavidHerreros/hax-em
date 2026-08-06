@@ -19,7 +19,6 @@ from hax.utils.ctf import computeCTF
 from hax.utils.fourier_filters import ctfFilter
 from hax.utils.euler import euler_matrix_batch
 from hax.utils.decorators import save_config
-from hax.utils.fourier_filters import wiener2DFilter
 
 from hax.programs.gaussian_volume_fitting import fit_volume, adjust_weights_to_images
 
@@ -100,7 +99,7 @@ def md_extraction(md_columns, index, vol, args):
 
 
 # Projecting the batch volume 
-def Preprocessing(vol, mask, euler_angles, shifts, ctf):
+def VolumeProjection(vol, mask, euler_angles, shifts, ctf):
 
     inds = np.asarray(np.where(mask > 0.0)).T #z,y,x voxel
 
@@ -155,6 +154,7 @@ def Preprocessing(vol, mask, euler_angles, shifts, ctf):
     images = ctfFilter(images, ctf, pad_factor=2)
 
     return images[..., None] 
+
 
 # Compute Misalignment 
 def compute_min_rotation_angle(mask, pixel_threshold=2.0):
@@ -283,7 +283,7 @@ def main():
   # Volume and Mask handling
   vol = ImageHandler(args.vol).getData()
   mask = ImageHandler().generateMask(inputFn=vol, boxsize=64)
-  theta_min_deg, R_max = compute_min_rotation_angle(mask, pixel_threshold=2.0) # it will be further used to compute misalignment; ita has to be computed once
+  theta_min_deg, R_max = compute_min_rotation_angle(mask, pixel_threshold=2.0) # it will be further used to compute misalignment; it can be computed once
 
   # Prepare network
   x_size = vol.shape[0]
@@ -293,7 +293,6 @@ def main():
 
   # Reload network
   if args.reload is not None:
-      #cryoCheck = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "cryoCheck"))
       cryoCheck = NeuralNetworkCheckpointer.load(args.reload)
 
   # Load metadata
@@ -314,8 +313,8 @@ def main():
     cryoCheck.train()
     # Prepare summary writer
     writer = JaxSummaryWriter(os.path.join(args.output_path, "cryoCheck_metrics"))
- 
 
+ 
     # Gaussian Splatting to adjust grey levels of the input volume
     if args.vol is not None:
       fit_path = os.path.join(args.output_path, "Gaussian_volume_fitting")
@@ -323,7 +322,7 @@ def main():
       
         model, _, _ = fit_volume(vol, mask=mask, iterations=20000, learning_rate=0.001, n_init=args.num_gaussians, fixed_gaussians=True)
         
-        # Adjust to images (options are apply mode or wiener mode)
+        # Adjust to images 
         model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
                                             num_epochs=5, is_global=True, ctf_type="apply")
 
@@ -352,7 +351,7 @@ def main():
     steps_per_val = int(int(args.dataset_split_fraction[1] * len(generator.md)) / args.batch_size)
 
     # Optimizer
-    optimizer = nnx.Optimizer(cryoCheck, optax.adamw(args.learning_rate), wrt=nnx.Param)  # optax.adamw, optax.sgd
+    optimizer = nnx.Optimizer(cryoCheck, optax.adamw(args.learning_rate), wrt=nnx.Param)  
     
     # Resume if checkpoint exists
     if os.path.isdir(os.path.join(args.output_path, "cryoCheck_CHECKPOINT")):
@@ -387,7 +386,7 @@ def main():
         batch_size = len(index)
         
         # Aligned images
-        projection_al = Preprocessing(vol=vol,
+        projection_al = VolumeProjection(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles,
                                  shifts=shifts,
@@ -399,7 +398,7 @@ def main():
 
         # Misaligned images - Data Augmentation
         rngs, euler_angles_noisy, shifts_noisy = generate_misalignment(rngs, euler_angles, shifts, box_size=x_size, theta_min_deg=theta_min_deg)
-        projection_misal = Preprocessing(vol=vol,
+        projection_misal = VolumeProjection(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles_noisy,
                                  shifts=shifts_noisy,
@@ -466,7 +465,7 @@ def main():
 
 
             # Aligned images
-            projection_al_v = Preprocessing(vol=vol,
+            projection_al_v = VolumeProjection(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles,
                                  shifts=shifts,
@@ -479,7 +478,7 @@ def main():
     
             # Misaligned images
             rngs, euler_angles_noisy, shifts_noisy = generate_misalignment(rngs, euler_angles, shifts, box_size=x_size, theta_min_deg=theta_min_deg)
-            projection_misal_v = Preprocessing(vol=vol,
+            projection_misal_v = VolumeProjection(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles_noisy,
                                  shifts=shifts_noisy,
@@ -621,7 +620,7 @@ def main():
 
       euler_angles, shifts, ctf = md_extraction (md_columns, index, vol, args)
       
-      projection_pred = Preprocessing(vol=vol,
+      projection_pred = VolumeProjection(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles,
                                  shifts=shifts,
