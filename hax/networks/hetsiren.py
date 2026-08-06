@@ -454,7 +454,7 @@ class DeltaVolumeDecoder(nnx.Module):
                                bposi + jnp.array((0, 1, 1)), bposi + jnp.array((1, 0, 1)), bposi + jnp.array((1, 1, 0)), bposi + jnp.array((1, 1, 1))], axis=1)
         else:
             bamp = values
-            bposi = coords
+            bposi = jnp.round(coords).astype(jnp.int32)
 
         def scatter_volume(vol, bpos_i, bamp_i):
             return vol.at[bpos_i[..., 2], bpos_i[..., 1], bpos_i[..., 0]].add(bamp_i)
@@ -868,8 +868,8 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         l1_loss = jnp.mean(jnp.abs(values))
 
         # L1 denoising for negative values
-        values_neg = jnp.where(values < 0.0, -values, 0.0)
-        l1_loss += jnp.mean(values_neg, where=values_neg > 0.0)
+        #values_neg = jnp.where(values < 0.0, -values, 0.0)
+        #l1_loss += jnp.mean(values_neg, where=values_neg > 0.0)
 
         # L1 and L2 total variation (old version - no sparse)
         # diff_x = volumes[:, 1:, :, :] - volumes[:, :-1, :, :]
@@ -1426,18 +1426,13 @@ def main():
                              f'{bcolors.WARNING}NOTE{bcolors.ENDC}: When this option is set and a reference volume is provided, we recommend changing the reference mask to a tight mask computed '
                              f'from the reference volume. This mask now tells the program which regions should be moved. Therefore, consider providing a mask that covers all the protein regions you would like '
                              f'to be analyzed by HetSIREN.')
-    parser.add_argument("--num_gaussians", required=False, type=int,
-                        help="Before training the network, HetSIREN will try to fit a set of Gaussians in the reference volume to recreate it. "
-                            "The default criterium is to automatically determine the number of Gaussians needed to reproduce the reference volume "
-                            "with high-fidelity. However, if you prefer to fix the number of Gaussians in advance based on your own criterium (e.g., "
-                            "the number of residues in your protein), you can set this parameter. When set, the HetSIREN will fit this fixed number of Gaussians "
-                            "so that the reproduce the reference volume as well as possible.")
     parser.add_argument("--sharpening", required=False, action='store_true',
-                        help='')
-    parser.add_argument("--densify_interval", required=False, type=int, default=500,
-                        help='')
-    parser.add_argument("--max_gaussians", required=False, type=int, default=50000,
-                        help='')
+                        help='When set, TomoSIREN architecture will take over instead of HetSIREN for a sharpening approach related to '
+                             'a tomography assumption for homogeneous volumes and gaussian fitting.')
+    parser.add_argument("--n_iter", required=False, type=int, default=20000,
+                        help='Total number of iterations to compute in gaussian fitting.')
+    parser.add_argument("--max_gaussians", required=False, type=int, default=20000,
+                        help='Maximum number of gaussians allowed in gaussian fitting when network tends to overfit.')
     parser.add_argument("--local_reconstruction", action='store_true',
                         help=f'When set, HetSIREN will turn to local heterogeneous reconstruction/refinement mod, focusing the analysis of heterogeneity to a region of interest enclosed by the provided refernece mask. '
                              f'{bcolors.WARNING}WARNING{bcolors.ENDC}: IF PROVIDED, TRANSPORT MASS WILL BE OVERRIDDEN AND NOT CONSIDERED. '
@@ -1578,9 +1573,8 @@ def main():
                         mask_fit = ImageHandler().generateMask(inputFn=vol, boxsize=64)
 
                     # Consensus volume
-                    num_gaussians = args.num_gaussians if args.num_gaussians else 2500
-                    model, _, _ = fit_volume(vol, mask=mask_fit, iterations=20000, learning_rate=0.01,
-                                             densify_interval=args.densify_interval, n_init=num_gaussians, max_gaussians=args.max_gaussians)
+                    model, _, _ = fit_volume(vol * mask_fit, mask=mask_fit, iterations=args.n_iter, learning_rate=0.01,
+                                             max_gaussians=args.max_gaussians)
 
                     # Adjust to images
                     model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.0001,
@@ -1592,8 +1586,8 @@ def main():
                     # Save volume
                     vol = np.array(model(place_deltas=True))
                     vol_splatted = np.array(model())
-                    ImageHandler().write(vol_splatted, os.path.join(args.output_path, "consensus_volume.mrc"), overwrite=True)
-                    ImageHandler().write(vol, os.path.join(args.output_path, "consensus_volume_deltas.mrc"), overwrite=True)
+                    ImageHandler().write(vol_splatted, os.path.join(args.output_path, "consensus_volume.mrc"), overwrite=True, sr=args.sr)
+                    ImageHandler().write(vol, os.path.join(args.output_path, "consensus_volume_deltas.mrc"), overwrite=True, sr=args.sr)
                 else:
                     model = NeuralNetworkCheckpointer.load(checkpoint_path=fit_path)
                     vol = np.array(model(place_deltas=True))
@@ -1606,15 +1600,12 @@ def main():
                 values = np.array(jax.nn.relu(model.weights.get_value()))
                 sigma = jax.nn.relu(model.sigma_param.get_value())
             else:
+                vol = np.array(model())
+                mask = ImageHandler().generateMask(inputFn=vol, boxsize=generator.md.getMetaDataImage(0).shape[0])
                 inds = np.asarray(np.where(mask > 0.0)).T
                 coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)
-                if args.vol is None:
-                    values = jnp.zeros((inds.shape[0],))
-                    sigma = 1.0
-                else:
-                    vol = np.array(model())
-                    values = vol[inds[:, 0], inds[:, 1], inds[:, 2]]
-                    sigma = jax.nn.relu(model.sigma_param.get_value())
+                values = vol[inds[:, 0], inds[:, 1], inds[:, 2]]
+                sigma = jax.nn.relu(model.sigma_param.get_value())
 
             hetsiren = HetSIREN(args.lat_dim, vol, mask, coords, values,
                                 generator.md.getMetaDataImage(0).shape[0], args.sr, d_hid=d_hid, sigma=sigma,

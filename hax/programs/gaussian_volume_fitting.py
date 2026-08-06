@@ -117,17 +117,17 @@ def splat_weights_bilinear(grid_shape, means, weights, sigma, rotations, shifts,
     # images = FastVariableBlur2D((grid_shape, grid_shape))(images[..., None], sigma)[..., 0]
 
     # Apply CTF
-    pad_factor = 1 if grid_shape > 256 else 2
-    images = ctfFilter(images, ctf, pad_factor=pad_factor)
-
-    return images
+    return ctfFilter(images, ctf, pad_factor=1 if grid_shape > 256 else 2)
+    #return images
 
 @partial(jax.jit, static_argnames=("image_size", "apix",))
-def global_gaussian_splat(image_size, coords_px_patch, apix, sigma_angstrom, grid, rots, shifts_px, ctfs, point_weights=1.0):
-    coords_rots = jnp.einsum('bni,bji->bnj', coords_px_patch - image_size / 2.0, rots)
-    coords_2d = coords_rots[..., :2] - shifts_px[:, None, :] + image_size / 2.0
+def global_gaussian_splat(image_size, coords_px, apix, sigma_angstrom, grid, rots, shifts_px, ctfs, point_weights=1.0):
+    factor = 0.5 * image_size
 
-    def single_projection_splat(coords_px, sigma_ang):
+    coords_rots = jnp.einsum('bni,bji->bnj', coords_px, rots)
+    coords_2d = factor * coords_rots[..., :2] - shifts_px[:, None, :] + factor
+
+    def single_projection_splat(coords_px, sigma_ang, pw_i):
         coords_px_int = jax.lax.stop_gradient(jnp.round(coords_px).astype(jnp.int32))
 
         grid_x = grid[:, 1]
@@ -140,43 +140,45 @@ def global_gaussian_splat(image_size, coords_px_patch, apix, sigma_angstrom, gri
         diff_y = shifted_coords_y.astype(jnp.float32) - coords_px[:, 1:2]
         dist_sq = diff_x ** 2 + diff_y ** 2
 
-        var_px = (sigma_ang / apix) ** 2 + (1.0 / (2.0 * apix)) ** 2
+        var_px = (sigma_ang / apix) ** 2
         if var_px.ndim == 1:
             var_px = var_px[:, None]
 
-        pw = point_weights[:, None] if hasattr(point_weights, 'ndim') and point_weights.ndim == 1 else point_weights
+        pw = pw_i[:, None] if hasattr(pw_i, 'ndim') and pw_i.ndim == 1 else pw_i
 
         amplitude = 1.0 / (2.0 * jnp.pi * var_px + 1e-6)
         weights = amplitude * jnp.exp(-dist_sq / (2.0 * var_px + 1e-6)) * pw
 
         out_of_bounds = (shifted_coords_x < 0) | (shifted_coords_x >= image_size) | \
                         (shifted_coords_y < 0) | (shifted_coords_y >= image_size) | \
-                        (weights.reshape(shifted_coords_x.shape) < 1e-4)
+                        (weights < 1e-4)
 
         target_idx = shifted_coords_y * image_size + shifted_coords_x
+        safe_weights = jnp.where(out_of_bounds, 0.0, weights)
         safe_idx = jnp.where(out_of_bounds, image_size * image_size, target_idx).astype(jnp.int32)
 
         img_flat = jnp.zeros((image_size * image_size) + 1, dtype=jnp.float32)
-        img_flat = img_flat.at[safe_idx.reshape(-1)].add(weights.reshape(-1))
+        img_flat = img_flat.at[safe_idx.reshape(-1)].add(safe_weights.reshape(-1))
         return img_flat[:-1].reshape(image_size, image_size)
 
     sigma_axes = 0 if hasattr(sigma_angstrom, 'ndim') and sigma_angstrom.ndim == 2 else None
-    images = jax.vmap(single_projection_splat, in_axes=(0, sigma_axes))(coords_2d, sigma_angstrom)
-
-    pad_factor = 1 if image_size > 256 else 2
-    images = ctfFilter(images, ctfs, pad_factor=pad_factor)
-    return images
+    pw_axes = 0 if hasattr(point_weights, 'ndim') and point_weights.ndim == 2 else None
+    images = jax.vmap(single_projection_splat, in_axes=(0, sigma_axes, pw_axes))(coords_2d, sigma_angstrom, point_weights)
+    return ctfFilter(images, ctfs, pad_factor=1 if image_size > 256 else 2)
+    #return images
 
 
 @partial(jax.jit, static_argnames=("image_size", "apix",))
 def anisotropic_gaussian_splat(image_size, coords_px, apix, sigma_3d, grid, rots, shifts_px, ctfs, point_weights=1.0):
-    coords_rots = jnp.einsum('bni,bji->bnj', coords_px - image_size / 2.0, rots)
-    coords_2d = coords_rots[..., :2] - shifts_px[:, None, :] + image_size / 2.0
+    factor = 0.5 * image_size
 
-    sigma_3d_rotated = jnp.einsum('brc,bncd,bkd->bnrk', rots, sigma_3d / (apix ** 2), rots)
-    sigma_2d = sigma_3d_rotated[:, :, :2, :2] + jnp.eye(2)[None, None, :, :] * (1.0 / (2.0 * apix)) ** 2
+    coords_rots = jnp.einsum('bni,bji->bnj', coords_px, rots)
+    coords_2d = factor * coords_rots[..., :2] - shifts_px[:, None, :] + factor
 
-    def single_projection_splat(c_px, sig_2d):
+    sigma_3d_rotated = jnp.einsum('brc,bncd,bkd->bnrk', rots, sigma_3d, rots)
+    sigma_2d_px = sigma_3d_rotated[:, :, :2, :2] / (apix ** 2)
+
+    def single_projection_splat(c_px, sig_2d, pw_i):
         c_px_int = jax.lax.stop_gradient(jnp.round(c_px).astype(jnp.int32))
         grid_x, grid_y = grid[:, 1], grid[:, 0]
 
@@ -186,13 +188,19 @@ def anisotropic_gaussian_splat(image_size, coords_px, apix, sigma_3d, grid, rots
         diff_y = shifted_coords_y.astype(jnp.float32) - c_px[:, 1:2]
 
         a, b, c, d = sig_2d[:, 0, 0:1], sig_2d[:, 0, 1:2], sig_2d[:, 1, 0:1], sig_2d[:, 1, 1:2]
-        det = jnp.maximum((a * d - b * c), 1e-4)
-        inv_00, inv_01, inv_11 = d / det, -b / det, a / det
+
+        b_sym = 0.5 * (b + c)
+        a_f = a + (1.0 / 12.0)
+        d_f = d + (1.0 / 12.0)
+
+        det = (a_f * d_f) - (b_sym ** 2)
+        inv_00, inv_01, inv_11 = d_f / det, -b_sym / det, a_f / det
 
         dist_sq = (diff_x ** 2) * inv_00 + 2.0 * diff_x * diff_y * inv_01 + (diff_y ** 2) * inv_11
-        pw = point_weights[:, None] if hasattr(point_weights, 'ndim') and point_weights.ndim == 1 else point_weights
 
-        amplitude = 1.0 / (2.0 * jnp.pi * jnp.sqrt(det) + 1e-6)
+        pw = pw_i[:, None] if hasattr(pw_i, 'ndim') and pw_i.ndim == 1 else pw_i
+
+        amplitude = 1.0 / (2.0 * jnp.pi * jnp.sqrt(det))
         weights = amplitude * jnp.exp(-0.5 * dist_sq) * pw
 
         out_of_bounds = (shifted_coords_x < 0) | (shifted_coords_x >= image_size) | \
@@ -206,7 +214,8 @@ def anisotropic_gaussian_splat(image_size, coords_px, apix, sigma_3d, grid, rots
         img_flat = img_flat.at[safe_idx.reshape(-1)].add(safe_weights.reshape(-1))
         return img_flat.reshape(image_size, image_size)
 
-    images = jax.vmap(single_projection_splat, in_axes=(0, 0))(coords_2d, sigma_2d)
+    pw_axes = 0 if hasattr(point_weights, 'ndim') and point_weights.ndim == 2 else None
+    images = jax.vmap(single_projection_splat, in_axes=(0, 0, pw_axes))(coords_2d, sigma_2d_px, point_weights)
     return ctfFilter(images, ctfs, pad_factor=1 if image_size > 256 else 2)
 
 
@@ -289,6 +298,17 @@ class FastVariableBlur3D(nnx.Module):
         # Broadcasting automatically expands this to (D, H, W/2+1)
         self.f_sq = fz ** 2 + fy ** 2 + fx ** 2
 
+        # Anti-Aliasing del Splatting Trilineal
+        # jnp.sinc(x) es sin(pi*x)/(pi*x).
+        sinc_z = jnp.sinc(fz)
+        sinc_y = jnp.sinc(fy)
+        sinc_x = jnp.sinc(fx)
+
+        # Splatting effect on volumen is sinc^2.
+        # Precomputing the inverse for forward pass.
+        sinc_3d_squared = (sinc_z * sinc_y * sinc_x) ** 2
+        self.sinc_inv = 1.0 / (sinc_3d_squared + 1e-8)
+
     def __call__(self, x: jax.Array, sigma: float) -> jax.Array:
         """
         Args:
@@ -297,7 +317,7 @@ class FastVariableBlur3D(nnx.Module):
         """
         # 3. Generate Gaussian Mask on-the-fly
         # Formula: exp(-2 * pi^2 * sigma^2 * (u^2 + v^2 + w^2))
-        mask = jnp.exp(-2 * jnp.pi ** 2 * sigma ** 2 * self.f_sq)
+        mask = jnp.exp(-2 * jnp.pi ** 2 * sigma ** 2 * self.f_sq) * self.sinc_inv
 
         # 4. RFFTN (Real -> Complex, N-dimensional)
         # We perform FFT over axes 1 (D), 2 (H), 3 (W).
@@ -325,7 +345,7 @@ class FastVariableBlur3D(nnx.Module):
 class GaussianSplatModel(nnx.Module):
 
     @save_config
-    def __init__(self, grid_size, n_init=None, manual_init=None, *, rngs: nnx.Rngs):
+    def __init__(self, grid_size, sigma=1.0, n_init=None, manual_init=None, *, rngs: nnx.Rngs):
         self.grid_size = grid_size
 
         # Define Parameters using nnx.Param
@@ -338,7 +358,7 @@ class GaussianSplatModel(nnx.Module):
                 jnp.abs(jax.random.normal(rngs.params(), (n_init,)))
             )
             self.sigma_param = nnx.Param(
-                jnp.array([1.0])  # Global blur sigma
+                jnp.array([sigma])  # Global blur sigma
             )
         elif manual_init is not None:
             self.means = nnx.Param(
@@ -348,7 +368,7 @@ class GaussianSplatModel(nnx.Module):
                 jnp.array(manual_init["weights"], dtype=jnp.float32)
             )
             self.sigma_param = nnx.Param(
-                jnp.array([1.0])  # Global blur sigma
+                jnp.array([sigma])  # Global blur sigma
             )
         else:
             raise ValueError("Provide either n_init or manual_init")
@@ -398,20 +418,21 @@ class GaussianSplatModel(nnx.Module):
             if "pdb" in kwargs.keys():
                 means = kwargs.pop("means")
                 weights = kwargs.pop("weights") if "weights" in kwargs.keys() else 1.0
-                if "sigma" in kwargs.keys():
-                    coarse_grained = kwargs.pop("coarse_grained")
+                if "grid" in kwargs.keys():
                     sr = projection_parameters["sr"]
-                    if coarse_grained:
-                        final_images = anisotropic_gaussian_splat(self.grid_size, means, sr,
-                                                             kwargs.pop("sigma"), kwargs.pop("grid"),
-                                                             rotations, shifts, ctf, point_weights=weights)
-                    else:
-                        final_images = global_gaussian_splat(self.grid_size, means, sr,
-                                                                  kwargs.pop("sigma"), kwargs.pop("grid"),
-                                                                  rotations, shifts, ctf, point_weights=weights)
+                    final_images = anisotropic_gaussian_splat(self.grid_size, means, sr,
+                                                         kwargs.pop("sigma"), kwargs.pop("grid"),
+                                                         rotations, shifts, ctf, point_weights=weights)
                 else:
-                    final_images = jax.vmap(lambda m, r, sh, c: splat_weights_bilinear(self.grid_size, m, weights, sigma, r[None, ...],
-                                                          sh[None, ...], c[None, ...], pdb=True)[0])(means, rotations, shifts, ctf)
+                    in_axes_m = 0 if means.ndim == 3 else None
+                    in_axes_w = 0 if (hasattr(weights, 'ndim') and weights.ndim == 2) else None
+
+                    final_images = jax.vmap(
+                        lambda m, w, r, sh, c: splat_weights_bilinear(
+                            self.grid_size, m, w, sigma, r[None, ...], sh[None, ...], c[None, ...], pdb=True
+                        )[0],
+                        in_axes=(in_axes_m, in_axes_w, 0, 0, 0)
+                    )(means, weights, rotations, shifts, ctf)
             else:
                 final_images = splat_weights_bilinear(self.grid_size, means, weights, sigma, rotations, shifts, ctf)
             return final_images
@@ -424,55 +445,82 @@ class GaussianSplatModel(nnx.Module):
             else:
                 final_vol = splat_weights(self.grid_size, means, weights)
             return final_vol
-        
-        
+
+
 class GlobalAdjustment(nnx.Module):
 
     def __init__(self):
         self.a = nnx.Param(1.0)
         self.b = nnx.Param(0.0)
-        
+
     def __call__(self, x):
         return nnx.relu(self.a.get_value()) * x + self.b.get_value()
-    
+
 
 # --- 3. ADAPTIVE LOGIC (NNX Compatible) ---
 
-def adapt_gaussians(model, grads, max_gaussians=50000, lr=None, optimizer=None):
-    """
-    Modifies the model structure (adds/removes params) and re-initializes optimizer.
-    """
+def adapt_gaussians(model, grads, key, max_gaussians=50000, lr=None, optimizer=None):
     means = model.means.get_value()
     weights_param = model.weights.get_value()
-
     actual_weights = nnx.relu(weights_param)
-    prune_threshold = jnp.maximum(
-        jnp.percentile(actual_weights, 5),
-        jnp.max(actual_weights) * 0.005
-    )
+    sigma = nnx.relu(model.sigma_param.get_value())
+
+    prune_threshold = jnp.max(actual_weights) * 0.005
     keep_mask = actual_weights > prune_threshold
     print("weights", actual_weights, prune_threshold)
 
     means = means[keep_mask]
-    weights_param = weights_param[keep_mask]
+    actual_weights = actual_weights[keep_mask]
     grad_means = grads.means.get_value()[keep_mask]
 
-    grad_norms = jnp.linalg.norm(grad_means, axis=-1)
-    grad_threshold = jnp.percentile(grad_norms, 90)
-    frustrated_mask = grad_norms > grad_threshold
+    epsilon = prune_threshold / (jnp.median(actual_weights) + 1e-5)
+    epsilon = jnp.clip(epsilon, 0.01, 0.99)
+    d_max = sigma * jnp.sqrt(-4.0 * jnp.log(epsilon))
+    d_max = jnp.minimum(d_max, 2.0 / model.grid_size)
+
+    voxel_coords = jnp.round(means / d_max).astype(jnp.int32)
+    voxel_coords = voxel_coords - jnp.min(voxel_coords, axis=0)
+    grid_size_hash = jnp.max(voxel_coords, axis=0) + 1
+
+    voxel_ids_grid = voxel_coords[:, 0] + \
+                     voxel_coords[:, 1] * grid_size_hash[0] + \
+                     voxel_coords[:, 2] * (grid_size_hash[0] ** 2)
+
+    grad_norms_pre = jnp.linalg.norm(grad_means, axis=-1)
+    is_stable = grad_norms_pre < jnp.mean(grad_norms_pre)
+
+    safe_ids = (grid_size_hash[0] ** 3) + jnp.arange(means.shape[0])
+    voxel_ids = jnp.where(is_stable, voxel_ids_grid, safe_ids)
+
+    unique_ids, inverse_indices = jnp.unique(voxel_ids, return_inverse=True)
+
+    weighted_means = means * actual_weights[:, None]
+    sum_weighted_means = jax.ops.segment_sum(weighted_means, inverse_indices, num_segments=unique_ids.shape[0])
+    merged_weights_actual = jax.ops.segment_sum(actual_weights, inverse_indices, num_segments=unique_ids.shape[0])
+
+    safe_merged_weights = jnp.where(merged_weights_actual > 0, merged_weights_actual, 1.0)
+    merged_means = sum_weighted_means / safe_merged_weights[:, None]
+
+    merged_grad_means = jax.ops.segment_sum(grad_means, inverse_indices, num_segments=unique_ids.shape[0])
+    merged_weights_param = merged_weights_actual
+
+    grad_norms = jnp.linalg.norm(merged_grad_means, axis=-1)
+    sigma_mask = 1.0 / (sigma + 1e-5)
+    grad_threshold = jnp.mean(grad_norms) + (sigma_mask * jnp.std(grad_norms))
+    split_mask = grad_norms > grad_threshold
     print("grad", grad_norms, grad_threshold)
 
-    split_mask = frustrated_mask
     do_not_touch_mask = ~split_mask
-    new_means_list = [means[do_not_touch_mask]]
-    new_weights_list = [weights_param[do_not_touch_mask]]
+    new_means_list = [merged_means[do_not_touch_mask]]
+    new_weights_list = [merged_weights_param[do_not_touch_mask]]
 
     n_split = jnp.sum(split_mask)
     if n_split > 0:
-        s_means = means[split_mask]
-        s_weights = weights_param[split_mask]
+        s_means = merged_means[split_mask]
+        s_weights = merged_weights_param[split_mask]
 
-        noise = np.random.normal(0, 0.0001, s_means.shape)
+        noise = jax.random.normal(key, s_means.shape) * 1e-5
+
         new_means_list.extend([s_means - noise, s_means + noise])
         new_weights_list.extend([s_weights * 0.5, s_weights * 0.5])
 
@@ -496,18 +544,29 @@ def adapt_gaussians(model, grads, max_gaussians=50000, lr=None, optimizer=None):
 
     return new_optimizer
 
-
 # Define Loss Function for NNX
 @partial(jax.jit, static_argnames=("update",))
-def training_step_volume(graphdef, state, target, update=True):
+def training_step_volume(graphdef, state, target, mask, update=True):
     model, optimizer = nnx.merge(graphdef, state)
 
-    def loss_fn(model, target):
+    def loss_fn(model, target, mask):
         recon = model()
 
-        recon_loss = jnp.mean((recon - target) ** 2.)
+        active_voxels = jnp.maximum(1.0, jnp.sum(mask))
+        solvent_voxels = jnp.maximum(1.0, mask.size - active_voxels)
 
-        l1_loss = 0.001 * jnp.mean(jnp.abs(recon))
+        diff = (recon - target) * mask
+        l1_loss = jnp.sum(jnp.abs(diff)) / active_voxels
+        l2_loss = jnp.sum(diff ** 2) / active_voxels
+        recon_loss = 0.8 * l1_loss + 0.2 * l2_loss
+
+        density_loss = 0.01 * jnp.sum(jnp.abs(recon * (1.0 - mask))) / solvent_voxels
+
+        #l1_loss = 0.001 * jnp.sum(jnp.abs(recon * mask)) / active_voxels
+        #actual_weights = nnx.relu(model.weights.get_value())
+        #weight_loss = 1e-4 * (jnp.sum(actual_weights) / active_voxels)
+
+        #negativity_loss = 10.0 * jnp.sum(mask * jax.nn.relu(-recon) ** 2) / active_voxels
 
         # diff_x = recon[1:, :, :] - recon[:-1, :, :]
         # diff_y = recon[:, 1:, :] - recon[:, :-1, :]
@@ -515,14 +574,29 @@ def training_step_volume(graphdef, state, target, update=True):
         # l1_grad_loss = 0.00001 * jnp.abs(diff_x).mean() + jnp.abs(diff_z).mean() + jnp.abs(diff_y).mean()
         # l2_grad_loss = jnp.square(diff_x).mean() + jnp.square(diff_z).mean() + jnp.square(diff_y).mean()
 
+        fft_recon = jnp.fft.rfftn(recon * mask)
+        fft_target = jnp.fft.rfftn(target * mask)
+
+        amp_recon = jnp.abs(fft_recon)
+        amp_target = jnp.abs(fft_target)
+
+        log_amp_recon = jnp.log1p(amp_recon)
+        log_amp_target = jnp.log1p(amp_target)
+
+        spectral_loss = 0.01 * jnp.mean(jnp.abs(log_amp_recon - log_amp_target))
+
         # Boundary violation loss
-        means = model.means.get_value()
-        violation = jax.nn.relu(jnp.abs(means) - 0.9)
+        violation = jax.nn.relu(jnp.abs(model.means.get_value()) - 0.9)
         boundary_loss = jnp.sum(violation ** 2.)
 
-        return recon_loss + l1_loss + boundary_loss
+        sigma = nnx.relu(model.sigma_param.get_value())
+        sigma_out_of_bounds = nnx.relu(sigma - 3.0) ** 2 + nnx.relu(0.2 - sigma) ** 2
+        sigma_loss = 0.01 * jnp.sum(sigma_out_of_bounds)
+        #sigma_pressure = 0.01 * jnp.sum(sigma ** 2)
 
-    loss_val, grads = nnx.value_and_grad(loss_fn)(model, target)
+        return recon_loss + boundary_loss + sigma_loss + density_loss + spectral_loss
+
+    loss_val, grads = nnx.value_and_grad(loss_fn)(model, target, mask)
 
     # Apply updates directly to the model state managed by optimizer
     if update:
@@ -662,27 +736,47 @@ def training_step_global_adjustment(graphdef, state, target, projection_paramete
     return loss_val, state
 
 
-def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densify_interval=500, n_init=2500, max_gaussians=50000):
+def estimate_init_gauss(volume, mask, max_gaussians):
+    threshold = np.mean(volume[mask > 0.0]) * 0.1
+    coords = np.argwhere((mask > 0.0) & (volume > threshold))
+    densities = volume[coords[:, 0], coords[:, 1], coords[:, 2]]
+    p_weights = np.maximum(densities, 0.0) ** 3
+    p_weights /= np.sum(p_weights)
+
+    n_active = len(coords)
+    target_k = n_active // 8
+    k_init = min(target_k, 15000, max_gaussians)
+    indices = np.random.choice(n_active, size=k_init, replace=False, p=p_weights)
+    sampled_coords = coords[indices]
+
+    weights = volume[sampled_coords[:, 0], sampled_coords[:, 1], sampled_coords[:, 2]]
+
+    grid_size = volume.shape[0]
+    factor = 0.5 * grid_size
+    means_norm = (np.stack([sampled_coords[:, 2], sampled_coords[:, 1], sampled_coords[:, 0]], axis=1).astype(
+        np.float32) - factor) / factor
+
+    nbrs = NearestNeighbors(n_neighbors=2).fit(means_norm)
+    distances, _ = nbrs.kneighbors(means_norm)
+    optimal_sigma = np.mean(distances[:, 1]) * factor
+
+    return {"means": means_norm, "weights": weights}, float(optimal_sigma)
+
+def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, max_gaussians=50000):
     # Grid size
     grid_size = target_vol.shape[0]
-
     if mask is not None:
-        # Extract mask coords
-        mask_sampled = sample_mask_points(mask, n_init)
-        inds = np.asarray(np.where(mask_sampled > 0.0)).T
-        values = target_vol[inds[:, 0], inds[:, 1], inds[:, 2]]
-        factor = 0.5 * target_vol.shape[0]
-        coords = (inds - factor) / factor
-        manual_init = {"means": coords, "weights": values}
+        manual_init, optimal_sigma = estimate_init_gauss(target_vol, mask, max_gaussians)
+        active_mask = jnp.array(mask, dtype=jnp.float32)
 
         # Init Model
         rngs = nnx.Rngs(42)
-        model = GaussianSplatModel(manual_init=manual_init, grid_size=grid_size, rngs=rngs)
+        model = GaussianSplatModel(manual_init=manual_init, sigma=optimal_sigma, grid_size=grid_size, rngs=rngs)
     else:
         # Init Model
         rngs = nnx.Rngs(42)
-        model = GaussianSplatModel(n_init=n_init, grid_size=grid_size, rngs=rngs)
-        mask = jnp.zeros_like(target_vol)
+        model = GaussianSplatModel(n_init=1000, sigma=1.0, grid_size=grid_size, rngs=rngs)
+        active_mask = jnp.zeros_like(target_vol, dtype=jnp.float32)
 
     # Init Optimizer (nnx.Optimizer automatically tracks model params)
     optimizer = nnx.Optimizer(model, optax.adamw(learning_rate), wrt=nnx.Param)
@@ -696,52 +790,72 @@ def fit_volume(target_vol, mask=None, iterations=5000, learning_rate=0.01, densi
     pbar = tqdm(range(iterations), desc="Fitting volume", file=sys.stdout, ascii=" >=", colour="green",
                 bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
+    window_size = 100
+    min_cooldown_steps = 500
+    last_adapt_step = 0
+
+    key = jax.random.PRNGKey(42)
     for i in pbar:
         # --- TRAIN STEP ---
-        loss_val, grads, state = training_step_volume(graphdef, state, target_vol, update=True)
+        loss_val, grads, state = training_step_volume(graphdef, state, target_vol, active_mask, update=True)
+        loss_val_float = float(loss_val)
+        loss_history.append(loss_val_float)
 
         model, _ = nnx.merge(graphdef, state)
-        loss_history.append(loss_val)
-        k_history.append(model.means.get_value().shape[0])
-        s = float(nnx.relu(model.sigma_param.get_value())[0])
+        current_k = model.means.get_value().shape[0]
+        k_history.append(current_k)
+        s = float(nnx.softplus(model.sigma_param.get_value())[0])
 
-        # Progress bar update  (TQDM)
-        pbar.set_postfix_str(f"| Loss: {loss_val:.6f} | K: {model.means.get_value().shape[0]:04d} | Sigma: {s:.3f}")
+        # Progress bar update (TQDM)
+        pbar.set_postfix_str(f"| Loss: {loss_val_float:.6f} | K: {current_k:04d} | Sigma: {s:.3f}")
 
-        # --- ADAPTIVE STEP ---
-        if i > 0 and i % densify_interval == 0:
-            # We pass the optimizer because we might need to replace it
-            model, optimizer = nnx.merge(graphdef, state)
-            optimizer = adapt_gaussians(model, grads, max_gaussians=max_gaussians, optimizer=optimizer)
-            graphdef, state = nnx.split((model, optimizer))
+        if i > window_size * 2:
+            prev_window = np.array(loss_history[-window_size * 2: -window_size])
+            recent_window = np.array(loss_history[-window_size:])
 
+            current_loss = jnp.mean(recent_window)
+            prev_loss = jnp.mean(prev_window)
+            rate_of_learning = (prev_loss - current_loss) / prev_loss
+
+            loss_std = jnp.std(prev_window)
+            dynamic_threshold = jnp.clip((loss_std / prev_loss) * 0.5, 1e-4, 0.01)
+            is_plateau = (0 <= rate_of_learning < dynamic_threshold)
+
+            is_cooldown_ready = (i - last_adapt_step) > min_cooldown_steps
+            is_early_phase = i < int(iterations * 0.8)
+
+            if is_plateau and is_cooldown_ready and is_early_phase:
+                key, subkey = jax.random.split(key)
+
+                progress = i / iterations
+                current_lr = learning_rate * (0.05 ** progress)
+                model, optimizer = nnx.merge(graphdef, state)
+                optimizer = adapt_gaussians(model, grads, subkey, max_gaussians=max_gaussians, lr=current_lr)
+                graphdef, state = nnx.split((model, optimizer))
+                last_adapt_step = i
 
     model, _ = nnx.merge(graphdef, state)
 
     # FINAL PRUNING
     means = model.means.get_value()
     weights = model.weights.get_value()
-
     actual_weights = nnx.relu(weights)
-    noise_floor = jnp.max(actual_weights) * 0.01
-    keep_mask = actual_weights > noise_floor
+
+    weight_floor = jnp.max(actual_weights) * 0.005
+    keep_mask = actual_weights > weight_floor
 
     filtered_means = means[keep_mask]
     filtered_weights = weights[keep_mask]
 
     cc_mask = get_outlier_mask(filtered_means)
-
     final_means = filtered_means[cc_mask]
     final_weights = filtered_weights[cc_mask]
 
     model.means = nnx.Param(final_means)
     model.weights = nnx.Param(final_weights)
-
-    # Update config file
     model.update_config()
 
     return model, k_history, loss_history
-
 
 def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256, learning_rate=0.01,
                densify_interval=200, save_partial=True, n_init=2500, max_gaussians=50000):
@@ -893,7 +1007,7 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
         # Prepare gaussian params
         means = model.means.get_value()
         weights = model.weights.get_value()
-        sigma = model.sigma_param.get_value()
+        sigma = nnx.relu(model.sigma_param.get_value())
         grid_size = model.grid_size
 
     else:
@@ -916,7 +1030,7 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
             (x, _, labels) = next(iter_data_loader)
             # --- TRAIN STEP ---
             projection_parameters = {"euler_angles": md_columns["euler_angles"][labels],
-                                     "shifts": md_columns["shifts"][labels]}
+                                     "shifts": md_columns["shifts"][labels] / sr if pdb else md_columns["shifts"][labels]}
             if ctf_type in ["apply", "wiener", "squared", "precorrect"]:
                 ctf_parameters = {"ctfDefocusU": md_columns["ctfDefocusU"][labels],
                                   "ctfDefocusV": md_columns["ctfDefocusV"][labels],
@@ -945,6 +1059,7 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
     if is_global:
         model_global_adjustment, _ = nnx.merge(graphdef, state)
         model.weights = nnx.Param(model_global_adjustment(weights))
+        model.sigma_param = nnx.Param(model_global_adjustment(sigma))
     else:
         model, _ = nnx.merge(graphdef, state)
 

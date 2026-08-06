@@ -17,20 +17,42 @@ jax.config.update("jax_default_matmul_precision", "tensorfloat32")
 EPS = 1e-6
 
 def generate_uniform_rotations(num_rots=4000):
-    phi = 1.22074408460575947536
-    alpha = jnp.array([1.0 / phi, 1.0 / (phi ** 2), 1.0 / (phi ** 3)])
+    num_s2 = int(jnp.round(num_rots ** (2 / 3)))
+    num_s1 = int(jnp.round(num_rots ** (1 / 3)))
 
-    indices = jnp.arange(num_rots, dtype=jnp.float32)
-    u = jnp.fmod(0.5 + indices[:, None] * alpha[None, :], 1.0)
-    u1, u2, u3 = u[:, 0], u[:, 1], u[:, 2]
+    indices_s2 = jnp.arange(num_s2, dtype=jnp.float32)
+    indices_s1 = jnp.arange(num_s1, dtype=jnp.float32)
 
-    # Shoemake mapping topologically perfect to hypersphere
-    w = jnp.sqrt(1.0 - u1) * jnp.sin(2.0 * jnp.pi * u2)
-    x = jnp.sqrt(1.0 - u1) * jnp.cos(2.0 * jnp.pi * u2)
-    y = jnp.sqrt(u1) * jnp.sin(2.0 * jnp.pi * u3)
-    z = jnp.sqrt(u1) * jnp.cos(2.0 * jnp.pi * u3)
+    phi_golden = jnp.pi * (3.0 - jnp.sqrt(5.0))
+    z = 1.0 - (indices_s2 / float(num_s2 - 1)) * 2.0
+    radius_s2 = jnp.sqrt(1.0 - z * z)
+    theta = phi_golden * indices_s2
 
-    quats = jnp.stack([w, x, y, z], axis=1)
+    x = radius_s2 * jnp.cos(theta)
+    y = radius_s2 * jnp.sin(theta)
+
+    psi = 2.0 * jnp.pi * indices_s1 / float(num_s1)
+    x_grid, psi_grid = jnp.meshgrid(x, psi, indexing='ij')
+    y_grid, _ = jnp.meshgrid(y, psi, indexing='ij')
+    z_grid, _ = jnp.meshgrid(z, psi, indexing='ij')
+
+    x_flat = x_grid.flatten()
+    y_flat = y_grid.flatten()
+    z_flat = z_grid.flatten()
+    psi_flat = psi_grid.flatten()
+
+    sin_half_theta = jnp.sqrt(jnp.maximum((1.0 - z_flat) / 2.0, 0.0))
+    cos_half_theta = jnp.sqrt(jnp.maximum((1.0 + z_flat) / 2.0, 0.0))
+
+    phi_angle = jnp.arctan2(y_flat, x_flat)
+
+    qw = cos_half_theta * jnp.cos(psi_flat / 2.0)
+    qz = cos_half_theta * jnp.sin(psi_flat / 2.0)
+    qx = sin_half_theta * jnp.cos(phi_angle + psi_flat / 2.0)
+    qy = sin_half_theta * jnp.sin(phi_angle + psi_flat / 2.0)
+
+    quats = jnp.stack([qw, qx, qy, qz], axis=1)
+
     rots = jax.vmap(quaternion_to_matrix)(quats)
     rots = rots.at[0].set(jnp.eye(3))
 
@@ -101,22 +123,49 @@ def matrix_to_quaternion(R):
 
     return lax.cond(tr > 0, trace_positive, branch_negative)
 
+@partial(jit, static_argnames=("apix",))
+def precompute_target_gradients(vol, apix):
+    nx, ny, nz = vol.shape
+    fft_t = jnp.fft.rfftn(vol)
+
+    freq_x = jnp.fft.fftfreq(nx, d=apix)
+    freq_y = jnp.fft.fftfreq(ny, d=apix)
+    freq_z = jnp.fft.rfftfreq(nz, d=apix)
+    kx, ky, kz = jnp.meshgrid(freq_x, freq_y, freq_z, indexing='ij')
+
+    fft_t_dx = 1j * kx * fft_t
+    fft_t_dy = 1j * ky * fft_t
+    fft_t_dz = 1j * kz * fft_t
+
+    return fft_t_dx, fft_t_dy, fft_t_dz
+
 @partial(jit, static_argnames=("grid_shape", "apix_s",))
-def rots_shifts(sim, fft_target, grid_shape, apix_s):
-    sim_centered = sim - jnp.mean(sim)
-    sim_var = jnp.sum(sim_centered ** 2) + EPS
-    probe = sim_centered / jnp.sqrt(sim_var)
+def vectorial_rots_shifts(probe, fft_t_dx, fft_t_dy, fft_t_dz, grid_shape, apix_s):
+    nx, ny, nz = grid_shape
+    freq_x = jnp.fft.fftfreq(nx, d=apix_s)
+    freq_y = jnp.fft.fftfreq(ny, d=apix_s)
+    freq_z = jnp.fft.rfftfreq(nz, d=apix_s)
+    kx, ky, kz = jnp.meshgrid(freq_x, freq_y, freq_z, indexing='ij')
 
     fft_probe = jnp.fft.rfftn(probe)
 
-    cc_grid = jnp.fft.irfftn(fft_target * jnp.conj(fft_probe), s=grid_shape)
+    fft_p_dx = 1j * kx * fft_probe
+    fft_p_dy = 1j * ky * fft_probe
+    fft_p_dz = 1j * kz * fft_probe
+
+    cc_x = fft_t_dx * jnp.conj(fft_p_dx)
+    cc_y = fft_t_dy * jnp.conj(fft_p_dy)
+    cc_z = fft_t_dz * jnp.conj(fft_p_dz)
+
+    cc_grid = jnp.fft.irfftn(cc_x + cc_y + cc_z, s=grid_shape)
+
     flat_idx = jnp.argmax(cc_grid)
     max_cc = cc_grid.flatten()[flat_idx]
 
     x, y, z = jnp.unravel_index(flat_idx, grid_shape)
-    dx = jnp.where(x > grid_shape[0] // 2, x - grid_shape[0], x)
-    dy = jnp.where(y > grid_shape[1] // 2, y - grid_shape[1], y)
-    dz = jnp.where(z > grid_shape[2] // 2, z - grid_shape[2], z)
+    dx = jnp.where(x > nx // 2, x - nx, x)
+    dy = jnp.where(y > ny // 2, y - ny, y)
+    dz = jnp.where(z > nz // 2, z - nz, z)
 
     shift_ang = jnp.array([dx, dy, dz]) * apix_s
     return max_cc, shift_ang
@@ -136,10 +185,11 @@ class SparseGaussianRasterizer(eqx.Module):
         r = jnp.arange(-kernel_width // 2, kernel_width // 2 + 1)
         self.mesh = jnp.meshgrid(r, r, r, indexing='ij')
 
+    @eqx.filter_jit
     def __call__(self, coords, weights=1.0):
         coords_vox = coords / self.voxel_size
-
         coords_vox_int = jax.lax.stop_gradient(jnp.round(coords_vox).astype(jnp.int32))
+
         target_x = coords_vox_int[:, 0:1] + self.mesh[0].flatten()[None, :]
         target_y = coords_vox_int[:, 1:2] + self.mesh[1].flatten()[None, :]
         target_z = coords_vox_int[:, 2:3] + self.mesh[2].flatten()[None, :]
@@ -150,14 +200,10 @@ class SparseGaussianRasterizer(eqx.Module):
         dist_sq = diff_x ** 2 + diff_y ** 2 + diff_z ** 2
 
         var_vox = (self.sigma / self.voxel_size) ** 2 + (1/12)
-        amplitude = 1.0 / ((2 * np.pi * self.sigma) ** 3) ** 0.5
+        pw = weights[:, None] if hasattr(weights, 'ndim') and weights.ndim == 1 else weights
 
-        densities = amplitude * jnp.exp(-dist_sq / (2 * var_vox + EPS))
-        densities_sum = jnp.sum(densities, axis=-1, keepdims=True) + EPS
-        if hasattr(weights, 'ndim') and weights.ndim == 1:
-            densities = (densities / densities_sum) * weights[:, None]
-        else:
-            densities = (densities / densities_sum) * weights
+        amplitude = 1.0 / ((2.0 * jnp.pi * var_vox) ** 1.5 + EPS)
+        densities = amplitude * jnp.exp(-dist_sq / (2.0 * var_vox + EPS)) * pw
 
         nx, ny, nz = self.grid_shape
         out_of_bounds = (target_x < 0) | (target_x >= nx) | \
@@ -166,11 +212,13 @@ class SparseGaussianRasterizer(eqx.Module):
                         (densities < 1e-4)
 
         target_idx_flat = target_x * (ny * nz) + target_y * nz + target_z
-        safe_idx = jnp.where(out_of_bounds, nx * ny * nz, target_idx_flat).astype(jnp.int32)
 
-        grid_flat = jnp.zeros((nx * ny * nz) + 1, dtype=jnp.float32)
-        grid_flat = grid_flat.at[safe_idx.reshape(-1)].add(densities.reshape(-1))
-        return grid_flat[:-1].reshape(self.grid_shape)
+        safe_densities = jnp.where(out_of_bounds, 0.0, densities)
+        safe_idx = (target_idx_flat % (nx * ny * nz)).astype(jnp.int32)
+
+        grid_flat = jnp.zeros(nx * ny * nz, dtype=jnp.float32)
+        grid_flat = grid_flat.at[safe_idx.reshape(-1)].add(safe_densities.reshape(-1))
+        return grid_flat.reshape(self.grid_shape)
 
 class ProteinTopology:
     # Electronic Scattering Approximation for Kirkland Cross-Section.
@@ -208,19 +256,22 @@ class ProteinTopology:
                         if not elem:
                             elem = atom_name[0]
 
+                        weight = self.electron_scattering.get(elem, 2.5)
+
                         if not is_hetatm:
-                            all_atoms.append(coord)
-                            weights.append(self.electron_scattering.get(elem, 2.5))
                             if atom_name == 'CA' or atom_name == 'P':
                                 protein_ca_coords.append(coord)
+                        else:
+                            if len(protein_ca_coords) > 0:
+                                ca_array = np.array(protein_ca_coords)
+                                dists_sq = np.sum((ca_array - coord) ** 2, axis=1)
+                                if np.min(dists_sq) >= 15.0 ** 2:
+                                    weight = 0.0
+                            else:
+                                weight = 0.0
 
-                        elif is_hetatm and len(protein_ca_coords) > 0:
-                            ca_array = np.array(protein_ca_coords)
-                            dists_sq = np.sum((ca_array - coord) ** 2, axis=1)
-
-                            if np.min(dists_sq) < 15.0 ** 2:
-                                all_atoms.append(coord)
-                                weights.append(self.electron_scattering.get(elem, 2.5))
+                        all_atoms.append(coord)
+                        weights.append(weight)
 
                     except ValueError:
                         continue
@@ -281,25 +332,27 @@ class ProteinTopology:
                         elem = parts[idx_elem].upper() if idx_elem != -1 else "C"
                         elem = ''.join([c for c in elem if c.isalpha()])
 
+                        weight = self.electron_scattering.get(elem, 2.5)
+
                         if not is_hetatm:
-                            all_atoms.append(coord)
-                            weights.append(self.electron_scattering.get(elem, 2.5))
                             if atom_name == 'CA' or atom_name == 'P':
                                 protein_ca_coords.append(coord)
+                        else:
+                            if len(protein_ca_coords) > 0:
+                                ca_array = np.array(protein_ca_coords)
+                                dists_sq = np.sum((ca_array - coord) ** 2, axis=1)
+                                if np.min(dists_sq) >= 15.0 ** 2:
+                                    weight = 0.0
+                            else:
+                                weight = 0.0
 
-                        elif is_hetatm and len(protein_ca_coords) > 0:
-                            ca_array = np.array(protein_ca_coords)
-                            dists_sq = np.sum((ca_array - coord) ** 2, axis=1)
-
-                            if np.min(dists_sq) < 15.0 ** 2:
-                                all_atoms.append(coord)
-                                weights.append(self.electron_scattering.get(elem, 2.5))
+                        all_atoms.append(coord)
+                        weights.append(weight)
 
                     except (IndexError, ValueError):
                         continue
 
         return all_atoms, weights
-
 
 class RigidTransformation(eqx.Module):
     global_shift: jnp.ndarray
@@ -343,63 +396,91 @@ class RigidEngine:
         g_q, g_s = transformation()
         return self.coords(g_q, g_s)
 
-    def global_grid_search(self, vol_s_orig, fft_s_orig, vol_s_flip, fft_s_flip, downsample_factor=4, n_rots=4000,
-                           batch_size=100, is_aligned=False):
-        raster_s = SparseGaussianRasterizer(vol_s_orig.shape, self.apix * downsample_factor,
-                                            sigma_vec=(self.apix * downsample_factor) * 1.5, kernel_width=5)
+    def global_grid_search(self, vol_s_orig, vol_s_flip, downsample_factor=4, n_rots=4000, batch_size=100):
+        center_proj = jnp.array(self.vol_shape) * self.apix / 2.0
+        apix_s = self.apix * downsample_factor
+
+        fft_dx_o, fft_dy_o, fft_dz_o = precompute_target_gradients(vol_s_orig, apix_s)
+        fft_dx_f, fft_dy_f, fft_dz_f = precompute_target_gradients(vol_s_flip, apix_s)
+
+        raster_s = SparseGaussianRasterizer(vol_s_orig.shape, apix_s, sigma_vec=apix_s * 1.5, kernel_width=5)
         rots = generate_uniform_rotations(n_rots)
 
-        @partial(jit, static_argnames=("apix",))
-        def process_batch(rot_batch, coords, center, weights, fft_o, fft_f, apix):
+        @jit
+        def process_batch(rot_batch, coords, center, weights):
             coords_rot = jnp.einsum('bij,nj->bni', rot_batch, coords) + center
             sim_vol = vmap(lambda c: raster_s(c, weights))(coords_rot)
-            res_o = vmap(lambda s: rots_shifts(s, fft_o, vol_s_orig.shape, apix))(sim_vol)
-            res_f = vmap(lambda s: rots_shifts(s, fft_f, vol_s_flip.shape, apix))(sim_vol)
+
+            sim_centered = sim_vol - jnp.mean(sim_vol)
+            sim_var = jnp.sum(sim_centered ** 2) + EPS
+            probe = sim_centered / jnp.sqrt(sim_var)
+
+            res_o = vmap(lambda v: vectorial_rots_shifts(v, fft_dx_o, fft_dy_o, fft_dz_o, vol_s_orig.shape, apix_s))(probe)
+            res_f = vmap(lambda v: vectorial_rots_shifts(v, fft_dx_f, fft_dy_f, fft_dz_f, vol_s_orig.shape, apix_s))(probe)
             return res_o, res_f
 
-        best_o = {'cc': -2.0, 'rot': jnp.eye(3), 'shift': jnp.zeros(3)}
-        best_f = {'cc': -2.0, 'rot': jnp.eye(3), 'shift': jnp.zeros(3)}
+        n_rots = rots.shape[0]
+        all_cc_o = jnp.zeros(n_rots, dtype=jnp.float32)
+        all_sh_o = jnp.zeros((n_rots, 3), dtype=jnp.float32)
+        all_cc_f = jnp.zeros(n_rots, dtype=jnp.float32)
+        all_sh_f = jnp.zeros((n_rots, 3), dtype=jnp.float32)
 
-        if not is_aligned:
-            center_proj = jnp.array(self.vol_shape) * self.apix / 2.0
-        else:
-            center_proj = self.topo.com
-
-        n_batches = int(jnp.ceil(rots.shape[0] / batch_size))
-        pbar = tqdm(range(n_batches), desc="Exhaustive Rigid Search")
+        n_batches = int(jnp.ceil(n_rots / batch_size))
+        pbar = tqdm(range(n_batches), desc=f"Exhaustive Search")
         for i in pbar:
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, n_rots)
             b_rots = rots[i * batch_size: (i + 1) * batch_size]
             (cc_o, sh_o), (cc_f, sh_f) = process_batch(
-                b_rots, self.topo.all_coords, center_proj, self.topo.atom_weights,
-                fft_s_orig, fft_s_flip, self.apix * downsample_factor
+                b_rots, self.topo.all_coords, center_proj, self.topo.atom_weights
             )
+            all_cc_o = all_cc_o.at[start_idx:end_idx].set(cc_o)
+            all_sh_o = all_sh_o.at[start_idx:end_idx].set(sh_o)
+            all_cc_f = all_cc_f.at[start_idx:end_idx].set(cc_f)
+            all_sh_f = all_sh_f.at[start_idx:end_idx].set(sh_f)
 
-            idx_o = jnp.argmax(cc_o)
-            if cc_o[idx_o] > best_o['cc']:
-                best_o.update({'cc': float(cc_o[idx_o]), 'rot': b_rots[idx_o], 'shift': sh_o[idx_o]})
+            idx_best_o = jnp.argmax(cc_o)
+            idx_best_f = jnp.argmax(cc_f)
+            pbar.set_postfix(CC_o=f"{float(cc_o[idx_best_o]):.3e}", CC_f=f"{float(cc_f[idx_best_f]):.3e}")
 
-            idx_f = jnp.argmax(cc_f)
-            if cc_f[idx_f] > best_f['cc']:
-                best_f.update({'cc': float(cc_f[idx_f]), 'rot': b_rots[idx_f], 'shift': sh_f[idx_f]})
+        top_k = min(10, n_rots)
+        top_cc_o, top_idx_o = lax.top_k(all_cc_o, top_k)
+        top_cc_f, top_idx_f = lax.top_k(all_cc_f, top_k)
 
-            pbar.set_postfix(CC_o=f"{float(cc_o[idx_o]):.3f}", CC_f=f"{float(cc_f[idx_f]):.3f}")
+        @eqx.filter_jit
+        def score_pose_native(rot_m, shift_v, target_vol):
+            coords = jnp.dot(self.topo.all_coords, rot_m.T) + center_proj + shift_v
+            sim_vol = self.rasterizer(coords, self.topo.atom_weights)
+            sim_centered = sim_vol - jnp.mean(sim_vol)
+            sim_norm = sim_centered / (jnp.sqrt(jnp.sum(sim_centered ** 2)) + EPS)
+            return jnp.sum(sim_norm * target_vol)
 
-        if best_f['cc'] > best_o['cc']:
-            print(f">>> FLIPPED Volume Selected (CC: {best_f['cc']:.4f})")
+        scores_o = jax.vmap(lambda r, s: score_pose_native(r, s, vol_s_orig))(rots[top_idx_o], all_sh_o[top_idx_o])
+        scores_f = jax.vmap(lambda r, s: score_pose_native(r, s, vol_s_flip))(rots[top_idx_f], all_sh_f[top_idx_f])
+        best_idx_o, best_idx_f = jnp.argmax(scores_o), jnp.argmax(scores_f)
+
+        if scores_f[best_idx_f] > scores_o[best_idx_o]:
+            print(f">>> FLIPPED Volume Selected (High-Res CC: {float(scores_f[best_idx_f]):.4f})")
             self.vol_raw = jnp.flip(self.vol_raw, axis=0)
-            final_rot, final_shift = best_f['rot'], best_f['shift']
-            self.cc_global = best_f['cc']
+            final_rot, final_shift = rots[top_idx_f][best_idx_f], all_sh_f[top_idx_f][best_idx_f]
+            self.cc_global = float(scores_f[best_idx_f])
+            final_vol_target = vol_s_flip
         else:
-            print(f">>> ORIGINAL Volume Selected (CC: {best_o['cc']:.4f})")
-            final_rot, final_shift = best_o['rot'], best_o['shift']
-            self.cc_global = best_o['cc']
+            print(f">>> ORIGINAL Volume Selected (High-Res CC: {float(scores_o[best_idx_o]):.4f})")
+            final_rot, final_shift = rots[top_idx_o][best_idx_o], all_sh_o[top_idx_o][best_idx_o]
+            self.cc_global = float(scores_o[best_idx_o])
+            final_vol_target = vol_s_orig
 
         final_global_shift = final_shift + center_proj
-        print(center_proj)
-        print(final_rot, final_global_shift)
-
         self.transformation = eqx.tree_at(lambda m: m.global_rot_quat, self.transformation, matrix_to_quaternion(final_rot))
         self.transformation = eqx.tree_at(lambda m: m.global_shift, self.transformation, final_global_shift)
+
+        final_coords_raw = self.get_transformed_coords(self.transformation)
+        sim_native = self.rasterizer(final_coords_raw, self.topo.atom_weights)
+        sim_centered = sim_native - jnp.mean(sim_native)
+        sim_target = sim_centered / (jnp.sqrt(jnp.sum(sim_centered ** 2)) + EPS)
+        native_cc = jnp.sum(sim_target * final_vol_target)
+        print(f">>> Final Native CC: {native_cc:.4f}\n")
 
     def optimize_rigid_pose(self, epochs=1000, is_aligned=False):
         diff, static = eqx.partition(self.transformation, eqx.is_inexact_array)
@@ -445,31 +526,26 @@ class RigidEngine:
         self.transformation = eqx.combine(diff, static)
         print(quaternion_to_matrix(self.transformation.global_rot_quat), self.transformation.global_shift)
 
-    def save(self, output_name, needsCentering=False, is_aligned=False):
+    def save(self, output_name, is_aligned=False):
         print(f"Saving results to {self.out_dir}...")
-        all_final_coords = self.get_transformed_coords(self.transformation)
-        all_final_coords_np = np.array(all_final_coords)
+        all_final_coords_orig = self.get_transformed_coords(self.transformation)
         if not is_aligned:
-            all_final_coords_np = all_final_coords_np - jnp.array(self.vol_shape) * self.apix / 2.0
+            all_final_coords = all_final_coords_orig - jnp.array(self.vol_shape) * self.apix / 2.0
         else:
-            all_final_coords_np = all_final_coords_np - self.topo.com
+            all_final_coords = all_final_coords_orig - self.topo.com
 
         ext = os.path.splitext(self.topo.pdb_path)[1].lower()
 
         if ext == '.cif':
             out_file = os.path.join(self.out_dir, f"{output_name}_fitted.cif")
-            self._write_cif(self.topo.pdb_path, out_file, all_final_coords_np)
+            self._write_cif(self.topo.pdb_path, out_file, np.array(all_final_coords))
         else:
             out_file = os.path.join(self.out_dir, f"{output_name}_fitted.pdb")
-            self._write_pdb(self.topo.pdb_path, out_file, all_final_coords_np)
+            self._write_pdb(self.topo.pdb_path, out_file, np.array(all_final_coords))
 
-        sim_vol = self.rasterizer(jnp.array(all_final_coords), self.topo.atom_weights)
+        sim_vol = self.rasterizer(jnp.array(all_final_coords_orig), self.topo.atom_weights)
         save_mrc(sim_vol.T, self.apix, os.path.join(self.out_dir, f"{output_name}_sim.mrc"))
-        if needsCentering:
-            save_mrc(self.vol_raw.T, self.apix, os.path.join(self.out_dir, f"{output_name}_center.mrc"), centering=True)
-            save_mrc(self.vol_raw.T, self.apix, os.path.join(self.out_dir, f"{output_name}_input_norm.mrc"), centering=False)
-        else:
-            save_mrc(self.vol_raw.T, self.apix, os.path.join(self.out_dir, f"{output_name}_input_norm.mrc"), centering=False)
+        save_mrc(self.vol_raw.T, self.apix, os.path.join(self.out_dir, f"{output_name}_input_norm.mrc"), centering=False)
 
     def _write_pdb(self, in_path, out_path, coords):
         with open(in_path, 'r') as f_in, open(out_path, 'w') as f_out:
@@ -550,7 +626,6 @@ def main():
     parser.add_argument("--sr", type=float, default=1.0)
     parser.add_argument("--downfactor", type=float, default=1.0)
     parser.add_argument("--is_aligned", action="store_true")
-    parser.add_argument("--needsCentering", action="store_true")
     parser.add_argument("--out_dir", type=str, default="rigid_output")
     args, _ = parser.parse_known_args()
 
@@ -566,21 +641,16 @@ def main():
 
     vol_s_orig = rescale(vol, 1 / args.downfactor, anti_aliasing=True, preserve_range=True)
     vol_centered = vol_s_orig - jnp.mean(vol_s_orig)
-    vol_norm = vol_centered / jnp.sqrt(jnp.sum(vol_centered ** 2) + EPS)
-    fft_s_orig = jnp.fft.rfftn(vol_norm)
-
-    vol_s_flip = jnp.flip(vol_norm, axis=0)
-    fft_s_flip = jnp.fft.rfftn(vol_s_flip)
-
-    engine.global_grid_search(vol_norm, fft_s_orig, vol_s_flip, fft_s_flip, downsample_factor=args.downfactor, n_rots=4000,
-                              batch_size=10, is_aligned=args.is_aligned)
+    vol_centered = vol_centered / jnp.sqrt(jnp.sum(vol_centered ** 2) + EPS)
+    vol_s_flip = jnp.flip(vol_centered, axis=0)
+    engine.global_grid_search(vol_centered, vol_s_flip, downsample_factor=args.downfactor, n_rots=1000, batch_size=10)
 
     if not args.is_aligned:
-        engine.save("final_rigid", needsCentering=args.needsCentering, is_aligned=args.is_aligned)
+        engine.save("final_rigid", is_aligned=args.is_aligned)
         engine.optimize_rigid_pose(epochs=1000, is_aligned=args.is_aligned)
-        engine.save("final_rigid_refined", needsCentering=args.needsCentering, is_aligned=args.is_aligned)
+        engine.save("final_rigid_refined", is_aligned=args.is_aligned)
     else:
-        engine.save("final_rigid", needsCentering=args.needsCentering, is_aligned=args.is_aligned)
+        engine.save("final_rigid", is_aligned=args.is_aligned)
 
 
 if __name__ == "__main__":
