@@ -1030,7 +1030,7 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
             (x, _, labels) = next(iter_data_loader)
             # --- TRAIN STEP ---
             projection_parameters = {"euler_angles": md_columns["euler_angles"][labels],
-                                     "shifts": md_columns["shifts"][labels] / sr if pdb else md_columns["shifts"][labels]}
+                                     "shifts": md_columns["shifts"][labels]}
             if ctf_type in ["apply", "wiener", "squared", "precorrect"]:
                 ctf_parameters = {"ctfDefocusU": md_columns["ctfDefocusU"][labels],
                                   "ctfDefocusV": md_columns["ctfDefocusV"][labels],
