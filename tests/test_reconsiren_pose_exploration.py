@@ -8,8 +8,8 @@ from hax.networks.reconsiren import (
     _PoseDiagnosticsTracker,
     ReconSIREN,
     _candidate_coverage_loss,
-    _candidate_frequency_scoring_size,
     _candidate_reconstruction_losses,
+    _consensus_multiscale_size_and_weight,
     _fibonacci_sphere_directions,
     _symmetry_aware_rotation_change_degrees,
     _top_two_candidate_diagnostics,
@@ -53,12 +53,16 @@ def test_low_frequency_candidate_loss_suppresses_high_frequency_error():
     assert float(low[0, 1] - low[0, 0]) < 0.05
 
 
-def test_candidate_frequency_curriculum_uses_discrete_stages_then_full_resolution():
+def test_consensus_multiscale_curriculum_uses_discrete_stages_and_decays_weight():
     scales = (0.25, 0.5, 0.75)
-    assert _candidate_frequency_scoring_size(100, 0, 10, 30, scales) == 25
-    assert _candidate_frequency_scoring_size(100, 100, 10, 30, scales) == 50
-    assert _candidate_frequency_scoring_size(100, 200, 10, 30, scales) == 75
-    assert _candidate_frequency_scoring_size(100, 300, 10, 30, scales) == 100
+    assert _consensus_multiscale_size_and_weight(100, 0, 10, 30, scales) == (25, 1.0)
+    size, weight = _consensus_multiscale_size_and_weight(100, 100, 10, 30, scales)
+    assert size == 50
+    np.testing.assert_allclose(weight, 2 / 3)
+    size, weight = _consensus_multiscale_size_and_weight(100, 200, 10, 30, scales)
+    assert size == 75
+    np.testing.assert_allclose(weight, 1 / 3)
+    assert _consensus_multiscale_size_and_weight(100, 300, 10, 30, scales) == (100, 0.0)
 
 
 def test_candidate_coverage_has_finite_direction_gradients():
@@ -162,7 +166,7 @@ def test_train_step_can_return_pose_diagnostics_without_changing_metrics():
 
     loss, metrics, diagnostics, _, _ = train_step_reconsiren(
         graphdef, state, images, labels, {}, jax.random.PRNGKey(8),
-        candidate_scoring_size=8,
+        consensus_multiscale_size=8, consensus_multiscale_weight=0.5,
         train_heterogeneity=False, return_metrics=True,
         return_pose_diagnostics=True)
 
@@ -171,8 +175,8 @@ def test_train_step_can_return_pose_diagnostics_without_changing_metrics():
     assert np.all(np.isfinite(np.asarray(metrics)))
     np.testing.assert_allclose(metrics[12], 1.0, atol=1e-5)
     assert 0.0 <= float(metrics[16]) <= 1.0
-    assert 0.0 <= float(metrics[17]) <= 1.0
-    assert float(metrics[18]) >= 0.0
+    assert float(metrics[17]) >= 0.0
+    np.testing.assert_allclose(metrics[18], 0.5 * (metrics[0] + metrics[17]))
     (winner_rotations, selected_heads, best_heads, absolute, relative,
      standardized, median_normalized, score_entropy) = diagnostics
     assert winner_rotations.shape == (2, 3, 3)

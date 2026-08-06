@@ -118,8 +118,9 @@ def scenarios(workdir, data):
             "--candidate_coverage_weight", "0.01", "--candidate_coverage_bins", "64",
             "--candidate_coverage_kappa", "24", "--candidate_bank_samples", "64",
             "--candidate_bank_mix", "0.5",
-            "--candidate_frequency_curriculum_epochs", "1",
-            "--candidate_frequency_scales", "0.25,0.5,0.75", "--seed", "7",
+            "--consensus_multiscale_epochs", "1",
+            "--consensus_multiscale_scales", "0.25,0.5,0.75",
+            "--consensus_multiscale_weight", "0.5", "--seed", "7",
             "--heterogeneity_profile", "anti_collapse", "--het_start_epoch", "1"]
 
     scn = []
