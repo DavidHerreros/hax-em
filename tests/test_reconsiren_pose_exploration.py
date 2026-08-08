@@ -5,6 +5,7 @@ import optax
 from flax import nnx
 
 from hax.networks.reconsiren import (
+    _PoseCurriculumController,
     _PoseDiagnosticsTracker,
     ReconSIREN,
     _candidate_coverage_loss,
@@ -139,6 +140,52 @@ def test_pose_diagnostics_tracker_compares_same_particles_across_epochs():
     np.testing.assert_allclose(summary["pose_change_mean_degrees"], 5.0, atol=1e-3)
     np.testing.assert_allclose(summary["head_switch_fraction"], 0.5, atol=1e-6)
     np.testing.assert_allclose(summary["comparison_coverage_fraction"], 1.0, atol=1e-6)
+
+
+def test_pose_curriculum_controller_advances_only_on_stability():
+    controller = _PoseCurriculumController(
+        320, (0.25, 0.5, 0.75), switch_threshold=0.05,
+        pose_threshold_degrees=5.0, min_epochs=1, max_epochs=0)
+    churning = {"head_switch_fraction": 0.4, "pose_change_median_degrees": 40.0}
+    stable = {"head_switch_fraction": 0.01, "pose_change_median_degrees": 2.0}
+
+    assert controller.scoring_size == 80
+    # An epoch without cross-epoch churn metrics must not advance the stage.
+    assert not controller.observe_epoch({})
+    assert not controller.observe_epoch(churning)
+    assert controller.scoring_size == 80
+    assert controller.observe_epoch(stable)
+    assert controller.scoring_size == 160
+    assert controller.observe_epoch(stable)
+    assert controller.scoring_size == 240
+    assert controller.multiscale_weight_multiplier > 0.0
+    assert controller.observe_epoch(stable)
+    assert controller.is_final
+    assert controller.scoring_size == 320
+    assert controller.multiscale_weight_multiplier == 0.0
+    assert not controller.observe_epoch(stable)
+
+
+def test_pose_curriculum_controller_respects_epoch_bounds_and_roundtrip():
+    stable = {"head_switch_fraction": 0.0, "pose_change_median_degrees": 0.0}
+    churning = {"head_switch_fraction": 1.0, "pose_change_median_degrees": 180.0}
+
+    controller = _PoseCurriculumController(100, (0.5,), min_epochs=2, max_epochs=3)
+    assert not controller.observe_epoch(stable)
+    assert controller.observe_epoch(stable)
+    assert controller.is_final
+
+    controller = _PoseCurriculumController(100, (0.5,), min_epochs=1, max_epochs=3)
+    assert not controller.observe_epoch(churning)
+    assert not controller.observe_epoch(churning)
+    assert controller.observe_epoch(churning)
+
+    source = _PoseCurriculumController(100, (0.25, 0.5, 0.75))
+    source.observe_epoch(stable)
+    restored = _PoseCurriculumController(100, (0.25, 0.5, 0.75))
+    restored.load_state_dict(source.state_dict())
+    assert restored.stage == source.stage == 1
+    assert restored.scoring_size == 50
 
 
 def _tiny_reconsiren_split():

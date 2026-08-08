@@ -327,6 +327,71 @@ class _PoseDiagnosticsTracker:
         return summary
 
 
+class _PoseCurriculumController:
+    """Advance the candidate scoring resolution when winner churn settles.
+
+    Unlike a fixed epoch schedule, each low-pass stage is held until the
+    per-particle winners are stable at that resolution: the frequency band
+    widens only once it stops changing the decisions it feeds.
+    """
+
+    def __init__(self, image_size, scales, switch_threshold=0.05,
+                 pose_threshold_degrees=5.0, min_epochs=1, max_epochs=10):
+        self.image_size = int(image_size)
+        self.scales = tuple(float(scale) for scale in scales)
+        self.switch_threshold = float(switch_threshold)
+        self.pose_threshold_degrees = float(pose_threshold_degrees)
+        self.min_epochs = max(1, int(min_epochs))
+        self.max_epochs = max(0, int(max_epochs))
+        self.stage = 0
+        self.epochs_in_stage = 0
+
+    @property
+    def is_final(self):
+        return self.stage >= len(self.scales)
+
+    @property
+    def scoring_size(self):
+        if self.is_final:
+            return self.image_size
+        return min(self.image_size,
+                   max(8, int(round(self.image_size * self.scales[self.stage]))))
+
+    @property
+    def multiscale_weight_multiplier(self):
+        if self.is_final:
+            return 0.0
+        return 1.0 - self.stage / (len(self.scales) + 1)
+
+    def observe_epoch(self, summary):
+        """Consume one finished epoch's pose-diagnostics summary; return True on advance."""
+        if self.is_final:
+            return False
+        self.epochs_in_stage += 1
+        if self.epochs_in_stage < self.min_epochs:
+            return False
+        # The first observed epoch has no cross-epoch comparison yet; the
+        # defaults keep the stage until churn is actually measured.
+        stable = (
+            summary.get("head_switch_fraction", 1.0) <= self.switch_threshold
+            and summary.get("pose_change_median_degrees", 180.0)
+            <= self.pose_threshold_degrees)
+        capped = 0 < self.max_epochs <= self.epochs_in_stage
+        if stable or capped:
+            self.stage += 1
+            self.epochs_in_stage = 0
+            return True
+        return False
+
+    def state_dict(self):
+        return {"stage": int(self.stage),
+                "epochs_in_stage": int(self.epochs_in_stage)}
+
+    def load_state_dict(self, state):
+        self.stage = min(max(0, int(state.get("stage", 0))), len(self.scales))
+        self.epochs_in_stage = max(0, int(state.get("epochs_in_stage", 0)))
+
+
 def _fibonacci_sphere_directions(n_directions, dtype=jnp.float32):
     """Deterministic equal-area bin centers on S2."""
     indices = jnp.arange(n_directions, dtype=dtype) + 0.5
@@ -1951,6 +2016,7 @@ def xmippEulerFromMatrix(matrix):
 def main():
     import os
     import sys
+    import json
     import shutil
     from tqdm import tqdm
     import random
@@ -2042,6 +2108,25 @@ def main():
     parser.add_argument("--consensus_multiscale_weight", type=float, default=0.5,
                         help="Initial low-frequency weight in the selected reconstruction objective. The "
                              "weight decays linearly to zero while retaining the complementary full-resolution term.")
+    parser.add_argument("--pose_curriculum", choices=("adaptive", "fixed"), default="adaptive",
+                        help=f"Candidate scoring-resolution schedule. {bcolors.BOLD}adaptive{bcolors.ENDC} ranks "
+                             "candidates at progressively higher low-pass resolutions and advances a stage only "
+                             "once per-particle winners are stable at the current one (this also drives the "
+                             f"consensus multiscale loss). {bcolors.BOLD}fixed{bcolors.ENDC} preserves the "
+                             "full-resolution scoring and epoch-scheduled multiscale loss.")
+    parser.add_argument("--candidate_frequency_scales", type=comma_separated_floats,
+                        default=(0.25, 0.5, 0.75),
+                        help="Comma-separated image-size fractions used as adaptive curriculum stages before "
+                             "full resolution is restored.")
+    parser.add_argument("--pose_curriculum_switch_threshold", type=float, default=0.05,
+                        help="Winner head-switch fraction at or below which a curriculum stage may advance.")
+    parser.add_argument("--pose_curriculum_pose_threshold", type=float, default=5.0,
+                        help="Median winner pose change (degrees) at or below which a curriculum stage may advance.")
+    parser.add_argument("--pose_curriculum_min_epochs", type=int, default=1,
+                        help="Minimum epochs spent in each curriculum stage before it may advance.")
+    parser.add_argument("--pose_curriculum_max_epochs", type=int, default=10,
+                        help="Epochs after which a curriculum stage advances even if winners are still "
+                             "churning; 0 waits for stability indefinitely.")
     parser.add_argument("--pose_diagnostics", action="store_true",
                         help="Track per-particle winner rotations and top-two loss margins. Adds a small "
                              "device-to-host transfer per batch but does not affect training.")
@@ -2150,6 +2235,25 @@ def main():
             args.consensus_multiscale_scales,
             args.consensus_multiscale_scales[1:])):
         parser.error("--consensus_multiscale_scales must be strictly increasing")
+    if (not args.candidate_frequency_scales
+            or any(scale <= 0.0 or scale > 1.0
+                   for scale in args.candidate_frequency_scales)):
+        parser.error("--candidate_frequency_scales values must be in (0,1]")
+    if any(right <= left for left, right in zip(
+            args.candidate_frequency_scales,
+            args.candidate_frequency_scales[1:])):
+        parser.error("--candidate_frequency_scales must be strictly increasing")
+    if not 0.0 <= args.pose_curriculum_switch_threshold <= 1.0:
+        parser.error("--pose_curriculum_switch_threshold must be in [0,1]")
+    if args.pose_curriculum_pose_threshold < 0.0:
+        parser.error("--pose_curriculum_pose_threshold must be non-negative")
+    if args.pose_curriculum_min_epochs < 1:
+        parser.error("--pose_curriculum_min_epochs must be at least 1")
+    if args.pose_curriculum_max_epochs < 0:
+        parser.error("--pose_curriculum_max_epochs must be non-negative")
+    if (args.pose_curriculum_max_epochs
+            and args.pose_curriculum_max_epochs < args.pose_curriculum_min_epochs):
+        parser.error("--pose_curriculum_max_epochs must be 0 or >= --pose_curriculum_min_epochs")
     if args.seed is not None:
         if args.seed < 0:
             parser.error("--seed must be non-negative")
@@ -2343,9 +2447,23 @@ def main():
         heterogeneity_profile = reconsiren.heterogeneity_profile
         het_start_epoch = reconsiren.het_start_epoch
         het_freeze_consensus = reconsiren.het_freeze_consensus
+        # The adaptive curriculum is gated on winner stability, so it needs the
+        # per-particle tracker even when the extra TensorBoard panels are off.
+        pose_diagnostics_enabled = (args.pose_diagnostics
+                                    or args.pose_curriculum == "adaptive")
         pose_diagnostics_tracker = (
             _PoseDiagnosticsTracker(len(generator.md), reconsiren.symmetry_matrices)
-            if args.pose_diagnostics else None)
+            if pose_diagnostics_enabled else None)
+        pose_curriculum_controller = (
+            _PoseCurriculumController(
+                xsize, args.candidate_frequency_scales,
+                switch_threshold=args.pose_curriculum_switch_threshold,
+                pose_threshold_degrees=args.pose_curriculum_pose_threshold,
+                min_epochs=args.pose_curriculum_min_epochs,
+                max_epochs=args.pose_curriculum_max_epochs)
+            if args.pose_curriculum == "adaptive" else None)
+        curriculum_state_path = os.path.join(
+            args.output_path, "ReconSIREN_CHECKPOINT", "pose_curriculum.json")
         graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_volume, optimizer_het))
 
         # Resume if checkpoint exists
@@ -2353,6 +2471,10 @@ def main():
             graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "ReconSIREN_CHECKPOINT"),
                                                                                         optimizer_pose, optimizer_volume, optimizer_het)
             print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
+            if (pose_curriculum_controller is not None
+                    and os.path.isfile(curriculum_state_path)):
+                with open(curriculum_state_path) as fid:
+                    pose_curriculum_controller.load_state_dict(json.load(fid))
         else:
             resume_epoch = 0
 
@@ -2379,6 +2501,19 @@ def main():
                 epoch_index = total_steps // steps_per_epoch
 
                 if total_steps % steps_per_epoch == 0:
+                    # Let the adaptive curriculum consume the finished epoch's
+                    # winner-stability summary before the tracker resets.
+                    if (pose_curriculum_controller is not None
+                            and pose_diagnostics_tracker is not None
+                            and pose_diagnostics_tracker.absolute_margins
+                            and total_steps > 1500):
+                        if pose_curriculum_controller.observe_epoch(
+                                pose_diagnostics_tracker.summary()):
+                            new_size = pose_curriculum_controller.scoring_size
+                            print(f"\n{bcolors.OKCYAN}Pose curriculum advanced to stage "
+                                  f"{pose_curriculum_controller.stage}: scoring candidates "
+                                  f"at {new_size}/{xsize} pixels{bcolors.ENDC}")
+
                     total_loss = 0
                     total_recon_loss = 0
                     total_recon_het_loss = 0
@@ -2483,6 +2618,11 @@ def main():
                             NeuralNetworkCheckpointer.save_intermediate(graphdef, state,
                                                                         os.path.join(args.output_path, "ReconSIREN_CHECKPOINT"),
                                                                         epoch=i, wait=False)
+                            if pose_curriculum_controller is not None:
+                                os.makedirs(os.path.dirname(curriculum_state_path),
+                                            exist_ok=True)
+                                with open(curriculum_state_path, "w") as fid:
+                                    json.dump(pose_curriculum_controller.state_dict(), fid)
 
                     i += 1
 
@@ -2497,15 +2637,24 @@ def main():
                 else:
                     tau = 0.0
                     use_tau = False
-                    candidate_scoring_size = xsize
-                    (consensus_multiscale_size,
-                     multiscale_weight_multiplier) = _consensus_multiscale_size_and_weight(
-                        xsize, total_steps - 1501, steps_per_epoch,
-                        args.consensus_multiscale_epochs,
-                        args.consensus_multiscale_scales)
-                    consensus_multiscale_weight = (
-                        args.consensus_multiscale_weight
-                        * multiscale_weight_multiplier)
+                    if pose_curriculum_controller is not None:
+                        # Score candidates in the stability-gated band and keep
+                        # the consensus multiscale loss on the same band.
+                        candidate_scoring_size = pose_curriculum_controller.scoring_size
+                        consensus_multiscale_size = candidate_scoring_size
+                        consensus_multiscale_weight = (
+                            args.consensus_multiscale_weight
+                            * pose_curriculum_controller.multiscale_weight_multiplier)
+                    else:
+                        candidate_scoring_size = xsize
+                        (consensus_multiscale_size,
+                         multiscale_weight_multiplier) = _consensus_multiscale_size_and_weight(
+                            xsize, total_steps - 1501, steps_per_epoch,
+                            args.consensus_multiscale_epochs,
+                            args.consensus_multiscale_scales)
+                        consensus_multiscale_weight = (
+                            args.consensus_multiscale_weight
+                            * multiscale_weight_multiplier)
                 uniform_weight = 0.1
 
                 coverage_steps = args.candidate_coverage_epochs * steps_per_epoch
@@ -2534,8 +2683,8 @@ def main():
                     train_pose_volume=train_pose_volume,
                     train_heterogeneity=train_heterogeneity,
                     return_metrics=True,
-                    return_pose_diagnostics=args.pose_diagnostics)
-                if args.pose_diagnostics:
+                    return_pose_diagnostics=pose_diagnostics_enabled)
+                if pose_diagnostics_enabled:
                     loss, metrics, pose_diagnostics, state, rng = train_result
                     (winner_rotations, selected_heads, best_heads,
                      absolute_margins, relative_margins, standardized_margins,
@@ -2625,19 +2774,26 @@ def main():
                          "active": float(consensus_multiscale_weight > 0.0)},
                         i * steps_per_epoch + step)
 
+                    curriculum_scalars = {
+                        "scoring_resolution_pixels": float(candidate_scoring_size),
+                        "scoring_resolution_fraction": (
+                            float(candidate_scoring_size) / xsize),
+                        "low_frequency_full_winner_agreement": (
+                            float(total_frequency_full_agreement) / step),
+                        "selected_full_loss_disadvantage_std": (
+                            float(total_frequency_full_disadvantage_std) / step),
+                        "active": float(candidate_scoring_size < xsize)}
+                    if pose_curriculum_controller is not None:
+                        curriculum_scalars["stage"] = float(
+                            pose_curriculum_controller.stage)
+                        curriculum_scalars["epochs_in_stage"] = float(
+                            pose_curriculum_controller.epochs_in_stage)
                     writer.add_scalars(
                         'Candidate frequency curriculum (ReconSIREN)',
-                        {"scoring_resolution_pixels": float(candidate_scoring_size),
-                         "scoring_resolution_fraction": (
-                             float(candidate_scoring_size) / xsize),
-                         "low_frequency_full_winner_agreement": (
-                             float(total_frequency_full_agreement) / step),
-                         "selected_full_loss_disadvantage_std": (
-                             float(total_frequency_full_disadvantage_std) / step),
-                         "active": float(candidate_scoring_size < xsize)},
+                        curriculum_scalars,
                         i * steps_per_epoch + step)
 
-                    if pose_diagnostics_tracker is not None:
+                    if args.pose_diagnostics and pose_diagnostics_tracker is not None:
                         pose_summary = pose_diagnostics_tracker.summary()
                         writer.add_scalars(
                             'Winner standardized confidence (ReconSIREN)',
