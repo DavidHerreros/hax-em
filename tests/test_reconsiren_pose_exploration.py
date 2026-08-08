@@ -141,7 +141,7 @@ def test_pose_diagnostics_tracker_compares_same_particles_across_epochs():
     np.testing.assert_allclose(summary["comparison_coverage_fraction"], 1.0, atol=1e-6)
 
 
-def test_train_step_can_return_pose_diagnostics_without_changing_metrics():
+def _tiny_reconsiren_split():
     model = ReconSIREN(
         coords=jnp.zeros((4, 3)), values=jnp.full((4,), 0.01),
         xsize=16, sr=1.0, bank_size=32, ctf_type=None,
@@ -160,7 +160,11 @@ def test_train_step_can_return_pose_diagnostics_without_changing_metrics():
         nnx.Optimizer(model, optax.adam(1e-4), wrt=volume_params),
         nnx.Optimizer(model, optax.adam(1e-4), wrt=het_params),
     )
-    graphdef, state = nnx.split((model, *optimizers))
+    return nnx.split((model, *optimizers))
+
+
+def test_train_step_can_return_pose_diagnostics_without_changing_metrics():
+    graphdef, state = _tiny_reconsiren_split()
     images = jax.random.normal(jax.random.PRNGKey(7), (2, 16, 16, 1))
     labels = jnp.array([0, 1])
 
@@ -171,14 +175,34 @@ def test_train_step_can_return_pose_diagnostics_without_changing_metrics():
         return_pose_diagnostics=True)
 
     assert np.isfinite(float(loss))
-    assert len(metrics) == 19
+    assert len(metrics) == 21
     assert np.all(np.isfinite(np.asarray(metrics)))
     np.testing.assert_allclose(metrics[12], 1.0, atol=1e-5)
     assert 0.0 <= float(metrics[16]) <= 1.0
     assert float(metrics[17]) >= 0.0
     np.testing.assert_allclose(metrics[18], 0.5 * (metrics[0] + metrics[17]))
+    # Full-resolution scoring: curriculum and full losses agree exactly.
+    np.testing.assert_allclose(metrics[19], 1.0, atol=1e-6)
+    np.testing.assert_allclose(metrics[20], 0.0, atol=1e-6)
     (winner_rotations, selected_heads, best_heads, absolute, relative,
      standardized, median_normalized, score_entropy) = diagnostics
     assert winner_rotations.shape == (2, 3, 3)
     assert (selected_heads.shape == best_heads.shape == absolute.shape == relative.shape
             == standardized.shape == median_normalized.shape == score_entropy.shape == (2,))
+
+
+def test_train_step_accepts_low_frequency_candidate_scoring():
+    graphdef, state = _tiny_reconsiren_split()
+    images = jax.random.normal(jax.random.PRNGKey(9), (2, 16, 16, 1))
+    labels = jnp.array([0, 1])
+
+    loss, metrics, _, _, _ = train_step_reconsiren(
+        graphdef, state, images, labels, {}, jax.random.PRNGKey(10),
+        candidate_scoring_size=8,
+        train_heterogeneity=False, return_metrics=True,
+        return_pose_diagnostics=True)
+
+    assert np.isfinite(float(loss))
+    assert len(metrics) == 21
+    assert np.all(np.isfinite(np.asarray(metrics)))
+    assert 0.0 <= float(metrics[19]) <= 1.0

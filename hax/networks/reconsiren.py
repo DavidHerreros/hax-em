@@ -1327,16 +1327,25 @@ def _gather_candidates(values, indices):
     return values[jnp.arange(values.shape[0])[:, None], indices]
 
 
-def _score_candidates(model, x, values, coords, rotations, shifts, ctf):
-    """Render candidates once and return legacy full-resolution losses."""
+def _score_candidates(model, x, values, coords, rotations, shifts, ctf,
+                      scoring_size=None):
+    """Render candidates once and return curriculum and full-resolution losses."""
     chunk = model.candidate_chunk_size
     n_candidates = rotations.shape[1]
+    scoring_size = model.xsize if scoring_size is None else scoring_size
     if chunk <= 0 or chunk >= n_candidates:
         images = model.phys_decoder(
             x, values, coords, model.xsize, rotations, shifts, ctf,
             model.ctf_type, model.get_std())
-        return _candidate_reconstruction_losses(images, x, ctf, model.ctf_type)
+        full_losses = _candidate_reconstruction_losses(
+            images, x, ctf, model.ctf_type)
+        if scoring_size >= model.xsize:
+            return full_losses, full_losses
+        scoring_losses = _candidate_reconstruction_losses(
+            images, x, ctf, model.ctf_type, scoring_size=scoring_size)
+        return scoring_losses, full_losses
 
+    scoring_losses = []
     full_losses = []
     for start in range(0, n_candidates, chunk):
         images = model.phys_decoder(
@@ -1346,7 +1355,13 @@ def _score_candidates(model, x, values, coords, rotations, shifts, ctf):
         full_chunk = _candidate_reconstruction_losses(
             images, x, ctf, model.ctf_type)
         full_losses.append(full_chunk)
-    return jnp.concatenate(full_losses, axis=1)
+        if scoring_size >= model.xsize:
+            scoring_losses.append(full_chunk)
+        else:
+            scoring_losses.append(_candidate_reconstruction_losses(
+                images, x, ctf, model.ctf_type, scoring_size=scoring_size))
+    return (jnp.concatenate(scoring_losses, axis=1),
+            jnp.concatenate(full_losses, axis=1))
 
 
 def _consensus_multiscale_size_and_weight(
@@ -1364,6 +1379,7 @@ def _consensus_multiscale_size_and_weight(
 @partial(jax.jit, static_argnames=("use_tau",
                                    "apply_candidate_coverage", "candidate_coverage_bins",
                                    "candidate_bank_samples",
+                                   "candidate_scoring_size",
                                    "consensus_multiscale_size",
                                    "train_pose_volume", "train_heterogeneity", "return_metrics",
                                    "return_pose_diagnostics"),
@@ -1376,11 +1392,14 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           candidate_coverage_kappa=32.0,
                           candidate_bank_samples=1024,
                           candidate_bank_mix=0.5,
+                          candidate_scoring_size=0,
                           consensus_multiscale_size=0,
                           consensus_multiscale_weight=0.0,
                           train_pose_volume=True, train_heterogeneity=True,
                           return_metrics=False, return_pose_diagnostics=False):
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
+    scoring_size = (model.xsize if candidate_scoring_size <= 0
+                    else min(int(candidate_scoring_size), model.xsize))
     multiscale_size = (model.xsize if consensus_multiscale_size <= 0
                        else min(int(consensus_multiscale_size), model.xsize))
 
@@ -1418,12 +1437,14 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         random_indices = jax.random.choice(choice_key, jnp.arange(model.symmetry_matrices.shape[0]), shape=(rotations.shape[0],))
         rotations = jnp.matmul(jnp.transpose(model.symmetry_matrices[random_indices], (0, 2, 1))[:, None, :, :], rotations)
 
-        # Candidate selection keeps the legacy full-resolution objective.  The
-        # optional coarse screen is disabled only during stochastic exploration.
+        # Low-frequency curriculum scoring evaluates all candidates.  The
+        # optional coarse screen remains available once full-resolution scoring
+        # resumes, and is disabled during legacy stochastic exploration.
         rotations_eval, shifts_eval = rotations, shifts
         candidate_head_indices = jnp.broadcast_to(
             jnp.arange(rotations.shape[1], dtype=jnp.int32), rotations.shape[:2])
-        if not use_tau and model.coarse_topk < rotations.shape[1]:
+        if (not use_tau and scoring_size >= model.xsize
+                and model.coarse_topk < rotations.shape[1]):
             screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
             x_screen = jax.image.resize(
                 x, (x.shape[0], screen_size, screen_size, x.shape[-1]), method="bilinear")
@@ -1448,10 +1469,10 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
 
         # The global competition never carries gradients through candidate
         # scoring.  Only its selected pose is rerendered into the consensus.
-        candidate_losses = _score_candidates(
+        candidate_losses, full_candidate_losses = _score_candidates(
             model, x, jax.lax.stop_gradient(values), jax.lax.stop_gradient(coords),
             jax.lax.stop_gradient(rotations_eval), jax.lax.stop_gradient(shifts_eval),
-            ctf)
+            ctf, scoring_size=scoring_size)
 
         # Candidate responsibilities are used only to pick a single global
         # winner.  Categorical exploration therefore remains safe for volume
@@ -1465,7 +1486,15 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             responsibilities = jax.nn.one_hot(
                 min_indices, candidate_losses.shape[1], dtype=candidate_losses.dtype)
 
+        scoring_best_indices = jnp.argmin(candidate_losses, axis=1)
+        full_best_indices = jnp.argmin(full_candidate_losses, axis=1)
+        low_frequency_full_agreement = jnp.mean(
+            scoring_best_indices == full_best_indices)
+        full_scale = jnp.maximum(jnp.std(full_candidate_losses, axis=1), 1e-8)
         batch_indices = jnp.arange(x.shape[0])
+        low_frequency_full_disadvantage_std = jnp.mean(
+            (full_candidate_losses[batch_indices, scoring_best_indices]
+             - full_candidate_losses[batch_indices, full_best_indices]) / full_scale)
 
         if return_pose_diagnostics:
             (best_indices, absolute_margin, relative_margin, standardized_margin,
@@ -1512,7 +1541,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                 (1.0 - effective_multiscale_weight) * recon_loss
                 + effective_multiscale_weight * low_frequency_recon_loss)
         else:
-            recon_loss = candidate_losses[batch_indices, min_indices].mean()
+            recon_loss = full_candidate_losses[batch_indices, min_indices].mean()
             low_frequency_recon_loss = recon_loss
             reconstruction_objective = recon_loss
 
@@ -1618,7 +1647,9 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                    consensus_amplitude_rms, consensus_amplitude_max,
                    consensus_active_amplitude_fraction,
                    low_frequency_recon_loss,
-                   reconstruction_objective)
+                   reconstruction_objective,
+                   low_frequency_full_agreement,
+                   low_frequency_full_disadvantage_std)
         pose_diagnostics = tuple(jax.lax.stop_gradient(value) for value in (
             rotations_selected[:, 0], selected_head_indices, best_head_indices,
             absolute_margin, relative_margin, standardized_margin,
@@ -1656,7 +1687,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         ctf = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
 
     coarse_ctf = ctf
-    if not use_tau and model.coarse_topk < model.encoder_pose.num_components:
+    if (not use_tau and scoring_size >= model.xsize
+            and model.coarse_topk < model.encoder_pose.num_components):
         screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
         if model.ctf_type not in (None, "None"):
             coarse_ctf = computeCTF(
@@ -1898,7 +1930,7 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md, k
         rotations = _gather_candidates(rotations, top_indices)
         shifts = _gather_candidates(shifts, top_indices)
 
-    recon_loss = _score_candidates(
+    recon_loss, _ = _score_candidates(
         model, x, values, coords, rotations, shifts, ctf)
 
     # Get minimum indices
@@ -2366,6 +2398,8 @@ def main():
                     total_consensus_active_amplitude_fraction = 0
                     total_low_frequency_recon_loss = 0
                     total_reconstruction_objective = 0
+                    total_frequency_full_agreement = 0
+                    total_frequency_full_disadvantage_std = 0
                     projection_diagnostic_steps = 0
                     total_validation_loss = 0
 
@@ -2457,11 +2491,13 @@ def main():
                 if total_steps <= 1500:
                     tau = 1e-3
                     use_tau = True
+                    candidate_scoring_size = xsize
                     consensus_multiscale_size = xsize
                     consensus_multiscale_weight = 0.0
                 else:
                     tau = 0.0
                     use_tau = False
+                    candidate_scoring_size = xsize
                     (consensus_multiscale_size,
                      multiscale_weight_multiplier) = _consensus_multiscale_size_and_weight(
                         xsize, total_steps - 1501, steps_per_epoch,
@@ -2492,6 +2528,7 @@ def main():
                     candidate_coverage_kappa=args.candidate_coverage_kappa,
                     candidate_bank_samples=args.candidate_bank_samples,
                     candidate_bank_mix=args.candidate_bank_mix,
+                    candidate_scoring_size=candidate_scoring_size,
                     consensus_multiscale_size=consensus_multiscale_size,
                     consensus_multiscale_weight=consensus_multiscale_weight,
                     train_pose_volume=train_pose_volume,
@@ -2516,7 +2553,9 @@ def main():
                  consensus_amplitude_rms, consensus_amplitude_max,
                  consensus_active_amplitude_fraction,
                  low_frequency_recon_loss,
-                 reconstruction_objective) = metrics
+                 reconstruction_objective,
+                 frequency_full_agreement,
+                 frequency_full_disadvantage_std) = metrics
                 total_loss += loss
                 total_recon_loss += recon_loss
                 total_recon_het_loss += recon_het_loss
@@ -2534,6 +2573,8 @@ def main():
                 total_consensus_active_amplitude_fraction += consensus_active_amplitude_fraction
                 total_low_frequency_recon_loss += low_frequency_recon_loss
                 total_reconstruction_objective += reconstruction_objective
+                total_frequency_full_agreement += frequency_full_agreement
+                total_frequency_full_disadvantage_std += frequency_full_disadvantage_std
                 if train_pose_volume:
                     total_projection_rms += projection_rms
                     total_normalized_target_rms += normalized_target_rms
@@ -2582,6 +2623,18 @@ def main():
                          "loss_resolution_fraction": (
                              float(consensus_multiscale_size) / xsize),
                          "active": float(consensus_multiscale_weight > 0.0)},
+                        i * steps_per_epoch + step)
+
+                    writer.add_scalars(
+                        'Candidate frequency curriculum (ReconSIREN)',
+                        {"scoring_resolution_pixels": float(candidate_scoring_size),
+                         "scoring_resolution_fraction": (
+                             float(candidate_scoring_size) / xsize),
+                         "low_frequency_full_winner_agreement": (
+                             float(total_frequency_full_agreement) / step),
+                         "selected_full_loss_disadvantage_std": (
+                             float(total_frequency_full_disadvantage_std) / step),
+                         "active": float(candidate_scoring_size < xsize)},
                         i * steps_per_epoch + step)
 
                     if pose_diagnostics_tracker is not None:
