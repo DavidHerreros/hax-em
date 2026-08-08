@@ -178,6 +178,22 @@ def repulsion_loss(
     return jnp.mean(energy)
 
 
+def _assignment_probabilities(losses, temperature, adaptive=True, eps=1e-6):
+    """Turn per-candidate losses into stable responsibilities.
+
+    In adaptive mode ``temperature`` is dimensionless: every particle's loss
+    differences are divided by their own standard deviation first.  This makes
+    the exploration schedule insensitive to map amplitude, box size and CTF
+    mode, unlike the historical absolute ``tau``.
+    """
+    centered = losses - jnp.min(losses, axis=1, keepdims=True)
+    if adaptive:
+        scale = jnp.std(centered, axis=1, keepdims=True)
+        centered = centered / jnp.maximum(scale, eps)
+    temperature = jnp.maximum(jnp.asarray(temperature, dtype=losses.dtype), eps)
+    return jax.nn.softmax(-centered / temperature, axis=1)
+
+
 def _top_two_candidate_diagnostics(losses, eps=1e-8):
     """Return complementary confidence diagnostics for candidate competition."""
     if losses.shape[1] < 2:
@@ -336,15 +352,32 @@ class _PoseCurriculumController:
     """
 
     def __init__(self, image_size, scales, switch_threshold=0.05,
-                 pose_threshold_degrees=5.0, min_epochs=1, max_epochs=10):
+                 pose_threshold_degrees=5.0, min_epochs=1, max_epochs=10,
+                 temperatures=None):
         self.image_size = int(image_size)
         self.scales = tuple(float(scale) for scale in scales)
         self.switch_threshold = float(switch_threshold)
         self.pose_threshold_degrees = float(pose_threshold_degrees)
         self.min_epochs = max(1, int(min_epochs))
         self.max_epochs = max(0, int(max_epochs))
+        if temperatures is None:
+            temperatures = (0.0,) * len(self.scales)
+        temperatures = tuple(float(value) for value in temperatures)
+        if len(temperatures) == 1:
+            temperatures = temperatures * len(self.scales)
+        if len(temperatures) != len(self.scales):
+            raise ValueError(
+                "curriculum temperatures must match the number of scales")
+        self.temperatures = temperatures
         self.stage = 0
         self.epochs_in_stage = 0
+
+    @property
+    def temperature(self):
+        """Dimensionless assignment temperature; the final stage is always hard."""
+        if self.is_final:
+            return 0.0
+        return self.temperatures[self.stage]
 
     @property
     def is_final(self):
@@ -1441,7 +1474,7 @@ def _consensus_multiscale_size_and_weight(
     return size, 1.0 - progress
 
 
-@partial(jax.jit, static_argnames=("use_tau",
+@partial(jax.jit, static_argnames=("use_tau", "assignment_mode",
                                    "apply_candidate_coverage", "candidate_coverage_bins",
                                    "candidate_bank_samples",
                                    "candidate_scoring_size",
@@ -1450,7 +1483,7 @@ def _consensus_multiscale_size_and_weight(
                                    "return_pose_diagnostics"),
          donate_argnums=(1,))
 def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
-                          use_tau=False, lambda_uniform=0.1,
+                          use_tau=False, assignment_mode="hard", lambda_uniform=0.1,
                           apply_candidate_coverage=False,
                           candidate_coverage_weight=0.0,
                           candidate_coverage_bins=256,
@@ -1508,7 +1541,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         rotations_eval, shifts_eval = rotations, shifts
         candidate_head_indices = jnp.broadcast_to(
             jnp.arange(rotations.shape[1], dtype=jnp.int32), rotations.shape[:2])
-        if (not use_tau and scoring_size >= model.xsize
+        if (not use_tau and assignment_mode == "hard"
+                and scoring_size >= model.xsize
                 and model.coarse_topk < rotations.shape[1]):
             screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
             x_screen = jax.image.resize(
@@ -1544,6 +1578,13 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         # amplitudes while allowing the winning head to vary over time.
         if use_tau:
             responsibilities = jax.nn.softmax(-candidate_losses / tau, axis=1)
+            min_indices = jax.random.categorical(
+                key, jnp.log(jnp.maximum(responsibilities, 1e-12)), axis=-1)
+        elif assignment_mode == "sampled":
+            # Dimensionless temperature: the winner is drawn from margin-aware
+            # responsibilities so symmetry breaks gradually instead of at an
+            # abrupt argmin switch.
+            responsibilities = _assignment_probabilities(candidate_losses, tau)
             min_indices = jax.random.categorical(
                 key, jnp.log(jnp.maximum(responsibilities, 1e-12)), axis=-1)
         else:
@@ -1752,7 +1793,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         ctf = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
 
     coarse_ctf = ctf
-    if (not use_tau and scoring_size >= model.xsize
+    if (not use_tau and assignment_mode == "hard"
+            and scoring_size >= model.xsize
             and model.coarse_topk < model.encoder_pose.num_components):
         screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
         if model.ctf_type not in (None, "None"):
@@ -2127,6 +2169,12 @@ def main():
     parser.add_argument("--pose_curriculum_max_epochs", type=int, default=10,
                         help="Epochs after which a curriculum stage advances even if winners are still "
                              "churning; 0 waits for stability indefinitely.")
+    parser.add_argument("--pose_curriculum_temperatures", type=comma_separated_floats,
+                        default=(0.3, 0.15, 0.05),
+                        help="Dimensionless assignment temperatures per adaptive curriculum stage (a single "
+                             "value applies to every stage). Winners are sampled from margin-aware "
+                             "responsibilities instead of taken by argmin; the final full-resolution stage "
+                             "is always hard. 0 disables sampling for clean A/B runs.")
     parser.add_argument("--pose_diagnostics", action="store_true",
                         help="Track per-particle winner rotations and top-two loss margins. Adds a small "
                              "device-to-host transfer per batch but does not affect training.")
@@ -2254,6 +2302,13 @@ def main():
     if (args.pose_curriculum_max_epochs
             and args.pose_curriculum_max_epochs < args.pose_curriculum_min_epochs):
         parser.error("--pose_curriculum_max_epochs must be 0 or >= --pose_curriculum_min_epochs")
+    if (not args.pose_curriculum_temperatures
+            or any(value < 0.0 for value in args.pose_curriculum_temperatures)):
+        parser.error("--pose_curriculum_temperatures values must be non-negative")
+    if len(args.pose_curriculum_temperatures) not in (
+            1, len(args.candidate_frequency_scales)):
+        parser.error("--pose_curriculum_temperatures must be a single value or one "
+                     "per --candidate_frequency_scales entry")
     if args.seed is not None:
         if args.seed < 0:
             parser.error("--seed must be non-negative")
@@ -2460,7 +2515,8 @@ def main():
                 switch_threshold=args.pose_curriculum_switch_threshold,
                 pose_threshold_degrees=args.pose_curriculum_pose_threshold,
                 min_epochs=args.pose_curriculum_min_epochs,
-                max_epochs=args.pose_curriculum_max_epochs)
+                max_epochs=args.pose_curriculum_max_epochs,
+                temperatures=args.pose_curriculum_temperatures)
             if args.pose_curriculum == "adaptive" else None)
         curriculum_state_path = os.path.join(
             args.output_path, "ReconSIREN_CHECKPOINT", "pose_curriculum.json")
@@ -2631,12 +2687,14 @@ def main():
                 if total_steps <= 1500:
                     tau = 1e-3
                     use_tau = True
+                    assignment_mode = "hard"
                     candidate_scoring_size = xsize
                     consensus_multiscale_size = xsize
                     consensus_multiscale_weight = 0.0
                 else:
                     tau = 0.0
                     use_tau = False
+                    assignment_mode = "hard"
                     if pose_curriculum_controller is not None:
                         # Score candidates in the stability-gated band and keep
                         # the consensus multiscale loss on the same band.
@@ -2645,6 +2703,8 @@ def main():
                         consensus_multiscale_weight = (
                             args.consensus_multiscale_weight
                             * pose_curriculum_controller.multiscale_weight_multiplier)
+                        tau = pose_curriculum_controller.temperature
+                        assignment_mode = "sampled" if tau > 0.0 else "hard"
                     else:
                         candidate_scoring_size = xsize
                         (consensus_multiscale_size,
@@ -2671,6 +2731,7 @@ def main():
                 train_result = train_step_reconsiren(
                     graphdef, state, x, labels, md_columns, rng,
                     lambda_uniform=uniform_weight, tau=tau, use_tau=use_tau,
+                    assignment_mode=assignment_mode,
                     apply_candidate_coverage=apply_candidate_coverage,
                     candidate_coverage_weight=candidate_coverage_weight,
                     candidate_coverage_bins=args.candidate_coverage_bins,

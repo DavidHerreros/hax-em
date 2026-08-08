@@ -8,6 +8,7 @@ from hax.networks.reconsiren import (
     _PoseCurriculumController,
     _PoseDiagnosticsTracker,
     ReconSIREN,
+    _assignment_probabilities,
     _candidate_coverage_loss,
     _candidate_reconstruction_losses,
     _consensus_multiscale_size_and_weight,
@@ -188,6 +189,39 @@ def test_pose_curriculum_controller_respects_epoch_bounds_and_roundtrip():
     assert restored.scoring_size == 50
 
 
+def test_assignment_probabilities_are_scale_invariant_and_sharpen():
+    losses = jnp.array([[0.2, 0.5, 0.8], [3.0, 1.0, 2.0]], dtype=jnp.float32)
+
+    probs = _assignment_probabilities(losses, 0.3)
+    rescaled = _assignment_probabilities(19.0 * losses + 100.0, 0.3)
+    np.testing.assert_allclose(probs, rescaled, atol=1e-5)
+    np.testing.assert_allclose(np.sum(np.asarray(probs), axis=1), np.ones(2),
+                               atol=1e-6)
+
+    cold = _assignment_probabilities(losses, 1e-4)
+    np.testing.assert_array_equal(np.argmax(cold, axis=1), np.array([0, 1]))
+    np.testing.assert_allclose(np.max(cold, axis=1), np.ones(2), atol=1e-5)
+
+
+def test_pose_curriculum_controller_temperature_matches_stage():
+    stable = {"head_switch_fraction": 0.0, "pose_change_median_degrees": 0.0}
+    controller = _PoseCurriculumController(
+        100, (0.25, 0.5, 0.75), temperatures=(0.3, 0.15, 0.05))
+
+    assert controller.temperature == 0.3
+    controller.observe_epoch(stable)
+    assert controller.temperature == 0.15
+    controller.observe_epoch(stable)
+    assert controller.temperature == 0.05
+    controller.observe_epoch(stable)
+    assert controller.is_final
+    assert controller.temperature == 0.0
+
+    broadcast = _PoseCurriculumController(100, (0.25, 0.5), temperatures=(0.0,))
+    assert broadcast.temperature == 0.0
+    assert broadcast.temperatures == (0.0, 0.0)
+
+
 def _tiny_reconsiren_split():
     model = ReconSIREN(
         coords=jnp.zeros((4, 3)), values=jnp.full((4,), 0.01),
@@ -253,3 +287,18 @@ def test_train_step_accepts_low_frequency_candidate_scoring():
     assert len(metrics) == 21
     assert np.all(np.isfinite(np.asarray(metrics)))
     assert 0.0 <= float(metrics[19]) <= 1.0
+
+
+def test_train_step_supports_sampled_assignment():
+    graphdef, state = _tiny_reconsiren_split()
+    images = jax.random.normal(jax.random.PRNGKey(11), (2, 16, 16, 1))
+    labels = jnp.array([0, 1])
+
+    loss, metrics, _, _, _ = train_step_reconsiren(
+        graphdef, state, images, labels, {}, jax.random.PRNGKey(12),
+        tau=0.3, assignment_mode="sampled", candidate_scoring_size=8,
+        train_heterogeneity=False, return_metrics=True,
+        return_pose_diagnostics=True)
+
+    assert np.isfinite(float(loss))
+    assert np.all(np.isfinite(np.asarray(metrics)))
