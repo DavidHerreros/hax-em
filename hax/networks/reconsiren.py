@@ -12,6 +12,7 @@ from functools import partial
 from einops import rearrange
 
 from sklearn.cluster import KMeans
+from sklearn.neighbors import NearestNeighbors
 
 from hax.utils import *
 from hax.layers import *
@@ -1524,20 +1525,154 @@ def _sharpen_gaussian_envelope(volume, sigma, reg=0.02):
     return jnp.fft.irfftn(jnp.fft.rfftn(volume) * gain, s=shape)
 
 
+def _estimate_particle_extent(images, threshold=0.1, margin=1.15):
+    """Estimate the particle radius in pixels from raw images alone.
+
+    Orientation-free: the per-pixel variance across the batch carries the
+    particle signal (projections change with pose) on top of a flat noise
+    floor taken from the outermost radial shells. Needs no reference volume
+    and no mask. Returns ``None`` when no clear extent stands out.
+    """
+    x = np.asarray(images, np.float32)
+    if x.ndim == 4:
+        x = x[..., 0]
+    x = (x - x.mean(axis=(1, 2), keepdims=True)) / (x.std(axis=(1, 2), keepdims=True) + 1e-8)
+    variance = x.var(axis=0)
+
+    h, w = variance.shape
+    yy, xx = np.indices((h, w))
+    r = np.sqrt((yy - h // 2) ** 2 + (xx - w // 2) ** 2).astype(np.int32)
+    n_shells = int(r.max()) + 1
+    profile = np.bincount(r.ravel(), weights=variance.ravel(), minlength=n_shells)
+    counts = np.bincount(r.ravel(), minlength=n_shells)
+    profile = profile / np.maximum(counts, 1)
+
+    max_radius = min(h, w) // 2
+    if max_radius < 8:
+        return None
+    profile = profile[:max_radius]
+    outer = profile[int(0.85 * max_radius):]
+    noise_floor = np.median(outer)
+    excess = profile - noise_floor
+    # Refuse rather than hallucinate: the variance peak must stand well clear
+    # of the outer-shell scatter (robust MAD scale) to count as a particle.
+    noise_scale = 1.4826 * np.median(np.abs(outer - noise_floor))
+    peak = excess.max()
+    if peak <= 5.0 * max(noise_scale, 1e-12):
+        return None
+    above = np.flatnonzero(excess > threshold * peak)
+    if above.size == 0:
+        return None
+    radius = float(above.max()) * margin
+    return float(np.clip(radius, 4.0, 0.95 * max_radius))
+
+
+def _geometry_prior_losses(coords, values, neighbor_indices, sigma):
+    """kNN spacing and amplitude-smoothness priors on the consensus cloud.
+
+    Spacing: a mass-weighted penalty when an edge stretches past ~2 sigma (the
+    overlap limit for continuous rendered density) or crowds below ~0.7 sigma
+    (redundant stacking on blobs). Smoothness: a graph Laplacian on amplitudes
+    so neighbouring mass-carrying points render at similar brightness and a
+    single iso-surface threshold traces the whole chain. The edge weights and
+    normalisations are stop-gradient so neither term can be cheated by simply
+    shrinking amplitudes.
+    """
+    positions = coords[0]
+    amplitudes = values[0]
+    neighbor_positions = positions[neighbor_indices]  # (N, k, 3)
+    distances = jnp.sqrt(jnp.sum(jnp.square(
+        positions[:, None, :] - neighbor_positions), axis=-1) + 1e-12)
+    sigma = jax.lax.stop_gradient(jnp.mean(sigma))
+
+    edge_weights = jnp.sqrt(amplitudes[:, None] * amplitudes[neighbor_indices] + 1e-12)
+    edge_weights = jax.lax.stop_gradient(edge_weights / (jnp.mean(edge_weights) + 1e-12))
+    # The gap term applies to the NEAREST neighbour only (neighbor_indices must
+    # be distance-sorted): connectivity means d_nn < ~2 sigma. Demanding it of
+    # all k neighbours would penalise chain topology itself and squeeze
+    # filaments into clumps. Crowding applies to every neighbour.
+    gap = jax.nn.relu(distances[:, 0] - 2.0 * sigma) / sigma
+    crowd = jax.nn.relu(0.7 * sigma - distances) / sigma
+    spacing_loss = (jnp.mean(edge_weights[:, 0] * jnp.square(gap))
+                    + jnp.mean(edge_weights * jnp.square(crowd)))
+
+    amplitude_scale = jax.lax.stop_gradient(jnp.mean(amplitudes) + 1e-12)
+    smoothness_loss = jnp.mean(edge_weights * jnp.square(
+        (amplitudes[:, None] - amplitudes[neighbor_indices]) / amplitude_scale))
+    return spacing_loss, smoothness_loss
+
+
+def _support_loss(coords, values, center, radius, sigma):
+    """Mass outside the shrink-wrapped spherical support, in units of sigma.
+
+    The support is derived from the converging cloud itself (no mask needed);
+    the term is zero for any point inside it, so it only suppresses dust.
+    """
+    positions = coords[0]
+    amplitudes = values[0]
+    distances = jnp.sqrt(jnp.sum(jnp.square(positions - center[None, :]), axis=-1) + 1e-12)
+    sigma = jax.lax.stop_gradient(jnp.mean(sigma))
+    outside = jax.nn.relu(distances - radius) / sigma
+    total_mass = jax.lax.stop_gradient(jnp.sum(amplitudes) + 1e-12)
+    return jnp.sum(amplitudes * outside) / total_mass
+
+
+@partial(jax.jit, donate_argnums=(1,))
+def recycle_dead_points_reconsiren(graphdef, state, key, dead_fraction=0.05,
+                                   new_value_fraction=0.25):
+    """Teleport amplitude-dead Gaussians next to mass-carrying ones.
+
+    Fixed-N counterpart of Gaussian-splatting densify/prune: points whose
+    amplitude collapsed below ``dead_fraction`` of the mean are resampled next
+    to donors drawn proportionally to mass (one splat width of jitter) and
+    restart at a small amplitude, relocating capacity onto the structure
+    without changing any array shape. Only valid for the 'direct' consensus
+    parameterization. Stale Adam moments of moved points are left in place:
+    the inflated second moment just makes their first few updates cautious.
+    """
+    model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
+    decoder = model.delta_volume_decoder
+
+    reference_coords = decoder.coords[0]
+    reference_values = decoder.reference_values[0]
+    delta_coords = decoder.delta_coords.get_value()
+    delta_values = decoder.delta_values.get_value()
+
+    values = jax.nn.relu(reference_values + delta_values)
+    mean_value = jnp.mean(values)
+    dead = values < dead_fraction * mean_value
+
+    donor_key, jitter_key = jax.random.split(jax.random.fold_in(key, 1))
+    donors = jax.random.categorical(
+        donor_key, jnp.log(values + 1e-12), shape=(values.shape[0],))
+    positions = reference_coords + delta_coords
+    sigma_normalized = jnp.mean(model.get_std()) / decoder.factor
+    jitter = sigma_normalized * jax.random.normal(jitter_key, positions.shape)
+    new_delta_coords = positions[donors] + jitter - reference_coords
+    new_delta_values = new_value_fraction * mean_value - reference_values
+
+    decoder.delta_coords.value = jnp.where(dead[:, None], new_delta_coords, delta_coords)
+    decoder.delta_values.value = jnp.where(dead, new_delta_values, delta_values)
+
+    state = nnx.state((model, optimizer_pose, optimizer_volume, optimizer_het))
+    return state, jnp.sum(dead)
+
+
 def _gather_candidates(values, indices):
     return values[jnp.arange(values.shape[0])[:, None], indices]
 
 
 def _score_candidates(model, x, values, coords, rotations, shifts, ctf,
-                      scoring_size=None):
+                      scoring_size=None, std=None):
     """Render candidates once and return curriculum and full-resolution losses."""
     chunk = model.candidate_chunk_size
     n_candidates = rotations.shape[1]
     scoring_size = model.xsize if scoring_size is None else scoring_size
+    std = model.get_std() if std is None else std
     if chunk <= 0 or chunk >= n_candidates:
         images = model.phys_decoder(
             x, values, coords, model.xsize, rotations, shifts, ctf,
-            model.ctf_type, model.get_std())
+            model.ctf_type, std)
         full_losses = _candidate_reconstruction_losses(
             images, x, ctf, model.ctf_type)
         if scoring_size >= model.xsize:
@@ -1552,7 +1687,7 @@ def _score_candidates(model, x, values, coords, rotations, shifts, ctf,
         images = model.phys_decoder(
             x, values, coords, model.xsize,
             rotations[:, start:start + chunk], shifts[:, start:start + chunk],
-            ctf, model.ctf_type, model.get_std())
+            ctf, model.ctf_type, std)
         full_chunk = _candidate_reconstruction_losses(
             images, x, ctf, model.ctf_type)
         full_losses.append(full_chunk)
@@ -1583,6 +1718,7 @@ def _consensus_multiscale_size_and_weight(
                                    "candidate_scoring_size",
                                    "consensus_multiscale_size",
                                    "apply_loss_whitening", "apply_amplitude_l1",
+                                   "apply_geometry_priors", "apply_support",
                                    "train_pose_volume", "train_heterogeneity", "return_metrics",
                                    "return_pose_diagnostics"),
          donate_argnums=(1,))
@@ -1602,6 +1738,15 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           whiten_filter=None,
                           apply_amplitude_l1=False,
                           amplitude_l1_weight=0.0,
+                          extra_blur=0.0,
+                          apply_geometry_priors=False,
+                          spacing_weight=0.0,
+                          smoothness_weight=0.0,
+                          neighbor_indices=None,
+                          apply_support=False,
+                          support_center=None,
+                          support_radius=0.0,
+                          support_weight=0.0,
                           train_pose_volume=True, train_heterogeneity=True,
                           return_metrics=False, return_pose_diagnostics=False):
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
@@ -1625,6 +1770,11 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         # orientation and the residual base for the heterogeneity-only stage.
         rotations, shifts = model.encoder_pose(x_ctf_corrected)
         coords, values = model.delta_volume_decoder()
+
+        # Coarse-to-fine render width: extra blur in quadrature on top of the
+        # learned splat, annealed to zero as the pose curriculum finishes, so
+        # the cloud cannot burn in fine detail while poses are still coarse.
+        std_eff = jnp.sqrt(jnp.square(model.get_std()) + jnp.square(extra_blur))
 
         anchor_deviation = jnp.asarray(0.0, dtype=rotations.dtype)
         if (model.encoder_pose.use_anchor_rotations
@@ -1666,7 +1816,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                 x_screen, jax.lax.stop_gradient(values_screen),
                 jax.lax.stop_gradient(coords_screen), model.xsize,
                 jax.lax.stop_gradient(rotations), jax.lax.stop_gradient(shifts),
-                coarse_ctf, model.ctf_type, jax.lax.stop_gradient(model.get_std()),
+                coarse_ctf, model.ctf_type, jax.lax.stop_gradient(std_eff),
                 render_size=screen_size)
             coarse_losses = _candidate_reconstruction_losses(
                 coarse_images, x_screen, coarse_ctf, model.ctf_type)
@@ -1680,7 +1830,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         candidate_losses, full_candidate_losses = _score_candidates(
             model, x, jax.lax.stop_gradient(values), jax.lax.stop_gradient(coords),
             jax.lax.stop_gradient(rotations_eval), jax.lax.stop_gradient(shifts_eval),
-            ctf, scoring_size=scoring_size)
+            ctf, scoring_size=scoring_size, std=jax.lax.stop_gradient(std_eff))
 
         # Candidate responsibilities are used only to pick a single global
         # winner.  Categorical exploration therefore remains safe for volume
@@ -1732,7 +1882,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         if train_pose_volume:
             selected_images = model.phys_decoder(
                 x, values, coords, model.xsize, rotations_selected, shifts_selected,
-                ctf, model.ctf_type, model.get_std())
+                ctf, model.ctf_type, std_eff)
             # The prepared pair is free (already-computed intermediates); the
             # whitened loss and the diagnostics both reuse it.
             selected_losses, selected_predicted, selected_target = (
@@ -1802,7 +1952,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             images_het = model.phys_decoder(
                 x, values_het, coords_het, model.xsize,
                 jax.lax.stop_gradient(rotations_het), jax.lax.stop_gradient(shifts_het),
-                ctf, model.ctf_type, model.get_std())[:, 0, ...]
+                ctf, model.ctf_type, std_eff)[:, 0, ...]
 
             if model.heterogeneity_profile == "legacy":
                 recon_het_loss = _candidate_reconstruction_losses(
@@ -1871,6 +2021,14 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             if train_heterogeneity:
                 amplitude_l1 = amplitude_l1 + jnp.mean(values_het)
             loss = loss + amplitude_l1_weight * amplitude_l1
+        if train_pose_volume and apply_geometry_priors:
+            spacing_loss, smoothness_loss = _geometry_prior_losses(
+                coords, values, neighbor_indices, std_eff)
+            loss = (loss + spacing_weight * spacing_loss
+                    + smoothness_weight * smoothness_loss)
+        if train_pose_volume and apply_support:
+            loss = loss + support_weight * _support_loss(
+                coords, values, support_center, support_radius, std_eff)
         metrics = (recon_loss, recon_het_loss, loss_uniform,
                    candidate_coverage_loss, normalized_entropy, anchor_deviation,
                    variance_loss, covariance_loss, latent_std,
@@ -2217,12 +2375,11 @@ def main():
                 help=f"ReconSIREN reconstruction mask (the mask provided must be binary - "
                      f"{bcolors.WARNING}NOTE{bcolors.ENDC}: since this is a reconstruction mask, it should be defined such that it covers the "
                      f"volume were the motions of interest are expected to happen)")
-    parser.add_argument("--num_gaussians", required=False, type=int, default=10000,
-                        help="Before training the network, HetSIREN will try to fit a set of Gaussians in the reference volume to recreate it. "
-                            "The default criterium is to automatically determine the number of Gaussians neede to reproduce the reference volume "
-                            "with high-fidelity. However, if you prefer to fix the number of Gaussians in advance based on your own criterium (e.g., "
-                            "the number of residues in your protein), you can set this parameter. When set, the HetSIREN will fit this fixed number of Gaussians "
-                            "so that the reproduce the reference volume as well as possible.")
+    parser.add_argument("--num_gaussians", required=False, type=int, default=None,
+                        help=f"Number of Gaussians in the point cloud. With a reference volume the Gaussians are fitted to it before "
+                             f"training (default 10000). Fully {bcolors.ITALIC}ab initio{bcolors.ENDC} (no --vol) the default is derived from the "
+                             f"estimated particle extent so the cloud can tile the particle at the splat width; set this parameter to "
+                             f"override either default (e.g. from the number of residues in your protein).")
     ca.add_load_images_to_ram(parser)
     ca.add_sr(parser)
     parser.add_argument("--do_not_learn_volume", action="store_true",
@@ -2395,6 +2552,48 @@ def main():
                         help=f"Master switch that turns off every quality feature at once (fused envelope, sigma "
                              f"bounds, loss whitening, amplitude L1, per-candidate shifts, sharpened map) for "
                              f"A/B testing against the previous behaviour.")
+    parser.add_argument("--no_extent_estimation", action="store_true",
+                        help=f"Disable the {bcolors.ITALIC}ab initio{bcolors.ENDC} particle-extent estimation from the raw images "
+                             f"(per-pixel variance excess over the noise floor) and fall back to the fixed "
+                             f"quarter-box initialization ball and the default Gaussian count.")
+    parser.add_argument("--support_weight", type=float, default=1.0,
+                        help="Weight of the shrink-wrap support penalty: mass outside a spherical support "
+                             "re-derived every epoch from the converging cloud itself (no mask needed). The "
+                             "term is zero inside the support, so it only suppresses background dust. 0 disables.")
+    parser.add_argument("--spacing_prior_weight", type=float, default=0.05,
+                        help="Weight of the kNN spacing prior: penalizes mass-carrying neighbours further apart "
+                             "than ~2 splat widths (density visually fragments) or closer than ~0.7 (redundant "
+                             "stacking). Active only at the final full-resolution curriculum stage. 0 disables.")
+    parser.add_argument("--amplitude_smoothness_weight", type=float, default=0.01,
+                        help="Weight of the kNN amplitude-smoothness prior (graph Laplacian on Gaussian masses) "
+                             "so one iso-surface threshold traces the whole chain instead of beading. Active only "
+                             "at the final full-resolution curriculum stage. 0 disables.")
+    parser.add_argument("--knn_neighbors", type=int, default=6,
+                        help="Neighbours per point in the kNN graph used by the spacing/smoothness priors "
+                             "(refreshed on the host every epoch).")
+    parser.add_argument("--no_point_recycling", action="store_true",
+                        help="Disable periodic recycling of amplitude-dead Gaussians next to mass-carrying ones "
+                             "(fixed-N densify/prune). Recycling requires the 'direct' consensus parameterization.")
+    parser.add_argument("--recycle_every", type=int, default=5,
+                        help="Epoch cadence for point recycling after the warm-up (also triggered when the pose "
+                             "curriculum advances a stage).")
+    parser.add_argument("--recycle_dead_fraction", type=float, default=0.05,
+                        help="A point is considered dead when its amplitude falls below this fraction of the "
+                             "mean amplitude.")
+    parser.add_argument("--cloud_blur_max", type=float, default=1.5,
+                        help="Maximum extra render blur (voxels, added in quadrature to the learned splat width) "
+                             "at the start of training, annealed to zero as the pose curriculum reaches full "
+                             "resolution: the cloud stays coarse while poses are coarse. 0 disables.")
+    parser.add_argument("--no_equalized_map", action="store_true",
+                        help="Do not write the amplitude-equalized tracing map in predict mode.")
+    parser.add_argument("--equalized_map_gamma", type=float, default=0.5,
+                        help="Gamma compression applied to Gaussian masses for the equalized tracing map "
+                             "(1 reproduces the physical map; smaller values flatten contrast along the chain so "
+                             "a single ChimeraX threshold shows the whole structure).")
+    parser.add_argument("--disable_geometry_features", action="store_true",
+                        help=f"Master switch that turns off every {bcolors.ITALIC}ab initio{bcolors.ENDC} geometry feature at once "
+                             f"(extent estimation, shrink-wrap support, spacing/smoothness priors, point "
+                             f"recycling, cloud blur curriculum, equalized map) for A/B testing.")
     ca.add_ctf_type(parser)
     ca.add_mode(parser)
     ca.add_epochs(parser)
@@ -2474,6 +2673,30 @@ def main():
         args.amplitude_l1 = 0.0
         args.no_per_candidate_shifts = True
         args.no_sharpened_map = True
+    if args.disable_geometry_features:
+        args.no_extent_estimation = True
+        args.support_weight = 0.0
+        args.spacing_prior_weight = 0.0
+        args.amplitude_smoothness_weight = 0.0
+        args.no_point_recycling = True
+        args.cloud_blur_max = 0.0
+        args.no_equalized_map = True
+    if args.support_weight < 0.0:
+        parser.error("--support_weight must be non-negative")
+    if args.spacing_prior_weight < 0.0 or args.amplitude_smoothness_weight < 0.0:
+        parser.error("--spacing_prior_weight and --amplitude_smoothness_weight must be non-negative")
+    if args.knn_neighbors < 1:
+        parser.error("--knn_neighbors must be at least 1")
+    if args.recycle_every < 1:
+        parser.error("--recycle_every must be at least 1")
+    if not 0.0 < args.recycle_dead_fraction < 1.0:
+        parser.error("--recycle_dead_fraction must be in (0,1)")
+    if args.cloud_blur_max < 0.0:
+        parser.error("--cloud_blur_max must be non-negative")
+    if not 0.0 < args.equalized_map_gamma <= 1.0:
+        parser.error("--equalized_map_gamma must be in (0,1]")
+    if args.num_gaussians is not None and args.num_gaussians < 1:
+        parser.error("--num_gaussians must be positive")
     if not 0.0 <= args.whiten_loss_weight <= 1.0:
         parser.error("--whiten_loss_weight must be in [0,1]")
     if args.amplitude_l1 < 0.0:
@@ -2532,6 +2755,39 @@ def main():
     else:
         mask = ImageHandler().createCircularMask(boxSize=xsize, radius=int(0.25 * xsize), is3D=True)
 
+    # Ab initio particle extent from the raw images (no reference, no mask):
+    # per-pixel variance across a probe of particles rises inside the particle
+    # and stays at the noise floor outside it.
+    extent_radius_px = None
+    if args.vol is None and args.mode == "train" and not args.no_extent_estimation:
+        n_probe = int(min(256, len(generator.md)))
+        probe_indices = np.linspace(0, len(generator.md) - 1, n_probe).astype(int)
+        probe = np.stack([np.squeeze(generator.md.getMetaDataImage(int(index)))
+                          for index in probe_indices])
+        extent_radius_px = _estimate_particle_extent(probe)
+        if extent_radius_px is not None:
+            print(f"{bcolors.OKCYAN}Estimated particle radius from {n_probe} images: "
+                  f"{extent_radius_px:.1f} px ({2.0 * extent_radius_px / xsize:.0%} of the box "
+                  f"as diameter){bcolors.ENDC}")
+        else:
+            print(f"{bcolors.WARNING}Could not estimate the particle extent from the images; "
+                  f"falling back to the fixed quarter-box initialization{bcolors.ENDC}")
+
+    # Resolve the Gaussian budget: explicit value > extent-derived (ab initio) > 10000.
+    if args.num_gaussians is not None:
+        num_gaussians = args.num_gaussians
+    elif args.vol is None and extent_radius_px is not None:
+        # Tile the estimated support at ~1.6x the initial 1-voxel splat width:
+        # close enough for neighbouring Gaussians to overlap into continuous
+        # density, sparse enough not to waste points on redundancy.
+        spacing_target = 1.6
+        support_volume = (4.0 / 3.0) * np.pi * extent_radius_px ** 3
+        num_gaussians = int(np.clip(support_volume / spacing_target ** 3, 5000, 40000))
+        print(f"{bcolors.OKCYAN}Auto Gaussian budget from the estimated extent: "
+              f"{num_gaussians} points{bcolors.ENDC}")
+    else:
+        num_gaussians = 10000
+
     # Initialize Gaussian positions
     fit_path = os.path.join(args.output_path, "Gaussian_volume_fitting")
     if args.vol is not None:
@@ -2543,7 +2799,7 @@ def main():
                 mask_fit = ImageHandler().generateMask(inputFn=vol, boxsize=64)
 
             # Consensus volume
-            model, _, _ = fit_volume(vol * mask_fit, mask=mask_fit, iterations=20000, learning_rate=0.001, n_init=args.num_gaussians, fixed_gaussians=True)
+            model, _, _ = fit_volume(vol * mask_fit, mask=mask_fit, iterations=20000, learning_rate=0.001, n_init=num_gaussians, fixed_gaussians=True)
 
             # Adjust to images
             # model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.0001,
@@ -2568,9 +2824,14 @@ def main():
         values = np.array(jax.nn.relu(model.weights.get_value()))
         sigma = jax.nn.relu(model.sigma_param.get_value())
     else:
-        coords = 0.25 * jnp.array(generate_sphere_points(args.num_gaussians) + np.random.normal(0, 0.1, (args.num_gaussians, 3)))
-        # coords = generate_cylinder_points(args.num_gaussians, radius=0.25, height=1.0) + np.random.normal(0, 0.1, (args.num_gaussians, 3))
-        values = jnp.full((args.num_gaussians,), 0.01)
+        # Initialization ball sized to the measured particle, not a fixed guess.
+        if extent_radius_px is not None:
+            ball_radius = float(np.clip(extent_radius_px / (0.5 * xsize), 0.1, 0.9))
+        else:
+            ball_radius = 0.25
+        coords = ball_radius * jnp.array(generate_sphere_points(num_gaussians) + np.random.normal(0, 0.1, (num_gaussians, 3)))
+        # coords = generate_cylinder_points(num_gaussians, radius=0.25, height=1.0) + np.random.normal(0, 0.1, (num_gaussians, 3))
+        values = jnp.full((num_gaussians,), 0.01)
         sigma = 1.0
 
 
@@ -2589,6 +2850,23 @@ def main():
         sigma_init_value = float(np.mean(np.asarray(sigma)))
         sigma_bounds = (min(0.5, 0.75 * sigma_init_value),
                         max(2.0, 1.5 * sigma_init_value))
+
+    # Startup connectivity check: with N points tiling the support, mean point
+    # spacing must stay below ~2 splat widths or the rendered density cannot be
+    # continuous no matter how well training goes. Ab initio users have no
+    # reference map to eyeball, so say it up front.
+    if args.vol is None and args.mode == "train":
+        radius_check = extent_radius_px if extent_radius_px is not None else 0.25 * xsize
+        implied_spacing = ((4.0 / 3.0) * np.pi * radius_check ** 3 / num_gaussians) ** (1.0 / 3.0)
+        sigma_now = float(np.mean(np.asarray(sigma)))
+        sigma_max = sigma_bounds[1] if sigma_bounds is not None else 2.0 * sigma_now
+        print(f"{bcolors.OKCYAN}Cloud geometry: {num_gaussians} points, implied spacing "
+              f"{implied_spacing:.2f} px, splat width {sigma_now:.2f} px (max {sigma_max:.2f}){bcolors.ENDC}")
+        if implied_spacing > 2.0 * sigma_max:
+            print(f"{bcolors.WARNING}WARNING: implied point spacing exceeds twice the maximum splat "
+                  f"width - the rendered density cannot be continuous. Increase --num_gaussians to "
+                  f"~{int((4.0 / 3.0) * np.pi * radius_check ** 3 / (1.6 * sigma_now) ** 3)} or widen "
+                  f"--sigma_bounds.{bcolors.ENDC}")
 
     # Random keys
     rng_seed = args.seed if args.seed is not None else random.randint(0, 2 ** 32 - 1)
@@ -2651,6 +2929,12 @@ def main():
             return model.delta_volume_decoder.decode_volume(sigma=model.get_std(),
                                                             analytic=model.fused_envelope)
 
+        # Consensus point cloud (voxel-centered coords, amplitudes) for the
+        # host-side kNN graph and shrink-wrap support updates.
+        @nnx.jit
+        def decode_cloud(model):
+            return model.delta_volume_decoder()
+
         # Decode volume
         @nnx.jit
         def decode_het_volume(model, x):
@@ -2706,6 +2990,22 @@ def main():
         heterogeneity_profile = reconsiren.heterogeneity_profile
         het_start_epoch = reconsiren.het_start_epoch
         het_freeze_consensus = reconsiren.het_freeze_consensus
+        # Geometry feature state (host side): the kNN graph and shrink-wrap
+        # support are refreshed from the live cloud at every epoch boundary.
+        geometry_priors_enabled = ((args.spacing_prior_weight > 0.0
+                                    or args.amplitude_smoothness_weight > 0.0)
+                                   and not args.do_not_learn_volume)
+        support_enabled = args.support_weight > 0.0 and not args.do_not_learn_volume
+        recycling_enabled = (not args.no_point_recycling
+                             and not args.do_not_learn_volume
+                             and reconsiren.delta_volume_decoder.parameterization == "direct")
+        if (not args.no_point_recycling and not args.do_not_learn_volume
+                and not recycling_enabled):
+            print(f"{bcolors.WARNING}Point recycling requires the 'direct' consensus "
+                  f"parameterization; disabled for this run{bcolors.ENDC}")
+        knn_indices = None
+        support_center_value = None
+        support_radius_value = None
         # The adaptive curriculum is gated on winner stability, so it needs the
         # per-particle tracker even when the extra TensorBoard panels are off.
         pose_diagnostics_enabled = (args.pose_diagnostics
@@ -2763,16 +3063,57 @@ def main():
                 if total_steps % steps_per_epoch == 0:
                     # Let the adaptive curriculum consume the finished epoch's
                     # winner-stability summary before the tracker resets.
+                    stage_advanced = False
                     if (pose_curriculum_controller is not None
                             and pose_diagnostics_tracker is not None
                             and pose_diagnostics_tracker.absolute_margins
                             and total_steps > 1500):
                         if pose_curriculum_controller.observe_epoch(
                                 pose_diagnostics_tracker.summary()):
+                            stage_advanced = True
                             new_size = pose_curriculum_controller.scoring_size
                             print(f"\n{bcolors.OKCYAN}Pose curriculum advanced to stage "
                                   f"{pose_curriculum_controller.stage}: scoring candidates "
                                   f"at {new_size}/{xsize} pixels{bcolors.ENDC}")
+
+                    # Refresh the geometry state from the live cloud: recycle
+                    # dead points on schedule, then rebuild the kNN graph and
+                    # the shrink-wrap support from the updated positions.
+                    if recycling_enabled and total_steps > 1500 and (
+                            stage_advanced or epoch_index % args.recycle_every == 0):
+                        state, n_recycled = recycle_dead_points_reconsiren(
+                            graphdef, state, rng, args.recycle_dead_fraction)
+                        rng, _ = jax.random.split(rng)
+                        n_recycled = int(n_recycled)
+                        if n_recycled:
+                            print(f"\n{bcolors.OKCYAN}Recycled {n_recycled} dead Gaussians "
+                                  f"onto the structure{bcolors.ENDC}")
+                    if geometry_priors_enabled or support_enabled:
+                        reconsiren_cloud, _, _, _ = nnx.merge(graphdef, state)
+                        cloud_coords, cloud_values = decode_cloud(reconsiren_cloud)
+                        cloud_coords = np.asarray(cloud_coords[0], np.float32)
+                        cloud_values = np.asarray(cloud_values[0], np.float32)
+                        if geometry_priors_enabled:
+                            n_neighbors = int(min(args.knn_neighbors, cloud_coords.shape[0] - 1))
+                            nn_graph = NearestNeighbors(n_neighbors=n_neighbors + 1).fit(cloud_coords)
+                            _, nn_idx = nn_graph.kneighbors(cloud_coords)
+                            knn_indices = jnp.asarray(nn_idx[:, 1:], dtype=jnp.int32)
+                        if support_enabled:
+                            mass = np.maximum(cloud_values, 0.0)
+                            total_mass = float(mass.sum())
+                            if total_mass > 0.0:
+                                center = (mass[:, None] * cloud_coords).sum(axis=0) / total_mass
+                                distances = np.linalg.norm(cloud_coords - center[None, :], axis=1)
+                                order = np.argsort(distances)
+                                cumulative = np.cumsum(mass[order]) / total_mass
+                                quantile_index = int(min(np.searchsorted(cumulative, 0.99),
+                                                         distances.shape[0] - 1))
+                                # Margin over the 99%-mass radius; floored so the
+                                # support can never collapse onto the cloud core.
+                                support_radius_value = float(max(
+                                    1.15 * distances[order][quantile_index],
+                                    4.0 * float(np.mean(np.asarray(sigma)))))
+                                support_center_value = jnp.asarray(center, dtype=jnp.float32)
 
                     total_loss = 0
                     total_recon_loss = 0
@@ -2931,6 +3272,32 @@ def main():
                                           * (1.0 - consensus_multiscale_weight))
                 apply_loss_whitening = whiten_weight_step > 0.0
 
+                # Connectivity priors also wait for full-resolution scoring:
+                # equalising or gap-closing a cloud that still has wrong poses
+                # would only make garbage look connected.
+                apply_geometry_priors_step = (
+                    geometry_priors_enabled and knn_indices is not None
+                    and not use_tau and candidate_scoring_size >= xsize)
+                apply_support_step = (support_enabled
+                                      and support_radius_value is not None)
+
+                # Coarse-to-fine cloud: extra render blur annealed with the
+                # pose curriculum, so cloud detail waits for pose stability.
+                extra_blur_step = 0.0
+                if args.cloud_blur_max > 0.0:
+                    if total_steps <= 1500:
+                        coarse_fraction = 1.0
+                    elif pose_curriculum_controller is not None:
+                        n_stages = len(pose_curriculum_controller.scales)
+                        coarse_fraction = 1.0 - (
+                            min(pose_curriculum_controller.stage, n_stages) / n_stages)
+                    elif args.consensus_multiscale_weight > 0.0:
+                        coarse_fraction = (consensus_multiscale_weight
+                                           / args.consensus_multiscale_weight)
+                    else:
+                        coarse_fraction = 0.0
+                    extra_blur_step = args.cloud_blur_max * coarse_fraction
+
                 coverage_steps = args.candidate_coverage_epochs * steps_per_epoch
                 apply_candidate_coverage = (
                     coverage_steps > 0 and total_steps < coverage_steps
@@ -2960,6 +3327,15 @@ def main():
                     whiten_filter=whiten_filter,
                     apply_amplitude_l1=args.amplitude_l1 > 0.0,
                     amplitude_l1_weight=args.amplitude_l1,
+                    extra_blur=extra_blur_step,
+                    apply_geometry_priors=apply_geometry_priors_step,
+                    spacing_weight=args.spacing_prior_weight,
+                    smoothness_weight=args.amplitude_smoothness_weight,
+                    neighbor_indices=knn_indices if apply_geometry_priors_step else None,
+                    apply_support=apply_support_step,
+                    support_center=support_center_value if apply_support_step else None,
+                    support_radius=support_radius_value if apply_support_step else 0.0,
+                    support_weight=args.support_weight,
                     train_pose_volume=train_pose_volume,
                     train_heterogeneity=train_heterogeneity,
                     return_metrics=True,
@@ -3247,6 +3623,27 @@ def main():
             ImageHandler().write(np.array(sharpened),
                                  os.path.join(args.output_path, "reconsiren_map_sharpened.mrc"),
                                  overwrite=True)
+
+        if not args.no_equalized_map:
+            # Tracing companion: gamma-compressed masses flatten the contrast
+            # along the structure so one iso-surface threshold shows the whole
+            # chain. Deliberately decoupled from true occupancy - read topology
+            # here, read confidence in the physical map.
+            cloud_coords, cloud_values = reconsiren.delta_volume_decoder()
+            masses = np.asarray(cloud_values[0], np.float32)
+            positive = masses[masses > 0.0]
+            if positive.size:
+                mean_mass = float(positive.mean())
+                equalized_masses = np.where(
+                    masses > 0.02 * mean_mass,
+                    mean_mass * (masses / mean_mass) ** args.equalized_map_gamma,
+                    0.0).astype(np.float32)
+                equalized = reconsiren.delta_volume_decoder.decode_volume(
+                    coords_values=(cloud_coords, jnp.asarray(equalized_masses)[None, ...]),
+                    sigma=reconsiren.get_std(), analytic=reconsiren.fused_envelope)
+                ImageHandler().write(np.array(equalized[0]),
+                                     os.path.join(args.output_path, "reconsiren_map_equalized.mrc"),
+                                     overwrite=True)
 
         # Predict heterogeneous states
         kmeans = KMeans(n_clusters=20).fit(latents)
