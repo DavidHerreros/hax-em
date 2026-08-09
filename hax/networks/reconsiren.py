@@ -1658,6 +1658,43 @@ def recycle_dead_points_reconsiren(graphdef, state, key, dead_fraction=0.05,
     return state, jnp.sum(dead)
 
 
+def volume_optimizer_transform(parameterization, volume_lr, coords_lr=None,
+                               amplitude_lr=None):
+    """Optax transform for the consensus volume decoder.
+
+    With the 'network' parameterization this is the plain clipped AdamW the
+    branch always used (state layout unchanged, old checkpoints resume). With
+    'direct' it partitions the parameters so coordinate deltas and amplitude
+    deltas train at their own learning rates: under Adam a wide network
+    readout multiplies the effective step of its outputs by roughly its width
+    (measured ~18-174x in reconsiren), so directly-parameterized deltas need a
+    correspondingly larger LR than the network mode ever did - and amplitudes
+    live on a ~50x smaller scale than normalized coordinates, so they get
+    their own rate.
+    """
+    import optax
+
+    if parameterization != "direct":
+        return optax.chain(optax.clip_by_global_norm(1.0),
+                           optax.adamw(volume_lr, eps=1e-6))
+
+    coords_lr = volume_lr if coords_lr is None else coords_lr
+    amplitude_lr = volume_lr if amplitude_lr is None else amplitude_lr
+
+    def label_params(params):
+        return jax.tree_util.tree_map_with_path(
+            lambda path, _: ("amplitude" if "delta_values" in jax.tree_util.keystr(path)
+                             else "coords"),
+            params)
+
+    return optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.multi_transform(
+            {"coords": optax.adamw(coords_lr, eps=1e-6),
+             "amplitude": optax.adamw(amplitude_lr, eps=1e-6)},
+            label_params))
+
+
 def _gather_candidates(values, indices):
     return values[jnp.arange(values.shape[0])[:, None], indices]
 
@@ -2506,6 +2543,21 @@ def main():
                         help="Number of prior latent vectors used for stable variance/covariance statistics.")
     parser.add_argument("--consensus_parameterization", choices=("network", "direct"), default=None,
                         help="Consensus Gaussian delta parameterization. Profile default: aggressive=direct.")
+    parser.add_argument("--volume_learning_rate", type=float, default=None,
+                        help="Learning rate of the consensus volume decoder. Default: 1e-4 with the 'network' "
+                             "parameterization, 3e-3 with 'direct'. The 30x direct default compensates Adam's "
+                             "readout effect: a wide network readout multiplies the effective step of its outputs "
+                             "by roughly its width (measured ~18-174x in ReconSIREN), so direct parameters "
+                             "trained at the network LR crawl. An explicit value is always used verbatim - the "
+                             "compensation is never applied on top of it.")
+    parser.add_argument("--coords_learning_rate", type=float, default=None,
+                        help="'direct' parameterization only: learning rate of the Gaussian coordinate deltas. "
+                             "Defaults to --volume_learning_rate.")
+    parser.add_argument("--amplitude_learning_rate", type=float, default=None,
+                        help="'direct' parameterization only: learning rate of the Gaussian amplitude deltas. "
+                             "Default 1e-3: amplitudes start near 0.01 mass, so Adam's ~LR-sized steady steps "
+                             "grow mass at ~10% of the initial mean per step without oscillating, while "
+                             "coordinates (on a ~50x larger normalized scale) keep the higher coords LR.")
     parser.add_argument("--render_chunk_size", type=int, default=None,
                         help="Gaussians per rematerialized scatter block; 0 disables point chunking. "
                              "Profile default: aggressive=2048, legacy=0.")
@@ -2697,6 +2749,10 @@ def main():
         parser.error("--equalized_map_gamma must be in (0,1]")
     if args.num_gaussians is not None and args.num_gaussians < 1:
         parser.error("--num_gaussians must be positive")
+    for lr_name in ("volume_learning_rate", "coords_learning_rate", "amplitude_learning_rate"):
+        lr_value = getattr(args, lr_name)
+        if lr_value is not None and lr_value <= 0.0:
+            parser.error(f"--{lr_name} must be positive")
     if not 0.0 <= args.whiten_loss_weight <= 1.0:
         parser.error("--whiten_loss_weight must be in [0,1]")
     if args.amplitude_l1 < 0.0:
@@ -2984,8 +3040,35 @@ def main():
         params_pose = nnx.All(nnx.Param, nnx.PathContains('encoder_pose'))
         params_volume = nnx.All(nnx.Param, nnx.PathContains('delta_volume_decoder'))
         params_het = nnx.All(nnx.Param, (nnx.PathContains('encoder_het'), nnx.PathContains('delta_het_decoder')))
+        # Resolve the consensus-volume learning rates. Explicit flags are used
+        # verbatim; only the DEFAULTS depend on the parameterization (direct
+        # deltas need the ~30x Adam readout compensation the network mode gets
+        # for free from its wide readout).
+        volume_is_direct = reconsiren.delta_volume_decoder.parameterization == "direct"
+        volume_lr = args.volume_learning_rate
+        if volume_lr is None:
+            volume_lr = 3e-3 if volume_is_direct else 1e-4
+        coords_lr = args.coords_learning_rate
+        amplitude_lr = args.amplitude_learning_rate
+        if not volume_is_direct and (coords_lr is not None or amplitude_lr is not None):
+            print(f"{bcolors.WARNING}--coords_learning_rate/--amplitude_learning_rate only apply to the "
+                  f"'direct' consensus parameterization; ignored for 'network'{bcolors.ENDC}")
+            coords_lr = amplitude_lr = None
+        if volume_is_direct:
+            coords_lr = volume_lr if coords_lr is None else coords_lr
+            amplitude_lr = 1e-3 if amplitude_lr is None else amplitude_lr
+            print(f"{bcolors.OKCYAN}Volume learning rates (direct): coords {coords_lr:.2e}, "
+                  f"amplitudes {amplitude_lr:.2e}{bcolors.ENDC}")
+        else:
+            print(f"{bcolors.OKCYAN}Volume learning rate (network): {volume_lr:.2e}{bcolors.ENDC}")
+
         optimizer_pose = nnx.Optimizer(reconsiren,  optax.chain(optax.clip_by_global_norm(1.0),optax.adamw(args.learning_rate, eps=1e-6)), wrt=params_pose)
-        optimizer_volume = nnx.Optimizer(reconsiren, optax.chain(optax.clip_by_global_norm(1.0),optax.adamw(learning_rate=1e-4, eps=1e-6)), wrt=params_volume)
+        optimizer_volume = nnx.Optimizer(
+            reconsiren,
+            volume_optimizer_transform(reconsiren.delta_volume_decoder.parameterization,
+                                       volume_lr, coords_lr=coords_lr,
+                                       amplitude_lr=amplitude_lr),
+            wrt=params_volume)
         optimizer_het = nnx.Optimizer(reconsiren, optax.chain(optax.clip_by_global_norm(1.0),optax.adamw(learning_rate=1e-4, eps=1e-6)), wrt=params_het)
         heterogeneity_profile = reconsiren.heterogeneity_profile
         het_start_epoch = reconsiren.het_start_epoch
@@ -3006,6 +3089,8 @@ def main():
         knn_indices = None
         support_center_value = None
         support_radius_value = None
+        previous_cloud_coords = None
+        previous_cloud_values = None
         # The adaptive curriculum is gated on winner stability, so it needs the
         # per-particle tracker even when the extra TensorBoard panels are off.
         pose_diagnostics_enabled = (args.pose_diagnostics
@@ -3075,6 +3160,28 @@ def main():
                             print(f"\n{bcolors.OKCYAN}Pose curriculum advanced to stage "
                                   f"{pose_curriculum_controller.stage}: scoring candidates "
                                   f"at {new_size}/{xsize} pixels{bcolors.ENDC}")
+
+                    # Cloud motion diagnostic (taken BEFORE recycling so the
+                    # teleports don't pollute it): per-epoch RMS displacement
+                    # in voxels and mean amplitude, the observables that
+                    # calibrate the direct-mode learning rates.
+                    reconsiren_cloud, _, _, _ = nnx.merge(graphdef, state)
+                    cloud_coords_now, cloud_values_now = decode_cloud(reconsiren_cloud)
+                    cloud_coords_now = np.asarray(cloud_coords_now[0], np.float32)
+                    cloud_values_now = np.asarray(cloud_values_now[0], np.float32)
+                    if previous_cloud_coords is not None:
+                        rms_displacement = float(np.sqrt(np.mean(np.sum(
+                            np.square(cloud_coords_now - previous_cloud_coords), axis=-1))))
+                        amplitude_drift = float(np.sqrt(np.mean(np.square(
+                            cloud_values_now - previous_cloud_values))))
+                        writer.add_scalar("Cloud RMS displacement (voxels/epoch)",
+                                          rms_displacement, epoch_index)
+                        writer.add_scalar("Cloud amplitude RMS drift (per epoch)",
+                                          amplitude_drift, epoch_index)
+                        writer.add_scalar("Cloud mean amplitude",
+                                          float(np.mean(cloud_values_now)), epoch_index)
+                    previous_cloud_coords = cloud_coords_now
+                    previous_cloud_values = cloud_values_now
 
                     # Refresh the geometry state from the live cloud: recycle
                     # dead points on schedule, then rebuild the kNN graph and
