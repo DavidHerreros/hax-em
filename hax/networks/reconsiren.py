@@ -510,7 +510,7 @@ class LowRankLinear(nnx.Module):
 
 
 class PoseHead(nnx.Module):
-    def __init__(self, is_refine=False, low_rank=0, *, rngs: nnx.Rngs):
+    def __init__(self, is_refine=False, low_rank=0, predict_shift_delta=False, *, rngs: nnx.Rngs):
         if is_refine:
             kernel_init = nnx.initializers.zeros_init()
             bias_init = nnx.initializers.zeros_init()
@@ -533,22 +533,33 @@ class PoseHead(nnx.Module):
                 hidden_layers.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         self.hidden_layers = nnx.List(hidden_layers)
         self.pose_layer = Linear(1024, 6, rngs=rngs, kernel_init=kernel_init, bias_init=bias_init)
+        self.predict_shift_delta = bool(predict_shift_delta)
+        if self.predict_shift_delta:
+            # Zero-init so per-candidate shifts start exactly at the shared
+            # trunk shift and only diverge when the data asks for it.
+            self.shift_layer = Linear(1024, 2, rngs=rngs,
+                                      kernel_init=nnx.initializers.zeros_init(),
+                                      bias_init=nnx.initializers.zeros_init())
 
     def __call__(self, x):
         for layer in self.hidden_layers:
             # x = nnx.gelu(x + layer(x))
             x = nnx.gelu(layer(x))
-        return self.pose_layer(x)
+        pose = self.pose_layer(x)
+        if self.predict_shift_delta:
+            return jnp.concat([pose, self.shift_layer(x)], axis=-1)
+        return pose
 
 
 class PoseHeadEnsemble(nnx.Module):
-    def __init__(self, num_members, is_refine=False, low_rank=0, *, rngs: nnx.Rngs):
+    def __init__(self, num_members, is_refine=False, low_rank=0, predict_shift_delta=False, *, rngs: nnx.Rngs):
         key = rngs.params()
         member_keys = jax.random.split(key, num_members)
 
         @nnx.vmap(in_axes=(0), out_axes=0)
         def make_member(key):
-            return PoseHead(is_refine=is_refine, low_rank=low_rank, rngs=nnx.Rngs(key))
+            return PoseHead(is_refine=is_refine, low_rank=low_rank,
+                            predict_shift_delta=predict_shift_delta, rngs=nnx.Rngs(key))
 
         self.ensemble = make_member(member_keys)
 
@@ -561,7 +572,8 @@ class PoseHeadEnsemble(nnx.Module):
 
 class EncoderPose(nnx.Module):
     def __init__(self, input_dim, pyramid_levels=4, num_components=18, refine_current_assignment=False,
-                 use_anchor_rotations=True, low_rank=0, spatial_pool=1, *, rngs: nnx.Rngs):
+                 use_anchor_rotations=True, low_rank=0, spatial_pool=1, per_candidate_shifts=False,
+                 *, rngs: nnx.Rngs):
         self.input_dim = input_dim
         self.input_conv_dim = 64  # Original was 64
         self.out_conv_dim = int(self.input_conv_dim / (2 ** 3))
@@ -570,6 +582,7 @@ class EncoderPose(nnx.Module):
         self.refine_current_assignment = refine_current_assignment
         self.use_anchor_rotations = use_anchor_rotations
         self.spatial_pool = max(1, int(spatial_pool))
+        self.per_candidate_shifts = bool(per_candidate_shifts)
 
         # Hidden layers
         hidden_layers_conv = [Conv(self.pyramid_levels, 64, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16)]
@@ -599,7 +612,9 @@ class EncoderPose(nnx.Module):
 
         # Layers to 9D rotation
         self.ensemble_6d_heads = PoseHeadEnsemble(num_members=num_components, is_refine=False,
-                                                 low_rank=low_rank, rngs=rngs)
+                                                 low_rank=low_rank,
+                                                 predict_shift_delta=self.per_candidate_shifts,
+                                                 rngs=rngs)
 
         # Layers to shifts
         hidden_shifts = [Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
@@ -650,7 +665,11 @@ class EncoderPose(nnx.Module):
         x = self.hidden_layers_linear[-1](x)
 
         # First output: rotation matrices
-        rotations_6d = self.ensemble_6d_heads(x)
+        head_outputs = self.ensemble_6d_heads(x)
+        if self.per_candidate_shifts:
+            rotations_6d, shift_deltas = head_outputs[..., :6], head_outputs[..., 6:]
+        else:
+            rotations_6d, shift_deltas = head_outputs, None
 
         rotations_6d = rotations_6d.reshape(x.shape[0] * self.num_components, 6)
         if self.refine_current_assignment:
@@ -673,8 +692,13 @@ class EncoderPose(nnx.Module):
             in_plane_shifts = nnx.gelu(in_plane_shifts + layer(in_plane_shifts))
         in_plane_shifts = self.hidden_shifts[-1](in_plane_shifts)
 
-        # Broadcast shifts to euler angles shape
-        in_plane_shifts = jnp.broadcast_to(in_plane_shifts[:, None, :], (in_plane_shifts.shape[0], self.num_components, 2))
+        # Per-candidate deltas ride on the shared trunk shift, so the winner
+        # competition can co-select an orientation with its matching shift.
+        if shift_deltas is not None:
+            in_plane_shifts = in_plane_shifts[:, None, :] + shift_deltas
+        else:
+            # Broadcast shifts to euler angles shape
+            in_plane_shifts = jnp.broadcast_to(in_plane_shifts[:, None, :], (in_plane_shifts.shape[0], self.num_components, 2))
 
         return rotations, in_plane_shifts
 
@@ -871,7 +895,7 @@ class DeltaVolumeDecoder(nnx.Module):
 
         return coords, values
 
-    def decode_volume(self, coords_values=None, filter=True, sigma=1.0):
+    def decode_volume(self, coords_values=None, filter=True, sigma=1.0, analytic=False):
         # Decode volume values
         if coords_values is not None:
             coords, values = coords_values
@@ -909,7 +933,8 @@ class DeltaVolumeDecoder(nnx.Module):
 
         # Filter volume
         if filter:
-            grids = jax.vmap(low_pass_3d, in_axes=(0, None))(grids, sigma)
+            low_pass = low_pass_3d_analytic if analytic else low_pass_3d
+            grids = jax.vmap(low_pass, in_axes=(0, None))(grids, sigma)
 
         return grids
 
@@ -971,7 +996,8 @@ class HetVolumeDecoder(nnx.Module):
 
         return coords, values
 
-    def decode_volume(self, x, filter=True, sigma=1.0, base_coords=None, base_values=None):
+    def decode_volume(self, x, filter=True, sigma=1.0, base_coords=None, base_values=None,
+                      analytic=False):
         # Decode volume values
         coords, values = self.__call__(x, base_coords=base_coords, base_values=base_values)
 
@@ -1006,14 +1032,16 @@ class HetVolumeDecoder(nnx.Module):
 
         # Filter volume
         if filter:
-            grids = jax.vmap(low_pass_3d, in_axes=(0, None))(grids, sigma)
+            low_pass = low_pass_3d_analytic if analytic else low_pass_3d
+            grids = jax.vmap(low_pass, in_axes=(0, None))(grids, sigma)
 
         return grids
 
 class PhysDecoder:
-    def __init__(self, xsize, render_chunk_size=0):
+    def __init__(self, xsize, render_chunk_size=0, fused_envelope=False):
         self.xsize = xsize
         self.render_chunk_size = int(render_chunk_size or 0)
+        self.fused_envelope = bool(fused_envelope)
 
     def _scatter(self, values, coords, xsize, rotations_flat, shifts_flat, dtype):
         # Volume factor
@@ -1085,15 +1113,25 @@ class PhysDecoder:
         scatter = self._scatter_chunked if blocked else self._scatter
         images = scatter(values, coords, render_size, rotations_flat, shifts_flat, x.dtype)
 
-        # Gaussian filter (needed by forward interpolation)
-        if filter:
-            images = dm_pix.gaussian_blur(images[..., None], std * scale, kernel_size=9)[..., 0]
-
-        # Apply CTF
-        if ctf_type in ["apply", "wiener", "squared"]:
+        apply_ctf = ctf_type in ["apply", "wiener", "squared"]
+        if apply_ctf:
             ctf = jnp.broadcast_to(ctf[:, None, :], (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
             ctf = rearrange(ctf, "b n w h -> (b n) w h")
-            images = ctfFilter(images, ctf, pad_factor=2)
+
+        if self.fused_envelope:
+            # Analytic splat envelope and CTF in a single Fourier pass: exact for
+            # any std (the tap kernel below truncates past +-4 px) and one fewer
+            # filtering pass per projection.
+            images = gaussianCTFFilter(images, sigma=std * scale if filter else None,
+                                       ctf=ctf if apply_ctf else None, pad_factor=2)
+        else:
+            # Gaussian filter (needed by forward interpolation)
+            if filter:
+                images = dm_pix.gaussian_blur(images[..., None], std * scale, kernel_size=9)[..., 0]
+
+            # Apply CTF
+            if apply_ctf:
+                images = ctfFilter(images, ctf, pad_factor=2)
 
         images = rearrange(images, "(b n) w h -> b n w h", b=rotations.shape[0], n=rotations.shape[1])
 
@@ -1117,6 +1155,7 @@ class ReconSIREN(nnx.Module):
                  het_covariance_weight=None, het_min_std=0.1,
                  het_start_epoch=None, het_freeze_consensus=None,
                  het_latent_bank_size=2048,
+                 fused_envelope=False, sigma_bounds=None, per_candidate_shifts=False,
                  *, rngs: nnx.Rngs, **kwargs):
         super(ReconSIREN, self).__init__()
         aggressive = optimization_profile == "aggressive"
@@ -1194,9 +1233,17 @@ class ReconSIREN(nnx.Module):
         self.symmetry_matrices = symmetry_matrices(symmetry_group)
         self.refine_current_assignment = refine_current_assignment
         self.learn_delta_volume = learn_delta_volume
+        self.fused_envelope = bool(fused_envelope)
+        if sigma_bounds is not None:
+            lo, hi = float(sigma_bounds[0]), float(sigma_bounds[1])
+            if not 0.0 < lo < hi:
+                raise ValueError("sigma_bounds must satisfy 0 < min < max")
+            sigma_bounds = (lo, hi)
+        self.sigma_bounds = sigma_bounds
         self.encoder_pose = EncoderPose(self.xsize, num_components=num_components, refine_current_assignment=refine_current_assignment,
                                         use_anchor_rotations=use_anchor_rotations, low_rank=pose_head_rank,
-                                        spatial_pool=pose_spatial_pool, rngs=rngs)
+                                        spatial_pool=pose_spatial_pool,
+                                        per_candidate_shifts=per_candidate_shifts, rngs=rngs)
         self.encoder_het = EncoderHet(self.xsize, lat_dim=lat_dim,
                                       architecture=het_encoder_architecture,
                                       encoder_size=het_encoder_size, rngs=rngs)
@@ -1209,10 +1256,19 @@ class ReconSIREN(nnx.Module):
             center_decoder=het_center_decoder, coordinate_scale=het_coordinate_scale,
             amplitude_scale=het_amplitude_scale, small_final_init=anti_collapse,
             rngs=rngs)
-        self.phys_decoder = PhysDecoder(self.xsize, render_chunk_size=render_chunk_size)
+        self.phys_decoder = PhysDecoder(self.xsize, render_chunk_size=render_chunk_size,
+                                        fused_envelope=self.fused_envelope)
 
-        # Gaussian std
-        self.log_std = nnx.Param(jnp.log(sigma))
+        # Gaussian std. When bounds are active the parameter stores a logit and
+        # the width lives on a sigmoid between them: a plain clip would zero the
+        # gradient at the bound and freeze sigma there for good.
+        sigma_init = jnp.asarray(sigma, dtype=jnp.float32)
+        if self.sigma_bounds is None:
+            self.log_std = nnx.Param(jnp.log(sigma_init))
+        else:
+            lo, hi = self.sigma_bounds
+            frac = jnp.clip((sigma_init - lo) / (hi - lo), 1e-3, 1.0 - 1e-3)
+            self.log_std = nnx.Param(jnp.log(frac) - jnp.log1p(-frac))
 
         #### Memory bank for latent spaces ####
         self.bank_size = bank_size
@@ -1236,7 +1292,11 @@ class ReconSIREN(nnx.Module):
         return self.encoder_pose(x, rngs=rngs)
     
     def get_std(self):
-        return jnp.exp(self.log_std.get_value())
+        raw = self.log_std.get_value()
+        if self.sigma_bounds is None:
+            return jnp.exp(raw)
+        lo, hi = self.sigma_bounds
+        return lo + (hi - lo) * jax.nn.sigmoid(raw)
 
     def decode_image(self, x, labels, md, ctf_type=None):
         # Precompute batch CTFs
@@ -1282,7 +1342,8 @@ class ReconSIREN(nnx.Module):
             base_coords, base_values = self.delta_volume_decoder()
         vol = self.delta_het_decoder.decode_volume(
             x, filter=filter, sigma=self.get_std(),
-            base_coords=base_coords, base_values=base_values)
+            base_coords=base_coords, base_values=base_values,
+            analytic=self.fused_envelope)
 
         return vol
 
@@ -1421,6 +1482,48 @@ def _latent_variance_covariance_loss(latent, minimum_std, bank=None, bank_count=
     return variance_loss, covariance_loss, jnp.mean(std)
 
 
+def _whitened_reconstruction_loss(predicted, target, whitening_filter):
+    """Noise-whitened MSE so every frequency shell carries comparable gradient.
+
+    The plain real-space MSE is dominated by the low-frequency shells where the
+    cryo-EM signal (and the coloured noise) concentrates, leaving essentially no
+    gradient pressure on the high-resolution shells. Dividing both images by the
+    dataset noise amplitude spectrum equalises the per-shell SNR before the
+    residual is taken.
+
+    ``predicted`` is candidate-shaped ``(B, N, H, W)``, ``target`` is
+    ``(B, 1, H, W)`` and ``whitening_filter`` lies on the unshifted ``fft2``
+    grid (see :func:`hax.utils.whitening_filter_2d`).
+    """
+    predicted_white = jnp.real(jnp.fft.ifft2(jnp.fft.fft2(predicted) * whitening_filter))
+    target_white = jnp.real(jnp.fft.ifft2(jnp.fft.fft2(target) * whitening_filter))
+    # Dimensionless residual: normalising by the whitened target power keeps the
+    # loss on the same O(1) scale as the plain normalized MSE it blends with.
+    scale = jnp.sqrt(jnp.mean(jnp.square(target_white), axis=(-2, -1), keepdims=True)) + 1e-8
+    return jnp.mean(jnp.square((predicted_white - target_white) / scale), axis=(-2, -1))
+
+
+def _sharpen_gaussian_envelope(volume, sigma, reg=0.02):
+    """Wiener inverse of the splat envelope ``exp(-2 pi^2 sigma^2 f^2)``.
+
+    The rendered map always carries the Gaussian splat envelope, so its
+    amplitudes fall off like a B-factor even when the fitted point cloud holds
+    sharper structure. This divides the envelope back out with a bounded-gain
+    Wiener filter (max boost ~ ``1 / (2 * sqrt(reg))``), the same operation as
+    conventional post-hoc map sharpening.
+    """
+    shape = volume.shape
+    fz = jnp.fft.fftfreq(shape[0])
+    fy = jnp.fft.fftfreq(shape[1])
+    fx = jnp.fft.rfftfreq(shape[2])
+    f_sq = (fz[:, None, None] ** 2 + fy[None, :, None] ** 2
+            + fx[None, None, :] ** 2)
+    sigma_sq = jnp.square(jnp.asarray(sigma, jnp.float32)).reshape(())
+    envelope = jnp.exp(-2.0 * jnp.pi ** 2 * sigma_sq * f_sq)
+    gain = (1.0 + reg) * envelope / (jnp.square(envelope) + reg)
+    return jnp.fft.irfftn(jnp.fft.rfftn(volume) * gain, s=shape)
+
+
 def _gather_candidates(values, indices):
     return values[jnp.arange(values.shape[0])[:, None], indices]
 
@@ -1479,6 +1582,7 @@ def _consensus_multiscale_size_and_weight(
                                    "candidate_bank_samples",
                                    "candidate_scoring_size",
                                    "consensus_multiscale_size",
+                                   "apply_loss_whitening", "apply_amplitude_l1",
                                    "train_pose_volume", "train_heterogeneity", "return_metrics",
                                    "return_pose_diagnostics"),
          donate_argnums=(1,))
@@ -1493,6 +1597,11 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           candidate_scoring_size=0,
                           consensus_multiscale_size=0,
                           consensus_multiscale_weight=0.0,
+                          apply_loss_whitening=False,
+                          whiten_weight=0.0,
+                          whiten_filter=None,
+                          apply_amplitude_l1=False,
+                          amplitude_l1_weight=0.0,
                           train_pose_volume=True, train_heterogeneity=True,
                           return_metrics=False, return_pose_diagnostics=False):
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
@@ -1624,17 +1733,25 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             selected_images = model.phys_decoder(
                 x, values, coords, model.xsize, rotations_selected, shifts_selected,
                 ctf, model.ctf_type, model.get_std())
+            # The prepared pair is free (already-computed intermediates); the
+            # whitened loss and the diagnostics both reuse it.
+            selected_losses, selected_predicted, selected_target = (
+                _candidate_reconstruction_losses(
+                    selected_images, x, ctf, model.ctf_type,
+                    return_prepared=True))
+            recon_loss = selected_losses.mean()
             if return_pose_diagnostics:
-                selected_losses, selected_predicted, selected_target = (
-                    _candidate_reconstruction_losses(
-                        selected_images, x, ctf, model.ctf_type,
-                        return_prepared=True))
-                recon_loss = selected_losses.mean()
                 projection_rms = jnp.sqrt(jnp.mean(jnp.square(selected_predicted)))
                 normalized_target_rms = jnp.sqrt(jnp.mean(jnp.square(selected_target)))
-            else:
-                recon_loss = _candidate_reconstruction_losses(
-                    selected_images, x, ctf, model.ctf_type).mean()
+            full_band_recon_loss = recon_loss
+            if apply_loss_whitening:
+                whitened_recon_loss = _whitened_reconstruction_loss(
+                    selected_predicted, selected_target, whiten_filter).mean()
+                effective_whiten_weight = jnp.clip(
+                    jnp.asarray(whiten_weight, dtype=recon_loss.dtype), 0.0, 1.0)
+                full_band_recon_loss = (
+                    (1.0 - effective_whiten_weight) * recon_loss
+                    + effective_whiten_weight * whitened_recon_loss)
             low_frequency_recon_loss = recon_loss
             effective_multiscale_weight = jnp.clip(
                 jnp.asarray(consensus_multiscale_weight, dtype=recon_loss.dtype),
@@ -1644,7 +1761,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                     selected_images, x, ctf, model.ctf_type,
                     scoring_size=multiscale_size).mean()
             reconstruction_objective = (
-                (1.0 - effective_multiscale_weight) * recon_loss
+                (1.0 - effective_multiscale_weight) * full_band_recon_loss
                 + effective_multiscale_weight * low_frequency_recon_loss)
         else:
             recon_loss = full_candidate_losses[batch_indices, min_indices].mean()
@@ -1745,6 +1862,15 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             loss = (loss + 0.5 * recon_het_loss
                     + model.het_variance_weight * variance_loss
                     + model.het_covariance_weight * covariance_loss)
+        if apply_amplitude_l1:
+            # Values are ReLU'd, so the mean is the L1 density prior: it shrinks
+            # noise-fitted background mass toward zero without touching coords.
+            amplitude_l1 = jnp.asarray(0.0, dtype=recon_loss.dtype)
+            if train_pose_volume:
+                amplitude_l1 = amplitude_l1 + jnp.mean(values)
+            if train_heterogeneity:
+                amplitude_l1 = amplitude_l1 + jnp.mean(values_het)
+            loss = loss + amplitude_l1_weight * amplitude_l1
         metrics = (recon_loss, recon_het_loss, loss_uniform,
                    candidate_coverage_loss, normalized_entropy, anchor_deviation,
                    variance_loss, covariance_loss, latent_std,
@@ -2237,6 +2363,38 @@ def main():
     parser.add_argument("--coarse_gaussians", type=int, default=None,
                         help="Deterministic Gaussian subset for coarse ranking; 0 uses the full cloud. "
                              "Profile default: aggressive=2048, legacy=all.")
+    parser.add_argument("--no_fused_envelope", action="store_true",
+                        help="Disable the fused analytic Gaussian-envelope + CTF Fourier filter and go back to "
+                             "the legacy truncated 9-tap spatial blur followed by a separate CTF pass.")
+    parser.add_argument("--sigma_bounds", type=str, default="auto",
+                        help="Bounds 'min,max' (in voxels) for the learned splat width. Bounding stops the "
+                             "optimizer from inflating sigma to hide pose error (which blurs the map) and from "
+                             "collapsing it below the splat sampling limit. 'auto' derives the bounds from the "
+                             "fitted initial width.")
+    parser.add_argument("--no_sigma_bounds", action="store_true",
+                        help="Keep the legacy unbounded learned splat width.")
+    parser.add_argument("--whiten_loss_weight", type=float, default=0.5,
+                        help="Blend weight in [0,1] for the noise-whitened consensus reconstruction loss. The "
+                             "dataset noise spectrum is estimated once from the particle solvent corners; "
+                             "whitening equalises the per-frequency-shell SNR so high-resolution shells receive "
+                             "real gradient instead of being drowned by the low-frequency power. Only active at "
+                             "the final (full-resolution) pose-curriculum stage. 0 disables.")
+    parser.add_argument("--amplitude_l1", type=float, default=0.0,
+                        help="Weight of an L1 prior on Gaussian amplitudes (consensus and heterogeneous) that "
+                             "suppresses noise-fitted background dust. Off by default: measure its scale against "
+                             "the reconstruction loss on your dataset before trusting a non-zero value.")
+    parser.add_argument("--no_per_candidate_shifts", action="store_true",
+                        help="Disable the per-candidate in-plane shift deltas and go back to one shared shift "
+                             "broadcast to every pose hypothesis.")
+    parser.add_argument("--no_sharpened_map", action="store_true",
+                        help="Do not write the additional envelope-sharpened map in predict mode.")
+    parser.add_argument("--sharpened_map_reg", type=float, default=0.02,
+                        help="Wiener regularizer for the envelope-sharpened map (bounds the maximum gain to "
+                             "~1/(2*sqrt(reg))).")
+    parser.add_argument("--disable_quality_features", action="store_true",
+                        help=f"Master switch that turns off every quality feature at once (fused envelope, sigma "
+                             f"bounds, loss whitening, amplitude L1, per-candidate shifts, sharpened map) for "
+                             f"A/B testing against the previous behaviour.")
     ca.add_ctf_type(parser)
     ca.add_mode(parser)
     ca.add_epochs(parser)
@@ -2309,6 +2467,27 @@ def main():
             1, len(args.candidate_frequency_scales)):
         parser.error("--pose_curriculum_temperatures must be a single value or one "
                      "per --candidate_frequency_scales entry")
+    if args.disable_quality_features:
+        args.no_fused_envelope = True
+        args.no_sigma_bounds = True
+        args.whiten_loss_weight = 0.0
+        args.amplitude_l1 = 0.0
+        args.no_per_candidate_shifts = True
+        args.no_sharpened_map = True
+    if not 0.0 <= args.whiten_loss_weight <= 1.0:
+        parser.error("--whiten_loss_weight must be in [0,1]")
+    if args.amplitude_l1 < 0.0:
+        parser.error("--amplitude_l1 must be non-negative")
+    if args.sharpened_map_reg <= 0.0:
+        parser.error("--sharpened_map_reg must be positive")
+    explicit_sigma_bounds = None
+    if not args.no_sigma_bounds and args.sigma_bounds != "auto":
+        try:
+            explicit_sigma_bounds = tuple(float(v) for v in args.sigma_bounds.split(","))
+        except ValueError:
+            parser.error("--sigma_bounds must be 'auto' or 'min,max'")
+        if len(explicit_sigma_bounds) != 2 or not 0.0 < explicit_sigma_bounds[0] < explicit_sigma_bounds[1]:
+            parser.error("--sigma_bounds must satisfy 0 < min < max")
     if args.seed is not None:
         if args.seed < 0:
             parser.error("--seed must be non-negative")
@@ -2399,6 +2578,18 @@ def main():
     # if mmap and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap")):
     #     shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap"))
 
+    # Bounds for the learned splat width. 'auto' anchors them to the fitted
+    # initial width: enough head-room to adapt, not enough to blur the map into
+    # hiding pose error or to collapse below the splat sampling limit.
+    if args.no_sigma_bounds:
+        sigma_bounds = None
+    elif explicit_sigma_bounds is not None:
+        sigma_bounds = explicit_sigma_bounds
+    else:
+        sigma_init_value = float(np.mean(np.asarray(sigma)))
+        sigma_bounds = (min(0.5, 0.75 * sigma_init_value),
+                        max(2.0, 1.5 * sigma_init_value))
+
     # Random keys
     rng_seed = args.seed if args.seed is not None else random.randint(0, 2 ** 32 - 1)
     rng = jax.random.PRNGKey(rng_seed)
@@ -2436,6 +2627,9 @@ def main():
                             het_start_epoch=args.het_start_epoch,
                             het_freeze_consensus=args.het_freeze_consensus,
                             het_latent_bank_size=args.het_latent_bank_size,
+                            fused_envelope=not args.no_fused_envelope,
+                            sigma_bounds=sigma_bounds,
+                            per_candidate_shifts=not args.no_per_candidate_shifts,
                             rngs=nnx.Rngs(model_key))
 
     # Reload network
@@ -2454,7 +2648,8 @@ def main():
         # Jitted functions for volume prediction
         @nnx.jit
         def decode_volume(model):
-            return model.delta_volume_decoder.decode_volume(sigma=model.get_std())
+            return model.delta_volume_decoder.decode_volume(sigma=model.get_std(),
+                                                            analytic=model.fused_envelope)
 
         # Decode volume
         @nnx.jit
@@ -2483,6 +2678,15 @@ def main():
         # Example of training data for Tensorboard
         with closing(iter(data_loader_train)) as iter_data_loader:
             x_example, labels_example = next(iter_data_loader)
+            whiten_filter = None
+            if args.whiten_loss_weight > 0.0:
+                # One-time dataset noise profile from the particle solvent
+                # corners; the whitened consensus loss reuses this filter at
+                # every step.
+                noise_psd = estimate_noise_psd(jnp.asarray(x_example, jnp.float32))
+                whiten_filter = whitening_filter_2d(noise_psd, (xsize, xsize))
+                print(f"{bcolors.OKCYAN}Estimated the noise power spectrum for loss "
+                      f"whitening from {x_example.shape[0]} particles{bcolors.ENDC}")
             x_example = jax.vmap(min_max_scale)(x_example)
             writer.add_images("Training data batch", x_example, dataformats="NHWC")
 
@@ -2717,6 +2921,16 @@ def main():
                             * multiscale_weight_multiplier)
                 uniform_weight = 0.1
 
+                # Whitening only makes sense once poses are scored at full
+                # resolution: before that the boosted shells are pure noise.
+                # It ramps in as the multiscale curriculum ramps out.
+                whiten_weight_step = 0.0
+                if (whiten_filter is not None and not use_tau
+                        and candidate_scoring_size >= xsize):
+                    whiten_weight_step = (args.whiten_loss_weight
+                                          * (1.0 - consensus_multiscale_weight))
+                apply_loss_whitening = whiten_weight_step > 0.0
+
                 coverage_steps = args.candidate_coverage_epochs * steps_per_epoch
                 apply_candidate_coverage = (
                     coverage_steps > 0 and total_steps < coverage_steps
@@ -2741,6 +2955,11 @@ def main():
                     candidate_scoring_size=candidate_scoring_size,
                     consensus_multiscale_size=consensus_multiscale_size,
                     consensus_multiscale_weight=consensus_multiscale_weight,
+                    apply_loss_whitening=apply_loss_whitening,
+                    whiten_weight=whiten_weight_step,
+                    whiten_filter=whiten_filter,
+                    apply_amplitude_l1=args.amplitude_l1 > 0.0,
+                    amplitude_l1_weight=args.amplitude_l1,
                     train_pose_volume=train_pose_volume,
                     train_heterogeneity=train_heterogeneity,
                     return_metrics=True,
@@ -2970,8 +3189,10 @@ def main():
                                                      num_workers=-1, load_to_ram=args.load_images_to_ram)
         steps_per_epoch = int(np.ceil(len(generator.md) / args.batch_size))
 
-        # Jitted functions for volume prediction
-        decode_volume = jax.jit(reconsiren.delta_volume_decoder.decode_volume)
+        # Jitted functions for volume prediction. The exported map must use the
+        # learned splat width, not the decode_volume default of 1.0.
+        decode_volume = jax.jit(lambda: reconsiren.delta_volume_decoder.decode_volume(
+            sigma=reconsiren.get_std(), analytic=reconsiren.fused_envelope))
         decode_het_volume = jax.jit(reconsiren.decode_het_volume)
 
         # Predict loop
@@ -3016,6 +3237,16 @@ def main():
 
         decoded_volume = decode_volume()
         ImageHandler().write(np.array(decoded_volume), os.path.join(args.output_path, "reconsiren_map.mrc"), overwrite=True)
+
+        if not args.no_sharpened_map:
+            # Companion map with the known splat envelope divided back out
+            # (bounded-gain Wiener); the standard map above stays untouched.
+            sharpened = _sharpen_gaussian_envelope(jnp.asarray(decoded_volume[0]),
+                                                   reconsiren.get_std(),
+                                                   reg=args.sharpened_map_reg)
+            ImageHandler().write(np.array(sharpened),
+                                 os.path.join(args.output_path, "reconsiren_map_sharpened.mrc"),
+                                 overwrite=True)
 
         # Predict heterogeneous states
         kmeans = KMeans(n_clusters=20).fit(latents)
