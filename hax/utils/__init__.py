@@ -3,7 +3,7 @@ from .geometric_losses import calculate_deformation_regularity_loss, calculate_o
 from .ctf import computeCTF, ctf_freqs
 from .euler import euler_matrix_batch, euler_from_matrix
 from .grid_interpolation import interpolate
-from .fourier_filters import wiener2DFilter, ctfFilter, gaussianCTFFilter, gaussian_envelope, fourier_resize, fourier_resample, centered_crop_or_pad, low_pass_3d, FastVariableBlur2D, bspline_3d, rfft2_padded, irfft2_padded, fourier_slice_interpolator, bandpass_filter
+from .fourier_filters import wiener2DFilter, ctfFilter, gaussianCTFFilter, gaussian_envelope, fourier_resize, fourier_resample, centered_crop_or_pad, low_pass_3d, low_pass_3d_analytic, FastVariableBlur2D, bspline_3d, rfft2_padded, irfft2_padded, fourier_slice_interpolator, bandpass_filter
 from .convolutional_filters import fast_gaussian_filter_3d
 from .zernike3d import computeBasis, basisDegreeVectors, precomputePolynomialsZernike, precomputePolynomialsSph
 from .segmentation import get_segmentation_centers, watershed_segmentation
@@ -12,7 +12,7 @@ from .random_gen import random_rotation_matrices
 from .miscellaneous import (estimate_noise_stddev, filter_latent_space, batched_knn, rigid_registration, estimate_envelopes,
                             sparse_finite_3D_differences, build_graph_from_coordinates, sample_mask_points, safe_norm,
                             positional_encoding)
-from .whiten_filter import estimate_noise_psd, create_whitening_fn
+from .whiten_filter import estimate_noise_psd, create_whitening_fn, whitening_filter_2d
 from .loggers import bcolors
 from .symmetry_groups import symmetry_matrices
 from .reconstruction import reconstruct_consensus_volume, consensus_mask

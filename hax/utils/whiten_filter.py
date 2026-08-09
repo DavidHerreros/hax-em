@@ -137,27 +137,16 @@ def estimate_noise_psd(
     return noise_psd_estimate
 
 
-def create_whitening_fn(
+def whitening_filter_2d(
         noise_psd_1d: jax.Array,
         image_shape: Tuple[int, int]
-) -> Callable[[jax.Array], jax.Array]:
+) -> jax.Array:
+    """Build the unshifted 2D whitening filter from a 1D noise PSD.
+
+    The filter lies on the plain (unshifted) ``fft2`` grid, so it can be
+    multiplied directly with ``fft2(image)``. It is normalised to unit mean
+    gain, keeping whitened images on roughly the same scale as the input.
     """
-    Creates and JIT-compiles a function to whiten batches of images.
-
-    This factory pre-builds the whitening filter from the dataset's noise profile
-    for maximum efficiency.
-
-    Args:
-        noise_psd_1d: The pre-computed 1D noise PSD of the dataset from `estimate_noise_psd`.
-        image_shape: The (height, width) of the images to be processed.
-
-    Returns:
-        A fast, JIT-compiled function that takes an image batch (B, H, W, 1) and
-        returns the whitened batch.
-    """
-    height, width = image_shape
-
-    # Pre-compute the 2D whitening filter from the 1D PSD
     r, n_rings = _radius_grid(image_shape)
 
     # Guard against a noise PSD that is shorter than the radial index range
@@ -178,8 +167,30 @@ def create_whitening_fn(
     radial_filter = radial_filter / jnp.mean(radial_filter)
 
     # Map the 1D filter values back to a 2D grid and unshift for multiplication
-    whitening_filter_2d_shifted = radial_filter[r]
-    whitening_filter_2d = fft.ifftshift(whitening_filter_2d_shifted)
+    return fft.ifftshift(radial_filter[r])
+
+
+def create_whitening_fn(
+        noise_psd_1d: jax.Array,
+        image_shape: Tuple[int, int]
+) -> Callable[[jax.Array], jax.Array]:
+    """
+    Creates and JIT-compiles a function to whiten batches of images.
+
+    This factory pre-builds the whitening filter from the dataset's noise profile
+    for maximum efficiency.
+
+    Args:
+        noise_psd_1d: The pre-computed 1D noise PSD of the dataset from `estimate_noise_psd`.
+        image_shape: The (height, width) of the images to be processed.
+
+    Returns:
+        A fast, JIT-compiled function that takes an image batch (B, H, W, 1) and
+        returns the whitened batch.
+    """
+    height, width = image_shape
+
+    whitening_filter = whitening_filter_2d(noise_psd_1d, image_shape)
 
     # This is the final function that will be returned
     @jit
@@ -196,7 +207,7 @@ def create_whitening_fn(
         # Apply the filter in Fourier space.
         # JAX handles broadcasting the (H, W) filter across the (B, H, W) batch.
         fft_images = fft.fft2(images_squeezed)
-        whitened_fft = fft_images * whitening_filter_2d
+        whitened_fft = fft_images * whitening_filter
 
         whitened_images = jnp.real(fft.ifft2(whitened_fft))
 

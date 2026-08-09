@@ -74,6 +74,25 @@ def low_pass_3d(x, std=1.0, kernel_size=9):
     return jnp.fft.ifftn(ft_x).real
 
 
+def low_pass_3d_analytic(x, std=1.0):
+    """Exact Gaussian low-pass ``exp(-2 pi^2 std^2 f^2)`` on a 3D grid.
+
+    The 3D counterpart of :func:`gaussian_envelope`: unlike :func:`low_pass_3d`
+    it is not truncated to a tap kernel, so it stays a true Gaussian for any
+    ``std`` and matches the analytic 2D splat envelope used by the fused
+    projection filter.
+    """
+    shape = x.shape
+    fz = jnp.fft.fftfreq(shape[0])
+    fy = jnp.fft.fftfreq(shape[1])
+    fx = jnp.fft.rfftfreq(shape[2])
+    f_sq = (fz[:, None, None] ** 2 + fy[None, :, None] ** 2
+            + fx[None, None, :] ** 2)
+    sigma_sq = jnp.square(jnp.asarray(std, jnp.float32)).reshape(())
+    envelope = jnp.exp(-2.0 * jnp.pi ** 2 * sigma_sq * f_sq)
+    return jnp.fft.irfftn(jnp.fft.rfftn(x) * envelope, s=shape)
+
+
 def _radial_frequency_grid(shape, pixel_size_A):
     """|k| in 1/A on the (H, W) grid, in unshifted FFT layout."""
     fy = jnp.fft.fftfreq(shape[0], d=pixel_size_A)  # cycles / A
