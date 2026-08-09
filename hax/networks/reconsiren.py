@@ -2362,10 +2362,10 @@ def main():
     from hax.cli import common_args as ca
 
     def comma_separated_ints(value):
-        return tuple(int(item.strip()) for item in value.split(",") if item.strip())
+        return tuple(ca.list_of_ints(value))
 
     def comma_separated_floats(value):
-        return tuple(float(item.strip()) for item in value.split(",") if item.strip())
+        return tuple(ca.list_of_floats(value))
 
     parser = argparse.ArgumentParser()
     ca.add_md(parser)
@@ -2704,9 +2704,9 @@ def main():
     if args.sharpened_map_reg <= 0.0:
         parser.error("--sharpened_map_reg must be positive")
     explicit_sigma_bounds = None
-    if not args.no_sigma_bounds and args.sigma_bounds != "auto":
+    if not args.no_sigma_bounds and str(args.sigma_bounds).strip().lower() != "auto":
         try:
-            explicit_sigma_bounds = tuple(float(v) for v in args.sigma_bounds.split(","))
+            explicit_sigma_bounds = tuple(ca.list_of_floats(args.sigma_bounds))
         except ValueError:
             parser.error("--sigma_bounds must be 'auto' or 'min,max'")
         if len(explicit_sigma_bounds) != 2 or not 0.0 < explicit_sigma_bounds[0] < explicit_sigma_bounds[1]:

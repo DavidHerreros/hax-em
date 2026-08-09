@@ -17,6 +17,7 @@ Design notes:
 """
 
 import os
+import re
 import sys
 import json
 import argparse
@@ -24,9 +25,34 @@ import argparse
 from hax.utils import bcolors
 
 
+def _list_arg_items(arg):
+    """Split a list-valued CLI string tolerantly.
+
+    Accepts the plain comma form (``0.8,0.2``) as well as the ways a list value
+    realistically reaches argparse second-hand: a Python/YAML repr pasted back
+    verbatim (``(0.25, 0.5, 0.75)``, ``[0.25, 0.5]``) - e.g. a GUI form echoing
+    a tuple default, or a hand-written config - plus stray whitespace,
+    whitespace-only separation and trailing commas.
+    """
+    text = str(arg).strip()
+    pairs = {"(": ")", "[": "]", "{": "}"}
+    if text and text[0] in pairs and text.endswith(pairs[text[0]]):
+        text = text[1:-1]
+    return [item for item in re.split(r"[\s,]+", text.strip()) if item]
+
+
 def list_of_floats(arg):
-    """argparse ``type`` for a comma-separated list of floats (e.g. ``0.8,0.2``)."""
-    return list(map(float, arg.split(',')))
+    """argparse ``type`` for a list of floats (e.g. ``0.8,0.2`` or ``(0.8, 0.2)``)."""
+    if isinstance(arg, (list, tuple)):
+        return [float(item) for item in arg]
+    return [float(item) for item in _list_arg_items(arg)]
+
+
+def list_of_ints(arg):
+    """argparse ``type`` for a list of ints (e.g. ``64,128`` or ``(64, 128)``)."""
+    if isinstance(arg, (list, tuple)):
+        return [int(item) for item in arg]
+    return [int(item) for item in _list_arg_items(arg)]
 
 
 def batch_size_or_auto(arg):
