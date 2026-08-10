@@ -1658,6 +1658,23 @@ def recycle_dead_points_reconsiren(graphdef, state, key, dead_fraction=0.05,
     return state, jnp.sum(dead)
 
 
+def _equalize_masses(masses, gamma, dust_fraction=0.02):
+    """Gamma-compress Gaussian masses for the tracing map.
+
+    Masses below ``dust_fraction`` of the positive mean are dropped entirely;
+    the rest are compressed toward the mean so one iso-surface threshold shows
+    the whole chain. Returns ``None`` when the cloud carries no mass yet.
+    """
+    masses = np.asarray(masses, np.float32)
+    positive = masses[masses > 0.0]
+    if not positive.size:
+        return None
+    mean_mass = float(positive.mean())
+    return np.where(masses > dust_fraction * mean_mass,
+                    mean_mass * (masses / mean_mass) ** gamma,
+                    0.0).astype(np.float32)
+
+
 def volume_optimizer_transform(parameterization, volume_lr, coords_lr=None,
                                amplitude_lr=None):
     """Optax transform for the consensus volume decoder.
@@ -2582,6 +2599,12 @@ def main():
                              "fitted initial width.")
     parser.add_argument("--no_sigma_bounds", action="store_true",
                         help="Keep the legacy unbounded learned splat width.")
+    parser.add_argument("--no_adaptive_sigma", action="store_true",
+                        help=f"Disable the spacing-derived minimum splat width in {bcolors.ITALIC}ab initio{bcolors.ENDC} mode. "
+                             f"By default the 'auto' sigma bounds floor the width at half the mean point spacing "
+                             f"implied by --num_gaussians and the estimated particle extent (narrower splats "
+                             f"render beads, not continuous density), raising the fixed 1.0 initialization when "
+                             f"it falls below that floor.")
     parser.add_argument("--whiten_loss_weight", type=float, default=0.5,
                         help="Blend weight in [0,1] for the noise-whitened consensus reconstruction loss. The "
                              "dataset noise spectrum is estimated once from the particle solvent corners; "
@@ -2727,6 +2750,7 @@ def main():
         args.no_sharpened_map = True
     if args.disable_geometry_features:
         args.no_extent_estimation = True
+        args.no_adaptive_sigma = True
         args.support_weight = 0.0
         args.spacing_prior_weight = 0.0
         args.amplitude_smoothness_weight = 0.0
@@ -2895,6 +2919,14 @@ def main():
     # if mmap and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap")):
     #     shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap"))
 
+    # Mean point spacing implied by tiling the (estimated) support with N
+    # points: the geometric quantity behind both the adaptive sigma floor and
+    # the startup connectivity check.
+    implied_spacing = None
+    if args.vol is None and args.mode == "train":
+        radius_check = extent_radius_px if extent_radius_px is not None else 0.25 * xsize
+        implied_spacing = ((4.0 / 3.0) * np.pi * radius_check ** 3 / num_gaussians) ** (1.0 / 3.0)
+
     # Bounds for the learned splat width. 'auto' anchors them to the fitted
     # initial width: enough head-room to adapt, not enough to blur the map into
     # hiding pose error or to collapse below the splat sampling limit.
@@ -2904,16 +2936,26 @@ def main():
         sigma_bounds = explicit_sigma_bounds
     else:
         sigma_init_value = float(np.mean(np.asarray(sigma)))
-        sigma_bounds = (min(0.5, 0.75 * sigma_init_value),
-                        max(2.0, 1.5 * sigma_init_value))
+        sigma_lo = min(0.5, 0.75 * sigma_init_value)
+        if implied_spacing is not None and not args.no_adaptive_sigma:
+            # Spacing-derived floor: a splat narrower than half the mean point
+            # spacing renders beads instead of continuous density, so the
+            # minimum width follows the measured cloud geometry rather than a
+            # fixed guess. If the fixed 1.0 init sits at/below that floor,
+            # raise it so sigma starts inside the usable range.
+            sigma_lo = max(sigma_lo, 0.5 * implied_spacing)
+            if sigma_init_value < 1.1 * sigma_lo:
+                sigma = 1.1 * sigma_lo
+                print(f"{bcolors.OKCYAN}Raised the initial splat width to {sigma:.2f} px to sit "
+                      f"above the spacing-derived floor ({sigma_lo:.2f} px){bcolors.ENDC}")
+                sigma_init_value = float(sigma)
+        sigma_bounds = (sigma_lo, max(2.0, 1.5 * sigma_init_value))
 
     # Startup connectivity check: with N points tiling the support, mean point
     # spacing must stay below ~2 splat widths or the rendered density cannot be
     # continuous no matter how well training goes. Ab initio users have no
     # reference map to eyeball, so say it up front.
-    if args.vol is None and args.mode == "train":
-        radius_check = extent_radius_px if extent_radius_px is not None else 0.25 * xsize
-        implied_spacing = ((4.0 / 3.0) * np.pi * radius_check ** 3 / num_gaussians) ** (1.0 / 3.0)
+    if implied_spacing is not None:
         sigma_now = float(np.mean(np.asarray(sigma)))
         sigma_max = sigma_bounds[1] if sigma_bounds is not None else 2.0 * sigma_now
         print(f"{bcolors.OKCYAN}Cloud geometry: {num_gaussians} points, implied spacing "
@@ -2991,6 +3033,17 @@ def main():
         def decode_cloud(model):
             return model.delta_volume_decoder()
 
+        # Physical + equalized intermediate maps in ONE scatter pass: the two
+        # value sets share the point positions, so stacking them along the
+        # batch axis reuses the scatter geometry and only adds a second
+        # grid accumulation + filter.
+        @nnx.jit
+        def decode_volume_pair(model, values_pair):
+            coords, _ = model.delta_volume_decoder()
+            return model.delta_volume_decoder.decode_volume(
+                coords_values=(coords, values_pair),
+                sigma=model.get_std(), analytic=model.fused_envelope)
+
         # Decode volume
         @nnx.jit
         def decode_het_volume(model, x):
@@ -2999,6 +3052,22 @@ def main():
         def write_volume(volume, path):
             """Write a map (runs on the logging thread)."""
             ImageHandler().write(volume, path, overwrite=True)
+
+        def write_intermediate_volumes(volumes, out_dir):
+            """Write the intermediate map(s) (runs on the logging thread).
+
+            ``volumes`` arrives as a device array: the device-to-host copy
+            happens HERE, off the training thread, so the loop never blocks on
+            the transfer - only on the (async-dispatched) decode itself.
+            """
+            volumes = np.asarray(volumes)
+            ImageHandler().write(volumes[0],
+                                 os.path.join(out_dir, "reconsiren_map_intermediate.mrc"),
+                                 overwrite=True)
+            if volumes.shape[0] > 1:
+                ImageHandler().write(volumes[1],
+                                     os.path.join(out_dir, "reconsiren_map_equalized_intermediate.mrc"),
+                                     overwrite=True)
 
         def write_het_volumes(volumes, out_dir):
             """Write the per-cluster heterogeneous maps (runs on the logging thread)."""
@@ -3091,6 +3160,8 @@ def main():
         support_radius_value = None
         previous_cloud_coords = None
         previous_cloud_values = None
+        intermediate_equalized_enabled = (not args.no_equalized_map
+                                          and not args.do_not_learn_volume)
         # The adaptive curriculum is gated on winner stability, so it needs the
         # per-particle tracker even when the extra TensorBoard panels are off.
         pose_diagnostics_enabled = (args.pose_diagnostics
@@ -3257,16 +3328,27 @@ def main():
                         with logger.section():
                             # Example of predicted data for Tensorboard
                             reconsiren, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
-                            volume = decode_volume(reconsiren)
+                            volume = None
+                            if intermediate_equalized_enabled:
+                                _, cloud_masses = decode_cloud(reconsiren)
+                                equalized_masses = _equalize_masses(
+                                    cloud_masses[0], args.equalized_map_gamma)
+                                if equalized_masses is not None:
+                                    values_pair = jnp.stack(
+                                        [jnp.asarray(np.asarray(cloud_masses[0], np.float32)),
+                                         jnp.asarray(equalized_masses)], axis=0)
+                                    volume = decode_volume_pair(reconsiren, values_pair)
+                            if volume is None:
+                                volume = decode_volume(reconsiren)
                             middle_slize = int(np.round(0.5 * volume.shape[-1]))
                             slice_xy, slice_xz, slice_yz = (min_max_scale(volume[0, middle_slize, :, :]),
                                                             min_max_scale(volume[0, :, middle_slize, :]),
                                                             min_max_scale(volume[0, :, :, middle_slize]))
                             slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
-                            volume = np.array(volume)
 
-                        logger.submit(write_volume, volume,
-                                      os.path.join(args.output_path, "reconsiren_map_intermediate.mrc"))
+                        # The full volumes stay on-device here; the transfer and
+                        # the file writes happen on the logging thread.
+                        logger.submit(write_intermediate_volumes, volume, args.output_path)
                         logger.submit(writer.add_images, "Predicted volume (slices)", slices,
                                       dataformats="NHWC", global_step=i)
 
@@ -3737,14 +3819,8 @@ def main():
             # chain. Deliberately decoupled from true occupancy - read topology
             # here, read confidence in the physical map.
             cloud_coords, cloud_values = reconsiren.delta_volume_decoder()
-            masses = np.asarray(cloud_values[0], np.float32)
-            positive = masses[masses > 0.0]
-            if positive.size:
-                mean_mass = float(positive.mean())
-                equalized_masses = np.where(
-                    masses > 0.02 * mean_mass,
-                    mean_mass * (masses / mean_mass) ** args.equalized_map_gamma,
-                    0.0).astype(np.float32)
+            equalized_masses = _equalize_masses(cloud_values[0], args.equalized_map_gamma)
+            if equalized_masses is not None:
                 equalized = reconsiren.delta_volume_decoder.decode_volume(
                     coords_values=(cloud_coords, jnp.asarray(equalized_masses)[None, ...]),
                     sigma=reconsiren.get_std(), analytic=reconsiren.fused_envelope)
