@@ -1,6 +1,5 @@
 #!/usr/bin/env python
 
-from pyexpat import model
 
 import jax
 import jax.numpy as jnp
@@ -99,7 +98,7 @@ def md_extraction(md_columns, index, vol, args):
 
 
 # Projecting the batch volume 
-def VolumeProjection(vol, mask, euler_angles, shifts, ctf):
+def volumeProjection(vol, mask, euler_angles, shifts, ctf):
 
     inds = np.asarray(np.where(mask > 0.0)).T #z,y,x voxel
 
@@ -224,7 +223,8 @@ def main():
   from hax.checkpointer import NeuralNetworkCheckpointer
   from hax.generators import MetaDataGenerator, extract_columns
   from hax.metrics import JaxSummaryWriter
-  from hax.utils.frc_jit import compute_fourier_residual
+  from hax.utils.frc_jit_clean import compute_fourier_residual
+  from hax.utils.standardize_frc import standardize_frc_curve
 
   def list_of_floats(arg):
         return list(map(float, arg.split(',')))
@@ -282,7 +282,7 @@ def main():
         
   # Volume and Mask handling
   vol = ImageHandler(args.vol).getData()
-  mask = ImageHandler().generateMask(inputFn=vol, boxsize=64)
+  mask = ImageHandler().generateMask(inputFn=vol, boxsize=vol.shape[0])
   theta_min_deg, R_max = compute_min_rotation_angle(mask, pixel_threshold=2.0) # it will be further used to compute misalignment; it can be computed once
 
   # Prepare network
@@ -324,7 +324,7 @@ def main():
         
         # Adjust to images 
         model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
-                                            num_epochs=5, is_global=True, ctf_type="apply")
+                                            num_epochs=500, is_global=True, ctf_type="apply")
 
         # Save model
         NeuralNetworkCheckpointer.save(model, fit_path)
@@ -386,30 +386,32 @@ def main():
         batch_size = len(index)
         
         # Aligned images
-        projection_al = VolumeProjection(vol=vol,
+        projection_al = volumeProjection(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles,
                                  shifts=shifts,
                                  ctf=ctf)
-        result = compute_fourier_residual(projection_al, x, n_shells=n_shells)
-        aligned_curve = result.frc_curve
-        aligned_res = result.residual_map
+        result_al = compute_fourier_residual(projection_al, x, n_shells=n_shells)
+        aligned_frc, freqs_ref = standardize_frc_curve(result_al.frc_curve, result_al.freqs, ts=args.sr, n_shells_ref=n_shells)
+        aligned_frc = jnp.array(aligned_frc)
+        #aligned_res = result.residual_map
         aligned_labels = jnp.ones((batch_size,1)) #label for aligned res is 1
 
         # Misaligned images - Data Augmentation
         rngs, euler_angles_noisy, shifts_noisy = generate_misalignment(rngs, euler_angles, shifts, box_size=x_size, theta_min_deg=theta_min_deg)
-        projection_misal = VolumeProjection(vol=vol,
+        projection_misal = volumeProjection(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles_noisy,
                                  shifts=shifts_noisy,
                                  ctf=ctf)
-        result = compute_fourier_residual(projection_misal, x, n_shells=n_shells)
-        misaligned_curve = result.frc_curve
-        misaligned_res = result.residual_map
+        result_mis = compute_fourier_residual(projection_misal, x, n_shells=n_shells)
+        misaligned_frc, _ = standardize_frc_curve(result_mis.frc_curve, result_mis.freqs, ts=args.sr, n_shells_ref=n_shells)
+        misaligned_frc = jnp.array(misaligned_frc)
+        #misaligned_res = result.residual_map
         misaligned_labels = jnp.zeros((batch_size,1)) #label for misaligned res is 0
       
        
-        res = jnp.concatenate([aligned_curve, misaligned_curve], axis=0)
+        res = jnp.concatenate([aligned_frc, misaligned_frc], axis=0)
         labels = jnp.concatenate([aligned_labels, misaligned_labels], axis=0)
         
         loss, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=res, labels=labels, train=True)
@@ -465,30 +467,32 @@ def main():
 
 
             # Aligned images
-            projection_al_v = VolumeProjection(vol=vol,
+            projection_al_v = volumeProjection(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles,
                                  shifts=shifts,
                                  ctf=ctf)
-            result = compute_fourier_residual(projection_al_v, x_validation, n_shells=n_shells)
-            aligned_curve_v = result.frc_curve
-            aligned_res_v = result.residual_map
+            result_al_v = compute_fourier_residual(projection_al_v, x_validation, n_shells=n_shells)
+            aligned_frc_v, freqs_ref = standardize_frc_curve(result_al_v.frc_curve, result_al_v.freqs, ts=args.sr, n_shells_ref=n_shells)
+            aligned_frc_v = jnp.array(aligned_frc_v)
+            aligned_res_v = result_al_v.residual_map
             aligned_labels_v = jnp.ones((batch_size_v,1))
         
     
             # Misaligned images
             rngs, euler_angles_noisy, shifts_noisy = generate_misalignment(rngs, euler_angles, shifts, box_size=x_size, theta_min_deg=theta_min_deg)
-            projection_misal_v = VolumeProjection(vol=vol,
+            projection_misal_v = volumeProjection(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles_noisy,
                                  shifts=shifts_noisy,
                                  ctf=ctf)
-            result = compute_fourier_residual(projection_misal_v, x_validation, n_shells=n_shells)
-            misaligned_curve_v = result.frc_curve
-            misaligned_res_v = result.residual_map
+            result_mis_v = compute_fourier_residual(projection_misal_v, x_validation, n_shells=n_shells)
+            misaligned_frc_v, _ = standardize_frc_curve(result_mis_v.frc_curve, result_mis_v.freqs, ts=args.sr, n_shells_ref=n_shells)
+            misaligned_frc_v = jnp.array(misaligned_frc_v)
+            misaligned_res_v = result_mis_v.residual_map
             misaligned_labels_v = jnp.zeros((batch_size_v,1))
           
-            res_validation = jnp.concatenate([aligned_curve_v, misaligned_curve_v],axis=0)
+            res_validation = jnp.concatenate([aligned_frc_v, misaligned_frc_v],axis=0)
             labels_validation = jnp.concatenate([aligned_labels_v, misaligned_labels_v], axis=0)
 
 
@@ -520,12 +524,12 @@ def main():
               plt.imsave(os.path.join(args.output_path, "aligned_bwr.png"), res_aligned, cmap='bwr', vmin=-max_val, vmax=max_val)
               plt.imsave(os.path.join(args.output_path, "misaligned_bwr.png"), res_misaligned, cmap='bwr', vmin=-max_val, vmax=max_val)
 
-              # --- FRC curve: nuovo, log come figura 1D ---
+              # --- FRC curve ---
               fig, ax = plt.subplots()
-              ax.plot(result.freqs, np.array(aligned_curve_v[0]), label="Aligned")
-              ax.plot(result.freqs, np.array(misaligned_curve_v[0]), label="Misaligned")
+              ax.plot(freqs_ref, np.array(aligned_frc_v[0]), label="Aligned")
+              ax.plot(freqs_ref, np.array(misaligned_frc_v[0]), label="Misaligned")
               ax.axhline(0.143, color="gray", linestyle="--", label="FRC=0.143")
-              ax.set_xlabel("Spatial frequency (cycles/pixel)")
+              ax.set_xlabel("Spatial frequency (cycles/Angstrom)")
               ax.set_ylabel("FRC")
               ax.set_title("FRC curve - Aligned vs Misaligned sample")
               ax.legend()
@@ -533,8 +537,8 @@ def main():
               writer.add_figure("FRC_Curve/Aligned_vs_Misaligned", fig, global_step=i)
               plt.close(fig)
   
-              np.save(os.path.join(args.output_path, "aligned_frc_curve.npy"), np.array(aligned_curve_v[0]))
-              np.save(os.path.join(args.output_path, "misaligned_frc_curve.npy"), np.array(misaligned_curve_v[0]))
+              np.save(os.path.join(args.output_path, "aligned_frc_curve.npy"), np.array(aligned_frc_v[0]))
+              np.save(os.path.join(args.output_path, "misaligned_frc_curve.npy"), np.array(misaligned_frc_v[0]))
 
             ######################################################################
 
@@ -620,15 +624,16 @@ def main():
 
       euler_angles, shifts, ctf = md_extraction (md_columns, index, vol, args)
       
-      projection_pred = VolumeProjection(vol=vol,
+      projection_pred = volumeProjection(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles,
                                  shifts=shifts,
                                  ctf=ctf)
       result = compute_fourier_residual(projection_pred, x, n_shells=n_shells)
-      prediction_curve = result.frc_curve
+      prediction_frc, _ = standardize_frc_curve(result.frc_curve, result.freqs, ts=args.sr, n_shells_ref=n_shells)
+      prediction_frc = jnp.array(prediction_frc)
       #predictions = predict_fn(prediction_res,eval=True)
-      predictions = cryoCheck(prediction_curve, eval=True)
+      predictions = cryoCheck(prediction_frc, eval=True)
 
       labels_prediction.append(np.array(predictions))
 
@@ -651,4 +656,3 @@ def main():
     md[:, "misalignment_score_heavy"] = final_predictions_heavy
     md.write(os.path.join(args.output_path, "md_final_predictions" +  os.path.splitext(args.md)[1]))
 
-### mlp architecture, uniform distribution for  misalignment 
