@@ -1563,6 +1563,11 @@ def _estimate_particle_extent(images, threshold=0.1, margin=1.15):
     above = np.flatnonzero(excess > threshold * peak)
     if above.size == 0:
         return None
+    if above.max() >= int(0.85 * max_radius):
+        # The variance excess reaches into the outer shells the noise floor
+        # was measured from: there is no clean particle boundary inside the
+        # box, so any radius here would be a whole-box hallucination.
+        return None
     radius = float(above.max()) * margin
     return float(np.clip(radius, 4.0, 0.95 * max_radius))
 
