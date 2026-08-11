@@ -2776,7 +2776,7 @@ def main():
     parser.add_argument("--amplitude_learning_rate", type=float, default=None,
                         help="'direct' parameterization only: learning rate of the Gaussian amplitude deltas. "
                              "Default 1e-3: amplitudes start near 0.01 mass, so Adam's ~LR-sized steady steps "
-                             "grow mass at ~10% of the initial mean per step without oscillating, while "
+                             "grow mass at ~10%% of the initial mean per step without oscillating, while "
                              "coordinates (on a ~50x larger normalized scale) keep the higher coords LR.")
     parser.add_argument("--render_chunk_size", type=int, default=None,
                         help="Gaussians per rematerialized scatter block; 0 disables point chunking. "
