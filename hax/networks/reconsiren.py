@@ -709,7 +709,9 @@ class EncoderHet(nnx.Module):
                  *, rngs: nnx.Rngs):
         self.input_dim = input_dim
         self.input_conv_dim = int(encoder_size) if architecture == "resize" else 64
-        self.out_conv_dim = int(self.input_conv_dim / (2 ** 4))
+        # Four stride-2 SAME convs: each level is ceil(previous / 2), so the
+        # flattened width is ceil(size / 16) for any input size.
+        self.out_conv_dim = -(-self.input_conv_dim // (2 ** 4))
         self.architecture = architecture
 
         if architecture == "convstem":
@@ -789,9 +791,10 @@ class EncoderHet(nnx.Module):
                     x, (x.shape[0], self.input_conv_dim, self.input_conv_dim, 1), method="bilinear")
             conv_layers = self.hidden_layers_conv
         else:
-            x = jax.image.resize(
-                x, (x.shape[0], self.input_conv_dim, self.input_conv_dim, 1),
-                method="lanczos3", antialias=True)
+            if x.shape[1] != self.input_conv_dim or x.shape[2] != self.input_conv_dim:
+                x = jax.image.resize(
+                    x, (x.shape[0], self.input_conv_dim, self.input_conv_dim, 1),
+                    method="lanczos3", antialias=True)
             conv_layers = self.hidden_layers_conv
 
         for layer in conv_layers:
@@ -1314,8 +1317,8 @@ class ReconSIREN(nnx.Module):
         if weight_sum <= 0.0 or any(weight < 0.0 for weight in het_loss_weights):
             raise ValueError("heterogeneity loss weights must be non-negative and sum to > 0")
         het_loss_weights = tuple(weight / weight_sum for weight in het_loss_weights)
-        if het_encoder_architecture == "resize" and (het_encoder_size < 16 or het_encoder_size % 16):
-            raise ValueError("het_encoder_size must be a positive multiple of 16 for the resize encoder")
+        if het_encoder_architecture == "resize" and het_encoder_size < 16:
+            raise ValueError("het_encoder_size must be at least 16 for the resize encoder")
         if not 0.0 <= het_mask_radius <= 0.5:
             raise ValueError("het_mask_radius must be in [0, 0.5]")
 
@@ -2716,7 +2719,8 @@ def main():
                              "anti_collapse=resize; legacy CLI profile=legacy.")
     parser.add_argument("--het_encoder_size", type=int, default=None,
                         help="Anti-aliased encoder image size for the resize architecture. "
-                             "Must be a multiple of 16; anti-collapse default: min(128, box size).")
+                             "Any size >= 16; matching the box size skips the resize entirely. "
+                             "Anti-collapse default: min(128, box size).")
     parser.add_argument("--het_disable_consensus_residual", action="store_true",
                         help="Disable decoding heterogeneous states as residuals from the learned consensus.")
     parser.add_argument("--het_disable_decoder_centering", action="store_true",
