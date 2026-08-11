@@ -939,6 +939,46 @@ class DeltaVolumeDecoder(nnx.Module):
 
         return grids
 
+def _splat_cloud_volumes(coords, values, volume_size, filter=True, sigma=1.0,
+                         analytic=False):
+    """Trilinear scatter of per-state Gaussian clouds onto ``B`` volume grids.
+
+    ``coords`` are already displaced to grid units (box corner origin) and vary
+    with the batch, unlike the consensus renderer where one cloud is shared
+    across amplitude sets.
+    """
+    grids = jnp.zeros((values.shape[0], volume_size, volume_size, volume_size))
+
+    bposf = jnp.floor(coords)
+    bposi = bposf.astype(jnp.int32)
+    bposf = coords - bposf
+
+    bamp0 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+    bamp1 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+    bamp2 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+    bamp3 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
+    bamp4 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
+    bamp5 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
+    bamp6 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+    bamp7 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
+
+    bamp = jnp.concat([bamp0, bamp1, bamp2, bamp3, bamp4, bamp5, bamp6, bamp7], axis=1)
+    bposi = jnp.concat([bposi, bposi + jnp.array((1, 0, 0)), bposi + jnp.array((0, 1, 0)), bposi + jnp.array((0, 0, 1)),
+                        bposi + jnp.array((0, 1, 1)), bposi + jnp.array((1, 0, 1)), bposi + jnp.array((1, 1, 0)), bposi + jnp.array((1, 1, 1))], axis=1)
+
+    def scatter_volume(vol, bpos_i, bamp_i):
+        return vol.at[bpos_i[..., 2], bpos_i[..., 1], bpos_i[..., 0]].add(bamp_i)
+
+    grids = jax.vmap(scatter_volume, in_axes=(0, 0, 0))(grids, bposi, bamp)
+
+    # Filter volume
+    if filter:
+        low_pass = low_pass_3d_analytic if analytic else low_pass_3d
+        grids = jax.vmap(low_pass, in_axes=(0, None))(grids, sigma)
+
+    return grids
+
+
 class HetVolumeDecoder(nnx.Module):
     def __init__(self, coords, values, n_gaussians, lat_dim, volume_size,
                  residual_to_consensus=False, center_decoder=False,
@@ -999,44 +1039,107 @@ class HetVolumeDecoder(nnx.Module):
 
     def decode_volume(self, x, filter=True, sigma=1.0, base_coords=None, base_values=None,
                       analytic=False):
-        # Decode volume values
         coords, values = self.__call__(x, base_coords=base_coords, base_values=base_values)
+        return _splat_cloud_volumes(coords + self.factor, values, self.volume_size,
+                                    filter=filter, sigma=sigma, analytic=analytic)
 
-        # Displace coordinates
-        coords = coords + self.factor
 
-        # Place values on grid
-        grids = jnp.zeros((x.shape[0], self.volume_size, self.volume_size, self.volume_size))
+class HetFieldDecoder(nnx.Module):
+    """Coordinate-conditioned delta field, FiLM-modulated by the latent.
 
-        # Scatter volume
-        bposf = jnp.floor(coords)
-        bposi = bposf.astype(jnp.int32)
-        bposf = coords - bposf
+    The low-rank readout of :class:`HetVolumeDecoder` spans at most ``lat_dim``
+    global deformation modes: every Gaussian moves along a fixed direction, and
+    a motion confined to one region has to be paid for out of that same global
+    budget. Here the delta is a continuous SIREN field of the point position,
+    so locality costs latent capacity only where the conformation differs. The
+    price is B x N x width activations instead of B x width.
+    """
 
-        bamp0 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
-        bamp1 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
-        bamp2 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
-        bamp3 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
-        bamp4 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
-        bamp5 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
-        bamp6 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
-        bamp7 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
+    def __init__(self, coords, values, n_gaussians, lat_dim, volume_size,
+                 residual_to_consensus=False, center_decoder=False,
+                 coordinate_scale=1.0, amplitude_scale=1.0, small_final_init=False,
+                 width=64, *, rngs: nnx.Rngs):
+        self.volume_size = volume_size
+        self.n_gaussians = n_gaussians
+        self.coords = coords[None, ...]
+        self.reference_values = values[None, ...]
+        self.residual_to_consensus = bool(residual_to_consensus)
+        self.center_decoder = bool(center_decoder)
+        self.coordinate_scale = float(coordinate_scale)
+        self.amplitude_scale = float(amplitude_scale)
+        self.width = int(width)
 
-        bamp = jnp.concat([bamp0, bamp1, bamp2, bamp3, bamp4, bamp5, bamp6, bamp7], axis=1)
-        bposi = jnp.concat([bposi, bposi + jnp.array((1, 0, 0)), bposi + jnp.array((0, 1, 0)), bposi + jnp.array((0, 0, 1)),
-                           bposi + jnp.array((0, 1, 1)), bposi + jnp.array((1, 0, 1)), bposi + jnp.array((1, 1, 0)), bposi + jnp.array((1, 1, 1))], axis=1)
+        # Indices to (normalized) coords
+        self.factor = 0.5 * volume_size
 
-        def scatter_volume(vol, bpos_i, bamp_i):
-            return vol.at[bpos_i[..., 2], bpos_i[..., 1], bpos_i[..., 0]].add(bamp_i)
+        self.coordinate_layer = Siren2Linear(
+            in_features=3, out_features=self.width, rngs=rngs, dtype=jnp.bfloat16,
+            is_first=True, w0=30.0, s=0.0, c=1.0)
+        hidden, film_gamma, film_beta = [], [], []
+        for _ in range(2):
+            hidden.append(
+                Siren2Linear(in_features=self.width, out_features=self.width, rngs=rngs,
+                             dtype=jnp.bfloat16, is_first=False, custom_init=True,
+                             is_residual=True, w0=1.0, s=0.0, c=6.0))
+            # Zero-initialized FiLM: the field starts latent-independent, so
+            # centering is exact at init and the untrained latent cannot inject
+            # noise into the consensus geometry.
+            film_gamma.append(Linear(in_features=lat_dim, out_features=self.width, rngs=rngs,
+                                     dtype=jnp.bfloat16,
+                                     kernel_init=nnx.initializers.zeros_init(),
+                                     bias_init=nnx.initializers.zeros_init()))
+            film_beta.append(Linear(in_features=lat_dim, out_features=self.width, rngs=rngs,
+                                    dtype=jnp.bfloat16,
+                                    kernel_init=nnx.initializers.zeros_init(),
+                                    bias_init=nnx.initializers.zeros_init()))
+        self.hidden = nnx.List(hidden)
+        self.film_gamma = nnx.List(film_gamma)
+        self.film_beta = nnx.List(film_beta)
+        final_init = (nnx.initializers.normal(1e-4) if small_final_init
+                      else nnx.initializers.glorot_uniform())
+        self.readout = Linear(in_features=self.width, out_features=4, rngs=rngs,
+                              kernel_init=final_init,
+                              bias_init=nnx.initializers.zeros_init())
 
-        grids = jax.vmap(scatter_volume, in_axes=(0, 0, 0))(grids, bposi, bamp)
+    def _decode_deltas(self, x, points):
+        # points: (N, 3) normalized to ~[-1, 1]; x: (B, lat_dim)
+        h = self.coordinate_layer(points)
+        h = jnp.broadcast_to(h[None, ...], (x.shape[0],) + h.shape)
+        for layer, gamma, beta in zip(self.hidden, self.film_gamma, self.film_beta):
+            h = layer(h * (1.0 + gamma(x)[:, None, :]) + beta(x)[:, None, :])
+        return self.readout(h)
 
-        # Filter volume
-        if filter:
-            low_pass = low_pass_3d_analytic if analytic else low_pass_3d
-            grids = jax.vmap(low_pass, in_axes=(0, None))(grids, sigma)
+    def __call__(self, x, base_coords=None, base_values=None):
+        if self.residual_to_consensus and (base_coords is None or base_values is None):
+            raise ValueError("Consensus-relative heterogeneity requires base coordinates and values")
+        # The field is queried at the CURRENT consensus positions, but must not
+        # push its own gradient back into them through its input.
+        points = base_coords[0] / self.factor if self.residual_to_consensus else self.coords[0]
+        points = jax.lax.stop_gradient(points)
 
-        return grids
+        deltas = self._decode_deltas(x, points)
+        if self.center_decoder:
+            # Remove the latent-independent decoder path.  z=0 is therefore the
+            # current consensus exactly, while all conformational changes must
+            # be explained through a latent-dependent residual.
+            deltas = deltas - self._decode_deltas(jnp.zeros_like(x), points)
+        delta_coords, delta_values = deltas[..., :3], deltas[..., 3]
+
+        if self.residual_to_consensus:
+            coords = base_coords + self.factor * self.coordinate_scale * delta_coords
+            values = nnx.relu(base_values + self.amplitude_scale * delta_values)
+        else:
+            coords = self.factor * (self.coords + delta_coords)
+            values = nnx.relu(self.reference_values + delta_values)
+
+        return coords, values
+
+    def decode_volume(self, x, filter=True, sigma=1.0, base_coords=None, base_values=None,
+                      analytic=False):
+        coords, values = self.__call__(x, base_coords=base_coords, base_values=base_values)
+        return _splat_cloud_volumes(coords + self.factor, values, self.volume_size,
+                                    filter=filter, sigma=sigma, analytic=analytic)
+
 
 class PhysDecoder:
     def __init__(self, xsize, render_chunk_size=0, fused_envelope=False):
@@ -1151,6 +1254,7 @@ class ReconSIREN(nnx.Module):
                  heterogeneity_profile="legacy", het_encoder_size=None,
                  het_residual_to_consensus=None, het_center_decoder=None,
                  het_coordinate_scale=1.0, het_amplitude_scale=1.0,
+                 het_decoder_architecture="lowrank", het_decoder_width=64,
                  het_loss_scales=None, het_loss_weights=None, het_mask_radius=None,
                  het_normalize_target=None, het_variance_weight=None,
                  het_covariance_weight=None, het_min_std=0.1,
@@ -1165,6 +1269,10 @@ class ReconSIREN(nnx.Module):
             raise ValueError("optimization_profile must be 'legacy' or 'aggressive'")
         if heterogeneity_profile not in ("legacy", "anti_collapse"):
             raise ValueError("heterogeneity_profile must be 'legacy' or 'anti_collapse'")
+        if het_decoder_architecture not in ("lowrank", "field"):
+            raise ValueError("het_decoder_architecture must be 'lowrank' or 'field'")
+        if int(het_decoder_width) < 1:
+            raise ValueError("het_decoder_width must be positive")
         pose_head_rank = (128 if aggressive else 0) if pose_head_rank is None else int(pose_head_rank)
         pose_spatial_pool = (4 if aggressive else 1) if pose_spatial_pool is None else int(pose_spatial_pool)
         if het_encoder_architecture is None:
@@ -1251,12 +1359,21 @@ class ReconSIREN(nnx.Module):
         self.delta_volume_decoder = DeltaVolumeDecoder(coords=coords, values=values, volume_size=self.xsize,
                                                        learn_delta_volume=learn_delta_volume,
                                                        parameterization=consensus_parameterization, rngs=rngs)
-        self.delta_het_decoder = HetVolumeDecoder(
+        # Both heterogeneity decoders live under the SAME attribute name: the
+        # optimizer/parameter filters select by path, so the architecture must
+        # not move in the tree.
+        self.het_decoder_architecture = het_decoder_architecture
+        self.het_decoder_width = int(het_decoder_width)
+        het_decoder_kwargs = dict(
             coords=coords, values=values, n_gaussians=coords.shape[0], lat_dim=lat_dim,
             volume_size=self.xsize, residual_to_consensus=het_residual_to_consensus,
             center_decoder=het_center_decoder, coordinate_scale=het_coordinate_scale,
-            amplitude_scale=het_amplitude_scale, small_final_init=anti_collapse,
-            rngs=rngs)
+            amplitude_scale=het_amplitude_scale, small_final_init=anti_collapse)
+        if het_decoder_architecture == "field":
+            self.delta_het_decoder = HetFieldDecoder(
+                width=self.het_decoder_width, rngs=rngs, **het_decoder_kwargs)
+        else:
+            self.delta_het_decoder = HetVolumeDecoder(rngs=rngs, **het_decoder_kwargs)
         self.phys_decoder = PhysDecoder(self.xsize, render_chunk_size=render_chunk_size,
                                         fused_envelope=self.fused_envelope)
 
@@ -1330,13 +1447,25 @@ class ReconSIREN(nnx.Module):
 
         return images_corrected
 
-    def decode_het_volume(self, x, filter=True):
+    def _het_latent(self, x):
         if x.ndim == 4:
             _, x, _ = self.encoder_het(x)
         elif x.ndim == 3:
             _, x, _ = self.encoder_het(x[None, ...])
         elif x.ndim == 1:
             x = x[None, ...]
+        return x
+
+    def decode_het_cloud(self, x):
+        """Heterogeneous point cloud (coords, masses) for a latent or an image."""
+        x = self._het_latent(x)
+        base_coords = base_values = None
+        if self.delta_het_decoder.residual_to_consensus:
+            base_coords, base_values = self.delta_volume_decoder()
+        return self.delta_het_decoder(x, base_coords=base_coords, base_values=base_values)
+
+    def decode_het_volume(self, x, filter=True):
+        x = self._het_latent(x)
 
         base_coords = base_values = None
         if self.delta_het_decoder.residual_to_consensus:
@@ -1441,8 +1570,12 @@ def _circular_loss_mask(size, radius, dtype):
 
 def _heterogeneity_reconstruction_loss(images, targets, ctf, ctf_type,
                                        scales, weights, mask_radius,
-                                       normalize_target):
-    """Masked multiresolution reconstruction loss for conformational residuals."""
+                                       normalize_target, return_prepared=False):
+    """Masked multiresolution reconstruction loss for conformational residuals.
+
+    ``return_prepared`` also returns the full-resolution prediction/target pair
+    (already CTF-treated and normalized) so a whitened term can reuse it.
+    """
     predicted, target = _prepare_heterogeneity_images(
         images, targets, ctf, ctf_type, normalize_target)
     loss = jnp.asarray(0.0, dtype=predicted.dtype)
@@ -1453,6 +1586,8 @@ def _heterogeneity_reconstruction_loss(images, targets, ctf, ctf_type,
         squared = jnp.square(predicted_level - target_level) * mask[None, None, ...]
         loss = loss + weight * jnp.sum(squared) / (
             predicted.shape[0] * predicted.shape[1] * jnp.maximum(jnp.sum(mask), 1.0))
+    if return_prepared:
+        return loss, predicted, target
     return loss
 
 
@@ -1634,6 +1769,11 @@ def recycle_dead_points_reconsiren(graphdef, state, key, dead_fraction=0.05,
     without changing any array shape. Only valid for the 'direct' consensus
     parameterization. Stale Adam moments of moved points are left in place:
     the inflated second moment just makes their first few updates cautious.
+
+    The low-rank heterogeneity readout is indexed by point, so a recycled point
+    would otherwise arrive at its new location carrying the conformational
+    deltas learned at the old one; its 4-column block is zeroed here. The field
+    decoder is index-free and needs no reset.
     """
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
     decoder = model.delta_volume_decoder
@@ -1658,6 +1798,18 @@ def recycle_dead_points_reconsiren(graphdef, state, key, dead_fraction=0.05,
 
     decoder.delta_coords.value = jnp.where(dead[:, None], new_delta_coords, delta_coords)
     decoder.delta_values.value = jnp.where(dead, new_delta_values, delta_values)
+
+    het_decoder = model.delta_het_decoder
+    if isinstance(het_decoder, HetVolumeDecoder):
+        # Readout kernel is (lat_features, 4 * n_gaussians): point j owns the
+        # output columns 4j..4j+3.
+        readout = het_decoder.hidden[-1]
+        dead_outputs = jnp.repeat(dead, 4)
+        kernel = readout.kernel.get_value()
+        readout.kernel.value = jnp.where(dead_outputs[None, :], jnp.zeros_like(kernel), kernel)
+        if readout.bias is not None:
+            bias = readout.bias.get_value()
+            readout.bias.value = jnp.where(dead_outputs, jnp.zeros_like(bias), bias)
 
     state = nnx.state((model, optimizer_pose, optimizer_volume, optimizer_het))
     return state, jnp.sum(dead)
@@ -2022,10 +2174,22 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                 reference_coords = model.delta_het_decoder.factor * model.delta_het_decoder.coords
                 reference_values = model.delta_het_decoder.reference_values
             else:
-                recon_het_loss = _heterogeneity_reconstruction_loss(
+                recon_het_loss, het_predicted, het_target = _heterogeneity_reconstruction_loss(
                     images_het[:, None, ...], x, ctf, model.ctf_type,
                     model.het_loss_scales, model.het_loss_weights,
-                    model.het_mask_radius, model.het_normalize_target)
+                    model.het_mask_radius, model.het_normalize_target,
+                    return_prepared=True)
+                if apply_loss_whitening:
+                    # The whitening filter is built for the full box, so the
+                    # whitened term always uses the full-resolution pair - the
+                    # multiscale levels above already carry the low frequencies.
+                    whitened_het_loss = _whitened_reconstruction_loss(
+                        het_predicted, het_target, whiten_filter).mean()
+                    effective_whiten_weight = jnp.clip(
+                        jnp.asarray(whiten_weight, dtype=recon_het_loss.dtype), 0.0, 1.0)
+                    recon_het_loss = (
+                        (1.0 - effective_whiten_weight) * recon_het_loss
+                        + effective_whiten_weight * whitened_het_loss)
                 variance_loss, covariance_loss, latent_std = _latent_variance_covariance_loss(
                     latent, model.het_min_std,
                     bank=model.latent_memory_bank.get(),
@@ -2080,14 +2244,34 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             if train_heterogeneity:
                 amplitude_l1 = amplitude_l1 + jnp.mean(values_het)
             loss = loss + amplitude_l1_weight * amplitude_l1
-        if train_pose_volume and apply_geometry_priors:
-            spacing_loss, smoothness_loss = _geometry_prior_losses(
-                coords, values, neighbor_indices, std_eff)
-            loss = (loss + spacing_weight * spacing_loss
-                    + smoothness_weight * smoothness_loss)
-        if train_pose_volume and apply_support:
-            loss = loss + support_weight * _support_loss(
-                coords, values, support_center, support_radius, std_eff)
+        # Geometry/support priors constrain whatever cloud is being trained.
+        # The deformed cloud needs them at least as much as the consensus: it is
+        # the one free to tear the chain apart or fling dust out of the support,
+        # and with a frozen consensus nothing else would restrain it. The kNN
+        # graph is the consensus one - a valid neighbourhood approximation while
+        # the per-particle deltas stay small compared to the point spacing.
+        if apply_geometry_priors:
+            if train_pose_volume:
+                spacing_loss, smoothness_loss = _geometry_prior_losses(
+                    coords, values, neighbor_indices, std_eff)
+                loss = (loss + spacing_weight * spacing_loss
+                        + smoothness_weight * smoothness_loss)
+            if train_heterogeneity:
+                het_spacing_loss, het_smoothness_loss = jax.vmap(
+                    _geometry_prior_losses, in_axes=(0, 0, None, None))(
+                        coords_het[:, None, ...], values_het[:, None, ...],
+                        neighbor_indices, std_eff)
+                loss = (loss + spacing_weight * jnp.mean(het_spacing_loss)
+                        + smoothness_weight * jnp.mean(het_smoothness_loss))
+        if apply_support:
+            if train_pose_volume:
+                loss = loss + support_weight * _support_loss(
+                    coords, values, support_center, support_radius, std_eff)
+            if train_heterogeneity:
+                loss = loss + support_weight * jnp.mean(jax.vmap(
+                    _support_loss, in_axes=(0, 0, None, None, None))(
+                        coords_het[:, None, ...], values_het[:, None, ...],
+                        support_center, support_radius, std_eff))
         metrics = (recon_loss, recon_het_loss, loss_uniform,
                    candidate_coverage_loss, normalized_entropy, anchor_deviation,
                    variance_loss, covariance_loss, latent_std,
@@ -2541,6 +2725,20 @@ def main():
                         help="Multiplier for heterogeneous coordinate residuals.")
     parser.add_argument("--het_amplitude_scale", type=float, default=1.0,
                         help="Multiplier for heterogeneous amplitude residuals.")
+    parser.add_argument("--het_decoder_architecture", choices=("lowrank", "field"), default="lowrank",
+                        help=f"Heterogeneity decoder. {bcolors.BOLD}lowrank{bcolors.ENDC} (default) is the shared "
+                             f"SIREN trunk with a per-Gaussian readout: it spans at most --lat_dim GLOBAL "
+                             f"deformation modes, so a motion confined to one domain competes for the same "
+                             f"budget as whole-body motion. {bcolors.BOLD}field{bcolors.ENDC} decodes the delta as a "
+                             f"coordinate-conditioned SIREN field modulated by the latent, making local motion "
+                             f"cheap; it costs batch x n_gaussians x --het_decoder_width activations.")
+    parser.add_argument("--het_decoder_width", type=int, default=64,
+                        help="Hidden width of the 'field' heterogeneity decoder (ignored by 'lowrank').")
+    parser.add_argument("--lat_dim", type=int, default=8,
+                        help="Dimension of the heterogeneity latent space.")
+    parser.add_argument("--het_learning_rate", type=float, default=1e-4,
+                        help="Learning rate of the heterogeneity encoder and decoder. Independent of "
+                             "--learning_rate, which governs the pose encoder only.")
     parser.add_argument("--het_loss_scales", type=comma_separated_ints, default=None,
                         help="Comma-separated reconstruction sizes; default for a full-size anti-collapse "
                              "run is 64,128,full.")
@@ -2978,7 +3176,7 @@ def main():
 
     # Prepare network (ReconSIREN)
     reconsiren = ReconSIREN(coords, values, xsize, args.sr, ctf_type=args.ctf_type, symmetry_group=args.symmetry_group,
-                            refine_current_assignment=args.refine_current_assignment, lat_dim=8, sigma=sigma,
+                            refine_current_assignment=args.refine_current_assignment, lat_dim=args.lat_dim, sigma=sigma,
                             bank_size=10000, learn_delta_volume=not args.do_not_learn_volume,
                             num_components=args.num_components,
                             use_anchor_rotations=not args.do_not_use_anchor_rotations,
@@ -2998,6 +3196,8 @@ def main():
                             het_center_decoder=args.het_center_decoder,
                             het_coordinate_scale=args.het_coordinate_scale,
                             het_amplitude_scale=args.het_amplitude_scale,
+                            het_decoder_architecture=args.het_decoder_architecture,
+                            het_decoder_width=args.het_decoder_width,
                             het_loss_scales=args.het_loss_scales,
                             het_loss_weights=args.het_loss_weights,
                             het_mask_radius=args.het_mask_radius,
@@ -3143,7 +3343,7 @@ def main():
                                        volume_lr, coords_lr=coords_lr,
                                        amplitude_lr=amplitude_lr),
             wrt=params_volume)
-        optimizer_het = nnx.Optimizer(reconsiren, optax.chain(optax.clip_by_global_norm(1.0),optax.adamw(learning_rate=1e-4, eps=1e-6)), wrt=params_het)
+        optimizer_het = nnx.Optimizer(reconsiren, optax.chain(optax.clip_by_global_norm(1.0),optax.adamw(learning_rate=args.het_learning_rate, eps=1e-6)), wrt=params_het)
         heterogeneity_profile = reconsiren.heterogeneity_profile
         het_start_epoch = reconsiren.het_start_epoch
         het_freeze_consensus = reconsiren.het_freeze_consensus
@@ -3764,6 +3964,7 @@ def main():
         decode_volume = jax.jit(lambda: reconsiren.delta_volume_decoder.decode_volume(
             sigma=reconsiren.get_std(), analytic=reconsiren.fused_envelope))
         decode_het_volume = jax.jit(reconsiren.decode_het_volume)
+        decode_het_cloud = jax.jit(reconsiren.decode_het_cloud)
 
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting angular assignment / shifts... ######")
@@ -3840,6 +4041,34 @@ def main():
         for center in centers:
             decoded = decode_het_volume(center[None, ...])
             ImageHandler().write(np.array(decoded), os.path.join(args.output_path, f"reconsiren_hetmap_{idx:02d}.mrc"), overwrite=True)
+
+            # Same post-processing companions the consensus map gets: without
+            # them the heterogeneous states are the only maps still carrying the
+            # raw splat envelope and the un-equalized masses, which makes them
+            # look worse than the consensus for reasons unrelated to the states.
+            if not args.no_sharpened_map:
+                sharpened = _sharpen_gaussian_envelope(jnp.asarray(decoded[0]),
+                                                       reconsiren.get_std(),
+                                                       reg=args.sharpened_map_reg)
+                ImageHandler().write(np.array(sharpened),
+                                     os.path.join(args.output_path,
+                                                  f"reconsiren_hetmap_{idx:02d}_sharpened.mrc"),
+                                     overwrite=True)
+
+            if not args.no_equalized_map:
+                het_coords, het_values = decode_het_cloud(center[None, ...])
+                equalized_masses = _equalize_masses(het_values[0], args.equalized_map_gamma)
+                if equalized_masses is not None:
+                    equalized = _splat_cloud_volumes(
+                        het_coords + reconsiren.delta_het_decoder.factor,
+                        jnp.asarray(equalized_masses)[None, ...],
+                        reconsiren.delta_het_decoder.volume_size,
+                        sigma=reconsiren.get_std(),
+                        analytic=reconsiren.fused_envelope)
+                    ImageHandler().write(np.array(equalized[0]),
+                                         os.path.join(args.output_path,
+                                                      f"reconsiren_hetmap_{idx:02d}_equalized.mrc"),
+                                         overwrite=True)
             idx += 1
 
     # If exists, clean MMAP
