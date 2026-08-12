@@ -6,15 +6,12 @@ from flax import nnx
 
 from hax.networks.reconsiren import (
     _PoseCurriculumController,
-    _PoseDiagnosticsTracker,
     ReconSIREN,
     _assignment_probabilities,
     _candidate_coverage_loss,
     _candidate_reconstruction_losses,
     _consensus_multiscale_size_and_weight,
     _fibonacci_sphere_directions,
-    _symmetry_aware_rotation_change_degrees,
-    _top_two_candidate_diagnostics,
     train_step_reconsiren,
 )
 
@@ -83,106 +80,32 @@ def test_candidate_coverage_has_finite_direction_gradients():
     assert float(jnp.linalg.norm(gradients)) > 0.0
 
 
-def test_top_two_candidate_diagnostics_report_scale_aware_margin():
-    losses = jnp.array([[0.2, 0.5, 0.8], [3.0, 1.0, 2.0]], dtype=jnp.float32)
-    (best, absolute, relative, standardized,
-     median_normalized, score_entropy) = _top_two_candidate_diagnostics(losses)
-
-    np.testing.assert_array_equal(best, np.array([0, 1]))
-    np.testing.assert_allclose(absolute, np.array([0.3, 1.0]), atol=1e-6)
-    np.testing.assert_allclose(relative, np.array([0.6, 0.5]), atol=1e-6)
-    np.testing.assert_allclose(
-        standardized, np.array([1.2247449, 1.2247449]), atol=1e-6)
-    np.testing.assert_allclose(median_normalized, np.ones(2), atol=1e-6)
-    assert np.all(np.asarray(score_entropy) > 0.0)
-    assert np.all(np.asarray(score_entropy) < 1.0)
-
-    shifted_scaled = _top_two_candidate_diagnostics(19.0 * losses + 100.0)
-    np.testing.assert_allclose(shifted_scaled[3], standardized, atol=1e-5)
-    np.testing.assert_allclose(shifted_scaled[4], median_normalized, atol=1e-5)
-    np.testing.assert_allclose(shifted_scaled[5], score_entropy, atol=1e-5)
-
-
-def test_rotation_change_uses_closest_symmetry_equivalent_pose():
-    identity = np.eye(3, dtype=np.float32)
-    half_turn_z = np.diag([-1.0, -1.0, 1.0]).astype(np.float32)
-    symmetries = np.stack([identity, half_turn_z])
-    previous = identity[None, ...]
-    equivalent_current = half_turn_z[None, ...]
-
-    change = _symmetry_aware_rotation_change_degrees(
-        previous, equivalent_current, symmetries)
-
-    np.testing.assert_allclose(change, 0.0, atol=1e-4)
-
-
-def test_pose_diagnostics_tracker_compares_same_particles_across_epochs():
-    identity = np.eye(3, dtype=np.float32)
-    tracker = _PoseDiagnosticsTracker(2, identity[None, ...])
-    labels = np.array([0, 1])
-    rotations_epoch_zero = np.stack([identity, identity])
-    tracker.update(labels, rotations_epoch_zero, np.array([0, 1]), np.array([0, 1]),
-                   np.array([0.2, 0.3]), np.array([0.1, 0.2]),
-                   np.array([0.5, 0.6]), np.array([0.7, 0.8]),
-                   np.array([0.9, 0.85]), epoch=0)
-
-    angle = np.deg2rad(10.0)
-    ten_degrees = np.array([
-        [1.0, 0.0, 0.0],
-        [0.0, np.cos(angle), -np.sin(angle)],
-        [0.0, np.sin(angle), np.cos(angle)]], dtype=np.float32)
-    rotations_epoch_one = np.stack([ten_degrees, identity])
-    tracker.update(labels, rotations_epoch_one, np.array([2, 1]), np.array([2, 1]),
-                   np.array([0.4, 0.5]), np.array([0.3, 0.4]),
-                   np.array([0.7, 0.8]), np.array([0.9, 1.0]),
-                   np.array([0.8, 0.75]), epoch=1)
-    summary = tracker.summary()
-
-    np.testing.assert_allclose(summary["pose_change_mean_degrees"], 5.0, atol=1e-3)
-    np.testing.assert_allclose(summary["head_switch_fraction"], 0.5, atol=1e-6)
-    np.testing.assert_allclose(summary["comparison_coverage_fraction"], 1.0, atol=1e-6)
-
-
-def test_pose_curriculum_controller_advances_only_on_stability():
+def test_pose_curriculum_controller_advances_on_the_epoch_schedule():
     controller = _PoseCurriculumController(
-        320, (0.25, 0.5, 0.75), switch_threshold=0.05,
-        pose_threshold_degrees=5.0, min_epochs=1, max_epochs=0)
-    churning = {"head_switch_fraction": 0.4, "pose_change_median_degrees": 40.0}
-    stable = {"head_switch_fraction": 0.01, "pose_change_median_degrees": 2.0}
+        320, (0.25, 0.5, 0.75), min_epochs=1, max_epochs=1)
 
     assert controller.scoring_size == 80
-    # An epoch without cross-epoch churn metrics must not advance the stage.
-    assert not controller.observe_epoch({})
-    assert not controller.observe_epoch(churning)
-    assert controller.scoring_size == 80
-    assert controller.observe_epoch(stable)
+    assert controller.observe_epoch()
     assert controller.scoring_size == 160
-    assert controller.observe_epoch(stable)
+    assert controller.observe_epoch()
     assert controller.scoring_size == 240
     assert controller.multiscale_weight_multiplier > 0.0
-    assert controller.observe_epoch(stable)
+    assert controller.observe_epoch()
     assert controller.is_final
     assert controller.scoring_size == 320
     assert controller.multiscale_weight_multiplier == 0.0
-    assert not controller.observe_epoch(stable)
+    assert not controller.observe_epoch()
 
 
 def test_pose_curriculum_controller_respects_epoch_bounds_and_roundtrip():
-    stable = {"head_switch_fraction": 0.0, "pose_change_median_degrees": 0.0}
-    churning = {"head_switch_fraction": 1.0, "pose_change_median_degrees": 180.0}
-
     controller = _PoseCurriculumController(100, (0.5,), min_epochs=2, max_epochs=3)
-    assert not controller.observe_epoch(stable)
-    assert controller.observe_epoch(stable)
+    assert not controller.observe_epoch()
+    assert not controller.observe_epoch()
+    assert controller.observe_epoch()
     assert controller.is_final
 
-    controller = _PoseCurriculumController(100, (0.5,), min_epochs=1, max_epochs=3)
-    assert not controller.observe_epoch(churning)
-    assert not controller.observe_epoch(churning)
-    assert controller.observe_epoch(churning)
-
-    source = _PoseCurriculumController(100, (0.25, 0.5, 0.75))
-    source.observe_epoch(stable)
+    source = _PoseCurriculumController(100, (0.25, 0.5, 0.75), max_epochs=1)
+    source.observe_epoch()
     restored = _PoseCurriculumController(100, (0.25, 0.5, 0.75))
     restored.load_state_dict(source.state_dict())
     assert restored.stage == source.stage == 1
@@ -204,16 +127,15 @@ def test_assignment_probabilities_are_scale_invariant_and_sharpen():
 
 
 def test_pose_curriculum_controller_temperature_matches_stage():
-    stable = {"head_switch_fraction": 0.0, "pose_change_median_degrees": 0.0}
     controller = _PoseCurriculumController(
-        100, (0.25, 0.5, 0.75), temperatures=(0.3, 0.15, 0.05))
+        100, (0.25, 0.5, 0.75), max_epochs=1, temperatures=(0.3, 0.15, 0.05))
 
     assert controller.temperature == 0.3
-    controller.observe_epoch(stable)
+    controller.observe_epoch()
     assert controller.temperature == 0.15
-    controller.observe_epoch(stable)
+    controller.observe_epoch()
     assert controller.temperature == 0.05
-    controller.observe_epoch(stable)
+    controller.observe_epoch()
     assert controller.is_final
     assert controller.temperature == 0.0
 
@@ -244,32 +166,19 @@ def _tiny_reconsiren_split():
     return nnx.split((model, *optimizers))
 
 
-def test_train_step_can_return_pose_diagnostics_without_changing_metrics():
+def test_train_step_accepts_consensus_multiscale_blending():
     graphdef, state = _tiny_reconsiren_split()
     images = jax.random.normal(jax.random.PRNGKey(7), (2, 16, 16, 1))
     labels = jnp.array([0, 1])
 
-    loss, metrics, diagnostics, _, _ = train_step_reconsiren(
+    loss, metrics, _, _ = train_step_reconsiren(
         graphdef, state, images, labels, {}, jax.random.PRNGKey(8),
         consensus_multiscale_size=8, consensus_multiscale_weight=0.5,
-        train_heterogeneity=False, return_metrics=True,
-        return_pose_diagnostics=True)
+        train_heterogeneity=False, return_metrics=True)
 
     assert np.isfinite(float(loss))
-    assert len(metrics) == 21
+    assert len(metrics) == 2
     assert np.all(np.isfinite(np.asarray(metrics)))
-    np.testing.assert_allclose(metrics[12], 1.0, atol=1e-5)
-    assert 0.0 <= float(metrics[16]) <= 1.0
-    assert float(metrics[17]) >= 0.0
-    np.testing.assert_allclose(metrics[18], 0.5 * (metrics[0] + metrics[17]))
-    # Full-resolution scoring: curriculum and full losses agree exactly.
-    np.testing.assert_allclose(metrics[19], 1.0, atol=1e-6)
-    np.testing.assert_allclose(metrics[20], 0.0, atol=1e-6)
-    (winner_rotations, selected_heads, best_heads, absolute, relative,
-     standardized, median_normalized, score_entropy) = diagnostics
-    assert winner_rotations.shape == (2, 3, 3)
-    assert (selected_heads.shape == best_heads.shape == absolute.shape == relative.shape
-            == standardized.shape == median_normalized.shape == score_entropy.shape == (2,))
 
 
 def test_train_step_accepts_low_frequency_candidate_scoring():
@@ -277,16 +186,14 @@ def test_train_step_accepts_low_frequency_candidate_scoring():
     images = jax.random.normal(jax.random.PRNGKey(9), (2, 16, 16, 1))
     labels = jnp.array([0, 1])
 
-    loss, metrics, _, _, _ = train_step_reconsiren(
+    loss, metrics, _, _ = train_step_reconsiren(
         graphdef, state, images, labels, {}, jax.random.PRNGKey(10),
         candidate_scoring_size=8,
-        train_heterogeneity=False, return_metrics=True,
-        return_pose_diagnostics=True)
+        train_heterogeneity=False, return_metrics=True)
 
     assert np.isfinite(float(loss))
-    assert len(metrics) == 21
+    assert len(metrics) == 2
     assert np.all(np.isfinite(np.asarray(metrics)))
-    assert 0.0 <= float(metrics[19]) <= 1.0
 
 
 def test_train_step_supports_sampled_assignment():
@@ -294,11 +201,10 @@ def test_train_step_supports_sampled_assignment():
     images = jax.random.normal(jax.random.PRNGKey(11), (2, 16, 16, 1))
     labels = jnp.array([0, 1])
 
-    loss, metrics, _, _, _ = train_step_reconsiren(
+    loss, metrics, _, _ = train_step_reconsiren(
         graphdef, state, images, labels, {}, jax.random.PRNGKey(12),
         tau=0.3, assignment_mode="sampled", candidate_scoring_size=8,
-        train_heterogeneity=False, return_metrics=True,
-        return_pose_diagnostics=True)
+        train_heterogeneity=False, return_metrics=True)
 
     assert np.isfinite(float(loss))
     assert np.all(np.isfinite(np.asarray(metrics)))

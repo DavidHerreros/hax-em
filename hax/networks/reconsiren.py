@@ -195,170 +195,18 @@ def _assignment_probabilities(losses, temperature, adaptive=True, eps=1e-6):
     return jax.nn.softmax(-centered / temperature, axis=1)
 
 
-def _top_two_candidate_diagnostics(losses, eps=1e-8):
-    """Return complementary confidence diagnostics for candidate competition."""
-    if losses.shape[1] < 2:
-        best_indices = jnp.zeros(losses.shape[0], dtype=jnp.int32)
-        zeros = jnp.zeros(losses.shape[0], dtype=losses.dtype)
-        return best_indices, zeros, zeros, zeros, zeros, zeros
-
-    negative_top_two, top_two_indices = jax.lax.top_k(-losses, 2)
-    best_losses = -negative_top_two[:, 0]
-    second_losses = -negative_top_two[:, 1]
-    absolute_margin = jnp.maximum(second_losses - best_losses, 0.0)
-    # Historical fraction by which the best candidate improves over the
-    # runner-up.  It is retained for continuity but includes any common loss
-    # baseline, unlike the standardized diagnostics below.
-    relative_margin = absolute_margin / jnp.maximum(jnp.abs(second_losses), eps)
-    candidate_scale = jnp.std(losses, axis=1)
-    standardized_margin = absolute_margin / jnp.maximum(candidate_scale, eps)
-    median_losses = jnp.median(losses, axis=1)
-    median_separation = jnp.maximum(median_losses - best_losses, 0.0)
-    median_normalized_margin = absolute_margin / jnp.maximum(median_separation, eps)
-
-    # Unlike assignment entropy, this remains informative after switching to
-    # hard winners because it is always derived from the full loss landscape.
-    centered_losses = losses - best_losses[:, None]
-    score_probabilities = jax.nn.softmax(
-        -centered_losses / jnp.maximum(candidate_scale[:, None], eps), axis=1)
-    score_entropy = -jnp.sum(
-        score_probabilities * jnp.log(jnp.maximum(score_probabilities, eps)), axis=1)
-    score_entropy = score_entropy / jnp.maximum(
-        jnp.log(jnp.asarray(losses.shape[1], dtype=losses.dtype)), eps)
-    return (top_two_indices[:, 0], absolute_margin, relative_margin,
-            standardized_margin, median_normalized_margin, score_entropy)
-
-
-def _symmetry_aware_rotation_change_degrees(previous, current, symmetries):
-    """Minimum SO(3) geodesic change over equivalent symmetry operations."""
-    previous = np.asarray(previous)
-    current = np.asarray(current)
-    symmetries = np.asarray(symmetries)
-    equivalent_previous = np.einsum("sji,njk->nsik", symmetries, previous)
-    relative = np.einsum("nji,nsjk->nsik", current, equivalent_previous)
-    cosine = np.clip((np.trace(relative, axis1=-2, axis2=-1) - 1.0) * 0.5,
-                     -1.0, 1.0)
-    return np.rad2deg(np.min(np.arccos(cosine), axis=1))
-
-
-class _PoseDiagnosticsTracker:
-    """Host-side per-particle history used only by opt-in diagnostics."""
-
-    def __init__(self, n_particles, symmetries):
-        self.symmetries = np.asarray(symmetries)
-        self.previous_rotations = np.zeros((n_particles, 3, 3), dtype=np.float32)
-        self.previous_heads = np.full(n_particles, -1, dtype=np.int32)
-        self.previous_epochs = np.full(n_particles, -1, dtype=np.int32)
-        self.epoch = None
-        self._reset_epoch()
-
-    def _reset_epoch(self):
-        self.absolute_margins = []
-        self.relative_margins = []
-        self.standardized_margins = []
-        self.median_normalized_margins = []
-        self.score_entropies = []
-        self.selected_is_top1 = []
-        self.pose_changes = []
-        self.head_switches = []
-        self.comparable_count = 0
-        self.observed_count = 0
-
-    def update(self, labels, rotations, selected_heads, best_heads,
-               absolute_margins, relative_margins, standardized_margins,
-               median_normalized_margins, score_entropies, epoch):
-        if self.epoch != epoch:
-            self.epoch = epoch
-            self._reset_epoch()
-
-        labels = np.asarray(labels, dtype=np.int64)
-        rotations = np.asarray(rotations)
-        selected_heads = np.asarray(selected_heads, dtype=np.int32)
-        best_heads = np.asarray(best_heads, dtype=np.int32)
-        self.absolute_margins.append(np.asarray(absolute_margins))
-        self.relative_margins.append(np.asarray(relative_margins))
-        self.standardized_margins.append(np.asarray(standardized_margins))
-        self.median_normalized_margins.append(np.asarray(median_normalized_margins))
-        self.score_entropies.append(np.asarray(score_entropies))
-        self.selected_is_top1.append(selected_heads == best_heads)
-        self.observed_count += labels.size
-
-        # Compare only consecutive epochs.  This prevents a particle omitted by
-        # a dropped final batch from contributing a multi-epoch change.
-        comparable = self.previous_epochs[labels] == epoch - 1
-        if np.any(comparable):
-            comparable_labels = labels[comparable]
-            changes = _symmetry_aware_rotation_change_degrees(
-                self.previous_rotations[comparable_labels], rotations[comparable],
-                self.symmetries)
-            self.pose_changes.append(changes)
-            self.head_switches.append(
-                self.previous_heads[comparable_labels] != selected_heads[comparable])
-            self.comparable_count += comparable_labels.size
-
-        self.previous_rotations[labels] = rotations
-        self.previous_heads[labels] = selected_heads
-        self.previous_epochs[labels] = epoch
-
-    def summary(self):
-        absolute = np.concatenate(self.absolute_margins)
-        relative = np.concatenate(self.relative_margins)
-        standardized = np.concatenate(self.standardized_margins)
-        median_normalized = np.concatenate(self.median_normalized_margins)
-        score_entropy = np.concatenate(self.score_entropies)
-        selected_is_top1 = np.concatenate(self.selected_is_top1)
-        summary = {
-            "absolute_margin_mean": float(np.mean(absolute)),
-            "relative_margin_mean": float(np.mean(relative)),
-            "relative_margin_median": float(np.median(relative)),
-            "relative_margin_p10": float(np.percentile(relative, 10.0)),
-            "relative_margin_below_1pct": float(np.mean(relative < 0.01)),
-            "relative_margin_below_5pct": float(np.mean(relative < 0.05)),
-            "relative_margin_below_10pct": float(np.mean(relative < 0.10)),
-            "standardized_margin_mean": float(np.mean(standardized)),
-            "standardized_margin_median": float(np.median(standardized)),
-            "standardized_margin_p10": float(np.percentile(standardized, 10.0)),
-            "standardized_margin_below_0_1": float(np.mean(standardized < 0.1)),
-            "standardized_margin_below_0_25": float(np.mean(standardized < 0.25)),
-            "standardized_margin_below_0_5": float(np.mean(standardized < 0.5)),
-            "median_normalized_margin_mean": float(np.mean(median_normalized)),
-            "median_normalized_margin_median": float(np.median(median_normalized)),
-            "candidate_score_entropy_mean": float(np.mean(score_entropy)),
-            "selected_is_top1_fraction": float(np.mean(selected_is_top1)),
-            "comparison_coverage_fraction": (
-                float(self.comparable_count / self.observed_count)
-                if self.observed_count else 0.0),
-        }
-        if self.pose_changes:
-            changes = np.concatenate(self.pose_changes)
-            switches = np.concatenate(self.head_switches)
-            summary.update({
-                "pose_change_mean_degrees": float(np.mean(changes)),
-                "pose_change_median_degrees": float(np.median(changes)),
-                "pose_change_p90_degrees": float(np.percentile(changes, 90.0)),
-                "pose_change_over_5deg_fraction": float(np.mean(changes > 5.0)),
-                "pose_change_over_15deg_fraction": float(np.mean(changes > 15.0)),
-                "pose_change_over_30deg_fraction": float(np.mean(changes > 30.0)),
-                "head_switch_fraction": float(np.mean(switches)),
-            })
-        return summary
-
-
 class _PoseCurriculumController:
-    """Advance the candidate scoring resolution when winner churn settles.
+    """Advance the candidate scoring resolution on a staged epoch schedule.
 
-    Unlike a fixed epoch schedule, each low-pass stage is held until the
-    per-particle winners are stable at that resolution: the frequency band
-    widens only once it stops changing the decisions it feeds.
+    Each low-pass stage is held for a fixed number of epochs before the
+    frequency band widens, so scoring resolution, assignment temperature and
+    the multiscale blend all move together.
     """
 
-    def __init__(self, image_size, scales, switch_threshold=0.05,
-                 pose_threshold_degrees=5.0, min_epochs=1, max_epochs=10,
+    def __init__(self, image_size, scales, min_epochs=1, max_epochs=10,
                  temperatures=None):
         self.image_size = int(image_size)
         self.scales = tuple(float(scale) for scale in scales)
-        self.switch_threshold = float(switch_threshold)
-        self.pose_threshold_degrees = float(pose_threshold_degrees)
         self.min_epochs = max(1, int(min_epochs))
         self.max_epochs = max(0, int(max_epochs))
         if temperatures is None:
@@ -397,21 +245,14 @@ class _PoseCurriculumController:
             return 0.0
         return 1.0 - self.stage / (len(self.scales) + 1)
 
-    def observe_epoch(self, summary):
-        """Consume one finished epoch's pose-diagnostics summary; return True on advance."""
+    def observe_epoch(self):
+        """Consume one finished epoch; return True when the stage advances."""
         if self.is_final:
             return False
         self.epochs_in_stage += 1
         if self.epochs_in_stage < self.min_epochs:
             return False
-        # The first observed epoch has no cross-epoch comparison yet; the
-        # defaults keep the stage until churn is actually measured.
-        stable = (
-            summary.get("head_switch_fraction", 1.0) <= self.switch_threshold
-            and summary.get("pose_change_median_degrees", 180.0)
-            <= self.pose_threshold_degrees)
-        capped = 0 < self.max_epochs <= self.epochs_in_stage
-        if stable or capped:
+        if 0 < self.max_epochs <= self.epochs_in_stage:
             self.stage += 1
             self.epochs_in_stage = 0
             return True
@@ -1933,8 +1774,7 @@ def _consensus_multiscale_size_and_weight(
                                    "consensus_multiscale_size",
                                    "apply_loss_whitening", "apply_amplitude_l1",
                                    "apply_geometry_priors", "apply_support",
-                                   "train_pose_volume", "train_heterogeneity", "return_metrics",
-                                   "return_pose_diagnostics"),
+                                   "train_pose_volume", "train_heterogeneity", "return_metrics"),
          donate_argnums=(1,))
 def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           use_tau=False, assignment_mode="hard", lambda_uniform=0.1,
@@ -1962,7 +1802,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           support_radius=0.0,
                           support_weight=0.0,
                           train_pose_volume=True, train_heterogeneity=True,
-                          return_metrics=False, return_pose_diagnostics=False):
+                          return_metrics=False):
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
     scoring_size = (model.xsize if candidate_scoring_size <= 0
                     else min(int(candidate_scoring_size), model.xsize))
@@ -1990,15 +1830,6 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         # the cloud cannot burn in fine detail while poses are still coarse.
         std_eff = jnp.sqrt(jnp.square(model.get_std()) + jnp.square(extra_blur))
 
-        anchor_deviation = jnp.asarray(0.0, dtype=rotations.dtype)
-        if (model.encoder_pose.use_anchor_rotations
-                and not model.encoder_pose.refine_current_assignment):
-            anchor_directions = model.encoder_pose.anchor_rotations[:, :, 2]
-            direction_dot = jnp.sum(
-                rotations[..., :, 2] * anchor_directions[None, ...], axis=-1)
-            anchor_deviation = jnp.mean(jnp.rad2deg(
-                jnp.arccos(jnp.clip(direction_dot, -1.0, 1.0))))
-
         # Refine current assignment (if provided)
         # rotations = jnp.matmul(rotations, current_rotations[:, None, :, :])
         rotations = jnp.matmul(current_rotations[:, None, :, :], rotations)  # TODO: The two options seem to work?
@@ -2012,8 +1843,6 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         # optional coarse screen remains available once full-resolution scoring
         # resumes, and is disabled during legacy stochastic exploration.
         rotations_eval, shifts_eval = rotations, shifts
-        candidate_head_indices = jnp.broadcast_to(
-            jnp.arange(rotations.shape[1], dtype=jnp.int32), rotations.shape[:2])
         if (not use_tau and assignment_mode == "hard"
                 and scoring_size >= model.xsize
                 and model.coarse_topk < rotations.shape[1]):
@@ -2037,7 +1866,6 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             _, top_indices = jax.lax.top_k(-coarse_losses, model.coarse_topk)
             rotations_eval = _gather_candidates(rotations, top_indices)
             shifts_eval = _gather_candidates(shifts, top_indices)
-            candidate_head_indices = top_indices
 
         # The global competition never carries gradients through candidate
         # scoring.  Only its selected pose is rerendered into the consensus.
@@ -2065,32 +1893,10 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             responsibilities = jax.nn.one_hot(
                 min_indices, candidate_losses.shape[1], dtype=candidate_losses.dtype)
 
-        scoring_best_indices = jnp.argmin(candidate_losses, axis=1)
-        full_best_indices = jnp.argmin(full_candidate_losses, axis=1)
-        low_frequency_full_agreement = jnp.mean(
-            scoring_best_indices == full_best_indices)
-        full_scale = jnp.maximum(jnp.std(full_candidate_losses, axis=1), 1e-8)
         batch_indices = jnp.arange(x.shape[0])
-        low_frequency_full_disadvantage_std = jnp.mean(
-            (full_candidate_losses[batch_indices, scoring_best_indices]
-             - full_candidate_losses[batch_indices, full_best_indices]) / full_scale)
-
-        if return_pose_diagnostics:
-            (best_indices, absolute_margin, relative_margin, standardized_margin,
-             median_normalized_margin, candidate_score_entropy) = (
-                _top_two_candidate_diagnostics(candidate_losses))
-        else:
-            best_indices = jnp.argmin(candidate_losses, axis=1)
-            diagnostic_zeros = jnp.zeros(candidate_losses.shape[0], dtype=x.dtype)
-            (absolute_margin, relative_margin, standardized_margin,
-             median_normalized_margin, candidate_score_entropy) = (diagnostic_zeros,) * 5
-        selected_head_indices = candidate_head_indices[batch_indices, min_indices]
-        best_head_indices = candidate_head_indices[batch_indices, best_indices]
 
         rotations_selected = rotations_eval[batch_indices, min_indices][:, None, ...]
         shifts_selected = shifts_eval[batch_indices, min_indices][:, None, ...]
-        projection_rms = jnp.asarray(0.0, dtype=x.dtype)
-        normalized_target_rms = jnp.asarray(0.0, dtype=x.dtype)
         low_frequency_recon_loss = jnp.asarray(0.0, dtype=x.dtype)
         reconstruction_objective = jnp.asarray(0.0, dtype=x.dtype)
         if train_pose_volume:
@@ -2098,15 +1904,12 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                 x, values, coords, model.xsize, rotations_selected, shifts_selected,
                 ctf, model.ctf_type, std_eff)
             # The prepared pair is free (already-computed intermediates); the
-            # whitened loss and the diagnostics both reuse it.
+            # whitened loss reuses it.
             selected_losses, selected_predicted, selected_target = (
                 _candidate_reconstruction_losses(
                     selected_images, x, ctf, model.ctf_type,
                     return_prepared=True))
             recon_loss = selected_losses.mean()
-            if return_pose_diagnostics:
-                projection_rms = jnp.sqrt(jnp.mean(jnp.square(selected_predicted)))
-                normalized_target_rms = jnp.sqrt(jnp.mean(jnp.square(selected_target)))
             full_band_recon_loss = recon_loss
             if apply_loss_whitening:
                 whitened_recon_loss = _whitened_reconstruction_loss(
@@ -2132,16 +1935,6 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             low_frequency_recon_loss = recon_loss
             reconstruction_objective = recon_loss
 
-        consensus_amplitude_mean = jnp.asarray(0.0, dtype=x.dtype)
-        consensus_amplitude_rms = jnp.asarray(0.0, dtype=x.dtype)
-        consensus_amplitude_max = jnp.asarray(0.0, dtype=x.dtype)
-        consensus_active_amplitude_fraction = jnp.asarray(0.0, dtype=x.dtype)
-        if return_pose_diagnostics:
-            consensus_amplitude_mean = jnp.mean(values)
-            consensus_amplitude_rms = jnp.sqrt(jnp.mean(jnp.square(values)))
-            consensus_amplitude_max = jnp.max(values)
-            consensus_active_amplitude_fraction = jnp.mean(values > 1e-8)
-
         min_indices_het = jnp.argmin(candidate_losses, axis=1)
         rotations_het = rotations_eval[jnp.arange(x.shape[0]), min_indices_het, :][:, None, ...]
         shifts_het = shifts_eval[jnp.arange(x.shape[0]), min_indices_het, :][:, None, ...]
@@ -2151,9 +1944,6 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         recon_het_loss = jnp.asarray(0.0, dtype=x.dtype)
         variance_loss = jnp.asarray(0.0, dtype=x.dtype)
         covariance_loss = jnp.asarray(0.0, dtype=x.dtype)
-        latent_std = jnp.asarray(0.0, dtype=x.dtype)
-        coordinate_rms = jnp.asarray(0.0, dtype=x.dtype)
-        amplitude_rms = jnp.asarray(0.0, dtype=x.dtype)
 
         if train_heterogeneity:
             _, latent, _ = model.encoder_het(x_ctf_corrected, rngs=distributions_key)
@@ -2172,10 +1962,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                 recon_het_loss = _candidate_reconstruction_losses(
                     images_het[:, None, ...], x, ctf, model.ctf_type,
                     normalize_target=False).mean()
-                variance_loss, covariance_loss, latent_std = _latent_variance_covariance_loss(
+                variance_loss, covariance_loss, _ = _latent_variance_covariance_loss(
                     latent, model.het_min_std)
-                reference_coords = model.delta_het_decoder.factor * model.delta_het_decoder.coords
-                reference_values = model.delta_het_decoder.reference_values
             else:
                 recon_het_loss, het_predicted, het_target = _heterogeneity_reconstruction_loss(
                     images_het[:, None, ...], x, ctf, model.ctf_type,
@@ -2193,15 +1981,11 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                     recon_het_loss = (
                         (1.0 - effective_whiten_weight) * recon_het_loss
                         + effective_whiten_weight * whitened_het_loss)
-                variance_loss, covariance_loss, latent_std = _latent_variance_covariance_loss(
+                variance_loss, covariance_loss, _ = _latent_variance_covariance_loss(
                     latent, model.het_min_std,
                     bank=model.latent_memory_bank.get(),
                     bank_count=model.latent_bank_count.get_value())
-                reference_coords, reference_values = base_coords, base_values
 
-            coordinate_rms = jnp.sqrt(jnp.mean(jnp.square(coords_het - reference_coords)))
-            amplitude_rms = jnp.sqrt(jnp.mean(jnp.square(values_het - reference_values)))
-        
         # Keep proposal and selected-pose distributions separate.  The legacy
         # SWD remains available, while the higher-resolution bank-aware loss
         # below distinguishes dense coverage from repeated anchor locations.
@@ -2224,11 +2008,6 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                 kappa=candidate_coverage_kappa,
                 bank_samples=candidate_bank_samples,
                 bank_mix=candidate_bank_mix)
-
-        normalized_entropy = -jnp.mean(jnp.sum(
-            responsibilities * jnp.log(jnp.maximum(responsibilities, 1e-12)), axis=1))
-        normalized_entropy = normalized_entropy / jnp.maximum(
-            jnp.log(jnp.asarray(responsibilities.shape[1], responsibilities.dtype)), 1.0)
 
         loss = jnp.asarray(0.0, dtype=recon_loss.dtype)
         if train_pose_volume:
@@ -2275,23 +2054,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                     _support_loss, in_axes=(0, 0, None, None, None))(
                         coords_het[:, None, ...], values_het[:, None, ...],
                         support_center, support_radius, std_eff))
-        metrics = (recon_loss, recon_het_loss, loss_uniform,
-                   candidate_coverage_loss, normalized_entropy, anchor_deviation,
-                   variance_loss, covariance_loss, latent_std,
-                   coordinate_rms, amplitude_rms, projection_rms,
-                   normalized_target_rms, consensus_amplitude_mean,
-                   consensus_amplitude_rms, consensus_amplitude_max,
-                   consensus_active_amplitude_fraction,
-                   low_frequency_recon_loss,
-                   reconstruction_objective,
-                   low_frequency_full_agreement,
-                   low_frequency_full_disadvantage_std)
-        pose_diagnostics = tuple(jax.lax.stop_gradient(value) for value in (
-            rotations_selected[:, 0], selected_head_indices, best_head_indices,
-            absolute_margin, relative_margin, standardized_margin,
-            median_normalized_margin, candidate_score_entropy))
-        return loss, (metrics, candidate_directions, winner_directions, latent,
-                      pose_diagnostics)
+        metrics = (recon_loss, recon_het_loss)
+        return loss, (metrics, candidate_directions, winner_directions, latent)
 
     # Optimizer parameters
     params_pose = nnx.All(nnx.Param, nnx.PathContains('encoder_pose'))
@@ -2341,8 +2105,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
     grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, (params_pose, params_volume, params_het)), has_aux=True)
-    (loss, (metrics, candidate_directions, winner_directions, latent,
-            pose_diagnostics)), grads_combined = grad_fn(model, x)
+    (loss, (metrics, candidate_directions, winner_directions,
+            latent)), grads_combined = grad_fn(model, x)
 
     grads_pose, grads_volume, grads_het = grads_combined.split(params_pose, params_volume, params_het)
 
@@ -2370,8 +2134,6 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
     state = nnx.state((model, optimizer_pose, optimizer_volume, optimizer_het))
 
     if return_metrics:
-        if return_pose_diagnostics:
-            return loss, metrics, pose_diagnostics, state, key
         return loss, metrics, state, key
     return loss, metrics[0], state, key
 
@@ -2689,24 +2451,17 @@ def main():
                         default=(0.25, 0.5, 0.75),
                         help="Comma-separated image-size fractions used as adaptive curriculum stages before "
                              "full resolution is restored.")
-    parser.add_argument("--pose_curriculum_switch_threshold", type=float, default=0.05,
-                        help="Winner head-switch fraction at or below which a curriculum stage may advance.")
-    parser.add_argument("--pose_curriculum_pose_threshold", type=float, default=5.0,
-                        help="Median winner pose change (degrees) at or below which a curriculum stage may advance.")
     parser.add_argument("--pose_curriculum_min_epochs", type=int, default=1,
                         help="Minimum epochs spent in each curriculum stage before it may advance.")
     parser.add_argument("--pose_curriculum_max_epochs", type=int, default=10,
-                        help="Epochs after which a curriculum stage advances even if winners are still "
-                             "churning; 0 waits for stability indefinitely.")
+                        help="Epochs spent in each curriculum stage before it advances. Must be at least 1 "
+                             "and at least --pose_curriculum_min_epochs.")
     parser.add_argument("--pose_curriculum_temperatures", type=comma_separated_floats,
                         default=(0.3, 0.15, 0.05),
                         help="Dimensionless assignment temperatures per adaptive curriculum stage (a single "
                              "value applies to every stage). Winners are sampled from margin-aware "
                              "responsibilities instead of taken by argmin; the final full-resolution stage "
                              "is always hard. 0 disables sampling for clean A/B runs.")
-    parser.add_argument("--pose_diagnostics", action="store_true",
-                        help="Track per-particle winner rotations and top-two loss margins. Adds a small "
-                             "device-to-host transfer per batch but does not affect training.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Optional reproducible seed for Gaussian-cloud and network initialization.")
     parser.add_argument("--heterogeneity_profile", choices=("legacy", "anti_collapse"),
@@ -2930,17 +2685,12 @@ def main():
             args.candidate_frequency_scales,
             args.candidate_frequency_scales[1:])):
         parser.error("--candidate_frequency_scales must be strictly increasing")
-    if not 0.0 <= args.pose_curriculum_switch_threshold <= 1.0:
-        parser.error("--pose_curriculum_switch_threshold must be in [0,1]")
-    if args.pose_curriculum_pose_threshold < 0.0:
-        parser.error("--pose_curriculum_pose_threshold must be non-negative")
     if args.pose_curriculum_min_epochs < 1:
         parser.error("--pose_curriculum_min_epochs must be at least 1")
-    if args.pose_curriculum_max_epochs < 0:
-        parser.error("--pose_curriculum_max_epochs must be non-negative")
-    if (args.pose_curriculum_max_epochs
-            and args.pose_curriculum_max_epochs < args.pose_curriculum_min_epochs):
-        parser.error("--pose_curriculum_max_epochs must be 0 or >= --pose_curriculum_min_epochs")
+    if args.pose_curriculum_max_epochs < 1:
+        parser.error("--pose_curriculum_max_epochs must be at least 1")
+    if args.pose_curriculum_max_epochs < args.pose_curriculum_min_epochs:
+        parser.error("--pose_curriculum_max_epochs must be >= --pose_curriculum_min_epochs")
     if (not args.pose_curriculum_temperatures
             or any(value < 0.0 for value in args.pose_curriculum_temperatures)):
         parser.error("--pose_curriculum_temperatures values must be non-negative")
@@ -3367,22 +3117,11 @@ def main():
         knn_indices = None
         support_center_value = None
         support_radius_value = None
-        previous_cloud_coords = None
-        previous_cloud_values = None
         intermediate_equalized_enabled = (not args.no_equalized_map
                                           and not args.do_not_learn_volume)
-        # The adaptive curriculum is gated on winner stability, so it needs the
-        # per-particle tracker even when the extra TensorBoard panels are off.
-        pose_diagnostics_enabled = (args.pose_diagnostics
-                                    or args.pose_curriculum == "adaptive")
-        pose_diagnostics_tracker = (
-            _PoseDiagnosticsTracker(len(generator.md), reconsiren.symmetry_matrices)
-            if pose_diagnostics_enabled else None)
         pose_curriculum_controller = (
             _PoseCurriculumController(
                 xsize, args.candidate_frequency_scales,
-                switch_threshold=args.pose_curriculum_switch_threshold,
-                pose_threshold_degrees=args.pose_curriculum_pose_threshold,
                 min_epochs=args.pose_curriculum_min_epochs,
                 max_epochs=args.pose_curriculum_max_epochs,
                 temperatures=args.pose_curriculum_temperatures)
@@ -3426,42 +3165,16 @@ def main():
                 epoch_index = total_steps // steps_per_epoch
 
                 if total_steps % steps_per_epoch == 0:
-                    # Let the adaptive curriculum consume the finished epoch's
-                    # winner-stability summary before the tracker resets.
+                    # Let the adaptive curriculum consume the finished epoch.
                     stage_advanced = False
                     if (pose_curriculum_controller is not None
-                            and pose_diagnostics_tracker is not None
-                            and pose_diagnostics_tracker.absolute_margins
                             and total_steps > 1500):
-                        if pose_curriculum_controller.observe_epoch(
-                                pose_diagnostics_tracker.summary()):
+                        if pose_curriculum_controller.observe_epoch():
                             stage_advanced = True
                             new_size = pose_curriculum_controller.scoring_size
                             print(f"\n{bcolors.OKCYAN}Pose curriculum advanced to stage "
                                   f"{pose_curriculum_controller.stage}: scoring candidates "
                                   f"at {new_size}/{xsize} pixels{bcolors.ENDC}")
-
-                    # Cloud motion diagnostic (taken BEFORE recycling so the
-                    # teleports don't pollute it): per-epoch RMS displacement
-                    # in voxels and mean amplitude, the observables that
-                    # calibrate the direct-mode learning rates.
-                    reconsiren_cloud, _, _, _ = nnx.merge(graphdef, state)
-                    cloud_coords_now, cloud_values_now = decode_cloud(reconsiren_cloud)
-                    cloud_coords_now = np.asarray(cloud_coords_now[0], np.float32)
-                    cloud_values_now = np.asarray(cloud_values_now[0], np.float32)
-                    if previous_cloud_coords is not None:
-                        rms_displacement = float(np.sqrt(np.mean(np.sum(
-                            np.square(cloud_coords_now - previous_cloud_coords), axis=-1))))
-                        amplitude_drift = float(np.sqrt(np.mean(np.square(
-                            cloud_values_now - previous_cloud_values))))
-                        writer.add_scalar("Cloud RMS displacement (voxels/epoch)",
-                                          rms_displacement, epoch_index)
-                        writer.add_scalar("Cloud amplitude RMS drift (per epoch)",
-                                          amplitude_drift, epoch_index)
-                        writer.add_scalar("Cloud mean amplitude",
-                                          float(np.mean(cloud_values_now)), epoch_index)
-                    previous_cloud_coords = cloud_coords_now
-                    previous_cloud_values = cloud_values_now
 
                     # Refresh the geometry state from the live cloud: recycle
                     # dead points on schedule, then rebuild the kNN graph and
@@ -3505,25 +3218,6 @@ def main():
                     total_loss = 0
                     total_recon_loss = 0
                     total_recon_het_loss = 0
-                    total_candidate_coverage_loss = 0
-                    total_assignment_entropy = 0
-                    total_anchor_deviation = 0
-                    total_variance_loss = 0
-                    total_covariance_loss = 0
-                    total_latent_std = 0
-                    total_coordinate_rms = 0
-                    total_amplitude_rms = 0
-                    total_projection_rms = 0
-                    total_normalized_target_rms = 0
-                    total_consensus_amplitude_mean = 0
-                    total_consensus_amplitude_rms = 0
-                    total_consensus_amplitude_max = 0
-                    total_consensus_active_amplitude_fraction = 0
-                    total_low_frequency_recon_loss = 0
-                    total_reconstruction_objective = 0
-                    total_frequency_full_agreement = 0
-                    total_frequency_full_disadvantage_std = 0
-                    projection_diagnostic_steps = 0
                     total_validation_loss = 0
 
                     # For progress bar (TQDM)
@@ -3565,15 +3259,17 @@ def main():
                         with logger.section():
                             reconsiren, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
 
-                            # Plot candidates and winners independently.  Counts
+                            # Plot winners and candidates independently.  Counts
                             # avoid displaying the zero-initialized bank tail.
                             angular_banks = (
-                                ("candidates", reconsiren.memory_bank.get(),
-                                 reconsiren.candidate_bank_count.get_value()),
-                                ("winners", reconsiren.winner_memory_bank.get(),
+                                ("Angular distribution density",
+                                 reconsiren.winner_memory_bank.get(),
                                  reconsiren.winner_bank_count.get_value()),
+                                ("Angular distribution density (candidates)",
+                                 reconsiren.memory_bank.get(),
+                                 reconsiren.candidate_bank_count.get_value()),
                             )
-                            for scope, bank, count in angular_banks:
+                            for title, bank, count in angular_banks:
                                 n_valid = int(count)
                                 if n_valid == 0:
                                     continue
@@ -3584,9 +3280,7 @@ def main():
                                 alpha = jnp.arctan2(dir_y, dir_x)
                                 euler_angles = jnp.stack([alpha, beta], axis=-1)
                                 fig, _ = plot_angular_distribution(euler_angles)
-                                writer.add_figure(
-                                    f"Angular distribution density ({scope})",
-                                    fig, global_step=i)
+                                writer.add_figure(title, fig, global_step=i)
 
                             decoded_centers = []
                             if epoch_index >= het_start_epoch:
@@ -3707,7 +3401,7 @@ def main():
                 train_pose_volume = not (
                     heterogeneity_profile == "anti_collapse"
                     and train_heterogeneity and het_freeze_consensus)
-                train_result = train_step_reconsiren(
+                loss, metrics, state, rng = train_step_reconsiren(
                     graphdef, state, x, labels, md_columns, rng,
                     lambda_uniform=uniform_weight, tau=tau, use_tau=use_tau,
                     assignment_mode=assignment_mode,
@@ -3736,52 +3430,11 @@ def main():
                     support_weight=args.support_weight,
                     train_pose_volume=train_pose_volume,
                     train_heterogeneity=train_heterogeneity,
-                    return_metrics=True,
-                    return_pose_diagnostics=pose_diagnostics_enabled)
-                if pose_diagnostics_enabled:
-                    loss, metrics, pose_diagnostics, state, rng = train_result
-                    (winner_rotations, selected_heads, best_heads,
-                     absolute_margins, relative_margins, standardized_margins,
-                     median_normalized_margins, score_entropies) = pose_diagnostics
-                    pose_diagnostics_tracker.update(
-                        labels, winner_rotations, selected_heads, best_heads,
-                        absolute_margins, relative_margins, standardized_margins,
-                        median_normalized_margins, score_entropies, epoch_index)
-                else:
-                    loss, metrics, state, rng = train_result
-                (recon_loss, recon_het_loss, loss_uniform, candidate_coverage_loss,
-                 assignment_entropy, anchor_deviation, variance_loss,
-                 covariance_loss, latent_std, coordinate_rms, amplitude_rms,
-                 projection_rms, normalized_target_rms, consensus_amplitude_mean,
-                 consensus_amplitude_rms, consensus_amplitude_max,
-                 consensus_active_amplitude_fraction,
-                 low_frequency_recon_loss,
-                 reconstruction_objective,
-                 frequency_full_agreement,
-                 frequency_full_disadvantage_std) = metrics
+                    return_metrics=True)
+                recon_loss, recon_het_loss = metrics
                 total_loss += loss
                 total_recon_loss += recon_loss
                 total_recon_het_loss += recon_het_loss
-                total_candidate_coverage_loss += candidate_coverage_loss
-                total_assignment_entropy += assignment_entropy
-                total_anchor_deviation += anchor_deviation
-                total_variance_loss += variance_loss
-                total_covariance_loss += covariance_loss
-                total_latent_std += latent_std
-                total_coordinate_rms += coordinate_rms
-                total_amplitude_rms += amplitude_rms
-                total_consensus_amplitude_mean += consensus_amplitude_mean
-                total_consensus_amplitude_rms += consensus_amplitude_rms
-                total_consensus_amplitude_max += consensus_amplitude_max
-                total_consensus_active_amplitude_fraction += consensus_active_amplitude_fraction
-                total_low_frequency_recon_loss += low_frequency_recon_loss
-                total_reconstruction_objective += reconstruction_objective
-                total_frequency_full_agreement += frequency_full_agreement
-                total_frequency_full_disadvantage_std += frequency_full_disadvantage_std
-                if train_pose_volume:
-                    total_projection_rms += projection_rms
-                    total_normalized_target_rms += normalized_target_rms
-                    projection_diagnostic_steps += 1
 
                 # Summary writer (training loss)
                 if logger.should_log_scalars(step):
@@ -3798,120 +3451,12 @@ def main():
                                         "heterogeneity": mean_recon_het_loss},
                                        i * steps_per_epoch + step)
 
-                    writer.add_scalars('Heterogeneity diagnostics (ReconSIREN)',
-                                       {"latent_std": float(total_latent_std) / step,
-                                        "coordinate_rms": float(total_coordinate_rms) / step,
-                                        "amplitude_rms": float(total_amplitude_rms) / step,
-                                        "variance_penalty": float(total_variance_loss) / step,
-                                        "covariance_penalty": float(total_covariance_loss) / step},
-                                       i * steps_per_epoch + step)
-
-                    writer.add_scalars('Pose exploration diagnostics (ReconSIREN)',
-                                       {"assignment_entropy": float(total_assignment_entropy) / step,
-                                        "candidate_coverage_kl": float(total_candidate_coverage_loss) / step,
-                                        "mean_anchor_deviation_degrees": float(total_anchor_deviation) / step,
-                                        "temperature": float(tau),
-                                        "candidate_coverage_weight": float(candidate_coverage_weight)},
-                                       i * steps_per_epoch + step)
-
-                    writer.add_scalars(
-                        'Selected reconstruction curriculum (ReconSIREN)',
-                        {"full_resolution_loss": mean_recon_loss,
-                         "low_frequency_loss": (
-                             float(total_low_frequency_recon_loss) / step),
-                         "blended_objective": (
-                             float(total_reconstruction_objective) / step),
-                         "low_frequency_weight": float(consensus_multiscale_weight),
-                         "loss_resolution_pixels": float(consensus_multiscale_size),
-                         "loss_resolution_fraction": (
-                             float(consensus_multiscale_size) / xsize),
-                         "active": float(consensus_multiscale_weight > 0.0)},
-                        i * steps_per_epoch + step)
-
-                    curriculum_scalars = {
-                        "scoring_resolution_pixels": float(candidate_scoring_size),
-                        "scoring_resolution_fraction": (
-                            float(candidate_scoring_size) / xsize),
-                        "low_frequency_full_winner_agreement": (
-                            float(total_frequency_full_agreement) / step),
-                        "selected_full_loss_disadvantage_std": (
-                            float(total_frequency_full_disadvantage_std) / step),
-                        "active": float(candidate_scoring_size < xsize)}
                     if pose_curriculum_controller is not None:
-                        curriculum_scalars["stage"] = float(
-                            pose_curriculum_controller.stage)
-                        curriculum_scalars["epochs_in_stage"] = float(
-                            pose_curriculum_controller.epochs_in_stage)
-                    writer.add_scalars(
-                        'Candidate frequency curriculum (ReconSIREN)',
-                        curriculum_scalars,
-                        i * steps_per_epoch + step)
-
-                    if args.pose_diagnostics and pose_diagnostics_tracker is not None:
-                        pose_summary = pose_diagnostics_tracker.summary()
-                        writer.add_scalars(
-                            'Winner standardized confidence (ReconSIREN)',
-                            {"margin_over_candidate_std_mean": pose_summary["standardized_margin_mean"],
-                             "margin_over_candidate_std_median": pose_summary["standardized_margin_median"],
-                             "margin_over_candidate_std_p10": pose_summary["standardized_margin_p10"],
-                             "margin_below_0.1_std": pose_summary["standardized_margin_below_0_1"],
-                             "margin_below_0.25_std": pose_summary["standardized_margin_below_0_25"],
-                             "margin_below_0.5_std": pose_summary["standardized_margin_below_0_5"],
-                             "candidate_score_entropy": pose_summary["candidate_score_entropy_mean"]},
-                            i * steps_per_epoch + step)
-                        writer.add_scalars(
-                            'Winner margin over available separation (ReconSIREN)',
-                            {"mean": pose_summary["median_normalized_margin_mean"],
-                             "median": pose_summary["median_normalized_margin_median"]},
-                            i * steps_per_epoch + step)
-                        writer.add_scalars(
-                            'Winner loss confidence (ReconSIREN)',
-                            {"relative_margin_mean": pose_summary["relative_margin_mean"],
-                             "relative_margin_median": pose_summary["relative_margin_median"],
-                             "relative_margin_p10": pose_summary["relative_margin_p10"],
-                             "ambiguous_below_1pct": pose_summary["relative_margin_below_1pct"],
-                             "ambiguous_below_5pct": pose_summary["relative_margin_below_5pct"],
-                             "ambiguous_below_10pct": pose_summary["relative_margin_below_10pct"],
-                             "selected_is_top1_fraction": pose_summary["selected_is_top1_fraction"]},
-                            i * steps_per_epoch + step)
-                        writer.add_scalar(
-                            'Winner top1-top2 absolute loss margin (ReconSIREN)',
-                            pose_summary["absolute_margin_mean"],
-                            i * steps_per_epoch + step)
-                        writer.add_scalars(
-                            'Consensus Gaussian amplitude scale (ReconSIREN)',
-                            {"mean": float(total_consensus_amplitude_mean) / step,
-                             "rms": float(total_consensus_amplitude_rms) / step,
-                             "max": float(total_consensus_amplitude_max) / step,
-                             "active_fraction": float(total_consensus_active_amplitude_fraction) / step},
-                            i * steps_per_epoch + step)
-                        if projection_diagnostic_steps:
-                            mean_projection_rms = (
-                                float(total_projection_rms) / projection_diagnostic_steps)
-                            mean_target_rms = (
-                                float(total_normalized_target_rms) / projection_diagnostic_steps)
-                            writer.add_scalars(
-                                'Selected projection scale (ReconSIREN)',
-                                {"prediction_rms": mean_projection_rms,
-                                 "normalized_target_rms": mean_target_rms,
-                                 "prediction_to_target_rms": (
-                                     mean_projection_rms / max(mean_target_rms, 1e-8))},
-                                i * steps_per_epoch + step)
-                        if "pose_change_mean_degrees" in pose_summary:
-                            writer.add_scalars(
-                                'Winner pose change degrees (ReconSIREN)',
-                                {"mean": pose_summary["pose_change_mean_degrees"],
-                                 "median": pose_summary["pose_change_median_degrees"],
-                                 "p90": pose_summary["pose_change_p90_degrees"]},
-                                i * steps_per_epoch + step)
-                            writer.add_scalars(
-                                'Winner instability fractions (ReconSIREN)',
-                                {"pose_change_over_5deg": pose_summary["pose_change_over_5deg_fraction"],
-                                 "pose_change_over_15deg": pose_summary["pose_change_over_15deg_fraction"],
-                                 "pose_change_over_30deg": pose_summary["pose_change_over_30deg_fraction"],
-                                 "head_switch": pose_summary["head_switch_fraction"],
-                                 "comparison_coverage": pose_summary["comparison_coverage_fraction"]},
-                                i * steps_per_epoch + step)
+                        writer.add_scalars('Pose curriculum (ReconSIREN)',
+                                           {"stage": float(pose_curriculum_controller.stage),
+                                            "scoring_resolution_pixels": float(candidate_scoring_size),
+                                            "scoring_resolution_fraction": float(candidate_scoring_size) / xsize},
+                                           i * steps_per_epoch + step)
 
                     # Progress bar update  (TQDM)
                     stage = "joint" if train_pose_volume and train_heterogeneity else (
