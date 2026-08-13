@@ -38,6 +38,9 @@ HET_LEARNING_RATE = 1e-4
 HET_MIN_STD = 0.1
 HET_LATENT_BANK_SIZE = 2048
 
+# Width of the coordinate-conditioned heterogeneity field decoder
+HET_FIELD_WIDTH = 64
+
 # Extra render blur during the early warm-up phase, to avoid dusty collapse
 CLOUD_BLUR_WARMUP = 1.5
 
@@ -612,6 +615,95 @@ class HetVolumeDecoder(nnx.Module):
                                     filter=filter, sigma=sigma)
 
 
+class HetFieldDecoder(nnx.Module):
+    """Coordinate-conditioned delta field, FiLM-modulated by the latent.
+
+    The low-rank readout of :class:`HetVolumeDecoder` spans at most ``lat_dim``
+    global deformation modes: every Gaussian moves along a fixed direction, and
+    a motion confined to one region has to be paid for out of that same global
+    budget. Here the delta is a continuous SIREN field of the point position,
+    so locality costs latent capacity only where the conformation differs. The
+    price is B x N x width activations instead of B x width.
+    """
+
+    def __init__(self, coords, values, n_gaussians, lat_dim, volume_size,
+                 residual_to_consensus=False, center_decoder=False,
+                 small_final_init=False, width=HET_FIELD_WIDTH, *, rngs: nnx.Rngs):
+        self.volume_size = volume_size
+        self.n_gaussians = n_gaussians
+        self.coords = coords[None, ...]
+        self.reference_values = values[None, ...]
+        self.residual_to_consensus = bool(residual_to_consensus)
+        self.center_decoder = bool(center_decoder)
+        self.width = int(width)
+
+        # Indices to (normalized) coords
+        self.factor = 0.5 * volume_size
+
+        self.coordinate_layer = Siren2Linear(
+            in_features=3, out_features=self.width, rngs=rngs, dtype=jnp.bfloat16,
+            is_first=True, w0=30.0, s=0.0, c=1.0)
+        hidden, film_gamma, film_beta = [], [], []
+        for _ in range(2):
+            hidden.append(
+                Siren2Linear(in_features=self.width, out_features=self.width, rngs=rngs,
+                             dtype=jnp.bfloat16, is_first=False, custom_init=True,
+                             is_residual=True, w0=1.0, s=0.0, c=6.0))
+            # Zero-initialized FiLM: the field starts latent-independent
+            film_gamma.append(Linear(in_features=lat_dim, out_features=self.width, rngs=rngs,
+                                     dtype=jnp.bfloat16,
+                                     kernel_init=nnx.initializers.zeros_init(),
+                                     bias_init=nnx.initializers.zeros_init()))
+            film_beta.append(Linear(in_features=lat_dim, out_features=self.width, rngs=rngs,
+                                    dtype=jnp.bfloat16,
+                                    kernel_init=nnx.initializers.zeros_init(),
+                                    bias_init=nnx.initializers.zeros_init()))
+        self.hidden = nnx.List(hidden)
+        self.film_gamma = nnx.List(film_gamma)
+        self.film_beta = nnx.List(film_beta)
+        final_init = (nnx.initializers.normal(1e-4) if small_final_init else nnx.initializers.glorot_uniform())
+        self.readout = Linear(in_features=self.width, out_features=4, rngs=rngs,
+                              kernel_init=final_init,
+                              bias_init=nnx.initializers.zeros_init())
+
+    def decode_deltas(self, x, points):
+        # points: (N, 3) normalized to ~[-1, 1]; x: (B, lat_dim)
+        h = self.coordinate_layer(points)
+        h = jnp.broadcast_to(h[None, ...], (x.shape[0],) + h.shape)
+        for layer, gamma, beta in zip(self.hidden, self.film_gamma, self.film_beta):
+            h = layer(h * (1.0 + gamma(x)[:, None, :]) + beta(x)[:, None, :])
+        return self.readout(h)
+
+    def __call__(self, x, base_coords=None, base_values=None):
+        if self.residual_to_consensus and (base_coords is None or base_values is None):
+            raise ValueError("Consensus-relative heterogeneity requires base coordinates and values")
+        # The field is queried at the current consensus positions, without pushing
+        # its own gradient back into them through its input
+        points = base_coords[0] / self.factor if self.residual_to_consensus else self.coords[0]
+        points = jax.lax.stop_gradient(points)
+
+        deltas = self.decode_deltas(x, points)
+        if self.center_decoder:
+            # Let z=0 be the consensus map, so any latent vector represents the deviation to be
+            # considered to get a given heterogeneous state
+            deltas = deltas - self.decode_deltas(jnp.zeros_like(x), points)
+        delta_coords, delta_values = deltas[..., :3], deltas[..., 3]
+
+        if self.residual_to_consensus:
+            coords = base_coords + self.factor * delta_coords
+            values = nnx.relu(base_values + delta_values)
+        else:
+            coords = self.factor * (self.coords + delta_coords)
+            values = nnx.relu(self.reference_values + delta_values)
+
+        return coords, values
+
+    def decode_volume(self, x, filter=True, sigma=1.0, base_coords=None, base_values=None):
+        coords, values = self.__call__(x, base_coords=base_coords, base_values=base_values)
+        return splat_cloud_volumes(coords + self.factor, values, self.volume_size,
+                                    filter=filter, sigma=sigma)
+
+
 class PhysDecoder:
     def __init__(self, xsize):
         self.xsize = xsize
@@ -687,11 +779,15 @@ class ReconSIREN(nnx.Module):
         het_covariance_weight = 1e-3 if anti_collapse else 0.0
         het_start_epoch = (5 if anti_collapse else 0) if het_start_epoch is None else int(het_start_epoch)
 
-        # Multiresolution heterogeneity reconstruction loss
-        het_loss_scales = tuple(dict.fromkeys(
-            [size for size in (64, 128) if size < xsize] + [int(xsize)]))
-        if anti_collapse and len(het_loss_scales) == 3:
-            het_loss_weights = (0.5, 0.3, 0.2)
+        # Multiresolution heterogeneity reconstruction loss, dominated by full resolution
+        if anti_collapse:
+            het_loss_scales = tuple(dict.fromkeys(
+                [min(int(xsize), max(32, int(round(0.64 * xsize)))), int(xsize)]))
+        else:
+            het_loss_scales = tuple(dict.fromkeys(
+                [size for size in (64, 128) if size < xsize] + [int(xsize)]))
+        if anti_collapse and len(het_loss_scales) == 2:
+            het_loss_weights = (0.2, 0.8)
         else:
             het_loss_weights = tuple(1.0 for _ in het_loss_scales)
         weight_sum = sum(het_loss_weights)
@@ -718,7 +814,10 @@ class ReconSIREN(nnx.Module):
         self.delta_volume_decoder = DeltaVolumeDecoder(coords=coords, values=values, volume_size=self.xsize,
                                                        learn_delta_volume=learn_delta_volume,
                                                        parameterization=consensus_parameterization, rngs=rngs)
-        self.delta_het_decoder = HetVolumeDecoder(coords=coords, values=values, n_gaussians=coords.shape[0],
+        # Both decoders live under the same attribute name: the optimizer parameter
+        # filters select by path, so the architecture must not move in the tree
+        het_decoder_class = HetFieldDecoder if anti_collapse else HetVolumeDecoder
+        self.delta_het_decoder = het_decoder_class(coords=coords, values=values, n_gaussians=coords.shape[0],
                                                   lat_dim=lat_dim, volume_size=self.xsize, residual_to_consensus=het_residual_to_consensus,
                                                   center_decoder=het_center_decoder, small_final_init=anti_collapse, rngs=rngs)
         self.phys_decoder = PhysDecoder(self.xsize)
