@@ -763,3 +763,11 @@ def support_loss(coords, values, center, radius, sigma):
     outside = jax.nn.relu(distances - radius) / sigma
     total_mass = jax.lax.stop_gradient(jnp.sum(amplitudes) + 1e-12)
     return jnp.sum(amplitudes * outside) / total_mass
+
+
+def whitened_reconstruction_loss(predicted, target, whitening_filter):
+    """Noise-whitened MSE so every frequency shell carries comparable gradient"""
+    predicted_white = jnp.real(jnp.fft.ifft2(jnp.fft.fft2(predicted) * whitening_filter))
+    target_white = jnp.real(jnp.fft.ifft2(jnp.fft.fft2(target) * whitening_filter))
+    scale = jnp.sqrt(jnp.mean(jnp.square(target_white), axis=(-2, -1), keepdims=True)) + 1e-8
+    return jnp.mean(jnp.square((predicted_white - target_white) / scale), axis=(-2, -1))

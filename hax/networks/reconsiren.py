@@ -18,8 +18,7 @@ from hax.utils import *
 from hax.layers import *
 
 
-# How many latents to encode before clustering them into the intermediate
-# heterogeneous volumes
+# How many latents to encode before clustering them into the intermediate heterogeneous volumes
 LATENTS_FOR_CLUSTERING = 2048
 
 # Parameters for sphere-coverage loss
