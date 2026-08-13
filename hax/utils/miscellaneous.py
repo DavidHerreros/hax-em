@@ -347,13 +347,12 @@ def estimate_envelopes(
 
 
 def sharpen_gaussian_envelope(volume, sigma, reg=0.02):
-    """Wiener inverse of the splat envelope ``exp(-2 pi^2 sigma^2 f^2)``.
+    """
+    Helper function only used when generating the resulting consensus/heterogeneity maps. Since generated volumes
+    low-passed by default with a known sigma (needed by Gaussian-splatting), we can treat this blurring as a B-factor.
 
-    The rendered map always carries the Gaussian splat envelope, so its
-    amplitudes fall off like a B-factor even when the fitted point cloud holds
-    sharper structure. This divides the envelope back out with a bounded-gain
-    Wiener filter (max boost ~ ``1 / (2 * sqrt(reg))``), the same operation as
-    conventional post-hoc map sharpening.
+    Since learned Gaussian positions may carry additional information compared to the blurred map, this function
+    computes analytically the previous envelope to sharpen the map
     """
     shape = volume.shape
     fz = jnp.fft.fftfreq(shape[0])
@@ -368,13 +367,7 @@ def sharpen_gaussian_envelope(volume, sigma, reg=0.02):
 
 
 def estimate_particle_extent(images, threshold=0.1, margin=1.15):
-    """Estimate the particle radius in pixels from raw images alone.
-
-    Orientation-free: the per-pixel variance across the batch carries the
-    particle signal (projections change with pose) on top of a flat noise
-    floor taken from the outermost radial shells. Needs no reference volume
-    and no mask. Returns ``None`` when no clear extent stands out.
-    """
+    """Estimate the particle radius in pixels from raw images alone"""
     x = np.asarray(images, np.float32)
     if x.ndim == 4:
         x = x[..., 0]
@@ -415,12 +408,7 @@ def estimate_particle_extent(images, threshold=0.1, margin=1.15):
 
 
 def equalize_masses(masses, gamma, dust_fraction=0.02):
-    """Gamma-compress Gaussian masses for the tracing map.
-
-    Masses below ``dust_fraction`` of the positive mean are dropped entirely;
-    the rest are compressed toward the mean so one iso-surface threshold shows
-    the whole chain. Returns ``None`` when the cloud carries no mass yet.
-    """
+    """Gamma-compress Gaussian masses for the tracing map"""
     masses = np.asarray(masses, np.float32)
     positive = masses[masses > 0.0]
     if not positive.size:

@@ -1113,17 +1113,16 @@ def whitened_reconstruction_loss(predicted, target, whitening_filter):
     return jnp.mean(jnp.square((predicted_white - target_white) / scale), axis=(-2, -1))
 
 
-def _geometry_prior_losses(coords, values, neighbor_indices, sigma):
-    """kNN spacing and amplitude-smoothness priors on the consensus cloud.
+def geometry_prior_losses(coords, values, neighbor_indices, sigma):
+    """Based on a set of precomputed nearest neighbor indices, this function computes two losses from coords and values:
 
-    Spacing: a mass-weighted penalty when an edge stretches past ~2 sigma (the
-    overlap limit for continuous rendered density) or crowds below ~0.7 sigma
-    (redundant stacking on blobs). Smoothness: a graph Laplacian on amplitudes
-    so neighbouring mass-carrying points render at similar brightness and a
-    single iso-surface threshold traces the whole chain. The edge weights and
-    normalisations are stop-gradient so neither term can be cheated by simply
-    shrinking amplitudes.
-    """
+     - Spacing loss: Penalizes the nearest neighbors of a point that is farther than 2*sigma distance. This promotes
+     that Gaussians are render as a continuous mass. Also, it penalizes neighbors being at a distance smaller than
+     0.7*sigma, as they would be rendered as a single clump of mass (i.e. Gaussian splatting losses expressivity)
+
+     - Smoothness loss: Makes the amplitude of the closes neighbors to a point close to a given point. Thus, it imposes
+     smoothness at the level of amplitudes between neighbors
+     """
     positions = coords[0]
     amplitudes = values[0]
     neighbor_positions = positions[neighbor_indices]  # (N, k, 3)
