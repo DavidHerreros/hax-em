@@ -2,10 +2,7 @@ import jax.numpy as jnp
 import jax.random as jnr
 
 def random_rotation_matrices(batch_size, key):
-    # Generate batch_size random numbers for u1, u2, and u3. The three draws
-    # must come from independent subkeys: reusing one key returns the same
-    # values three times, which collapses the samples onto a biased
-    # one-parameter family instead of covering SO(3).
+    # Generate batch_size random numbers for u1, u2, and u3
     key1, key2, key3 = jnr.split(key, 3)
     u1 = jnr.uniform(key1, shape=(batch_size,), minval=0.0, maxval=1.0)
     u2 = jnr.uniform(key2, shape=(batch_size,), minval=0.0, maxval=1.0)

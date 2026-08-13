@@ -755,8 +755,7 @@ class PhysDecoder:
             ctf = jnp.broadcast_to(ctf[:, None, :], (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
             ctf = rearrange(ctf, "b n w h -> (b n) w h")
 
-        # Analytic splat envelope and CTF in a single Fourier pass: exact for
-        # any std and one fewer filtering pass per projection.
+        # Apply CTF + low pass filter
         images = gaussianCTFFilter(images, sigma=std if filter else None,
                                    ctf=ctf if apply_ctf else None, pad_factor=2)
 
@@ -942,9 +941,12 @@ class ReconSIREN(nnx.Module):
         return vol
 
 
-def _candidate_reconstruction_losses(images, targets, ctf, ctf_type,
+def candidate_reconstruction_losses(images, targets, ctf, ctf_type,
                                      normalize_target=True, return_prepared=False):
-    """Per-particle, per-candidate loss without materialising target copies."""
+    """
+    Compute the representation loss between the predicted images (images) and the experimental images (targets)
+
+    Additionally, this function applies any additional CTF/normalization based on ctf_type and normalize_target"""
     target = targets[..., 0] if targets.shape[-1] == 1 else targets
     predicted = images[..., 0] if images.shape[-1] == 1 else images
     n_candidates = predicted.shape[1]
@@ -968,9 +970,6 @@ def _candidate_reconstruction_losses(images, targets, ctf, ctf_type,
         predicted = rearrange(predicted, "(b n) w h -> b n w h",
                               b=target.shape[0], n=n_candidates)
 
-    # The legacy path normalized identical target copies independently.  Taking
-    # the same reduction once per particle produces the same value and lets
-    # broadcasting remain a view throughout the fused subtraction.
     if normalize_target:
         target = standard_normalization(target)
     losses = jnp.mean(
@@ -980,8 +979,11 @@ def _candidate_reconstruction_losses(images, targets, ctf, ctf_type,
     return losses
 
 
-def _prepare_heterogeneity_images(images, targets, ctf, ctf_type, normalize_target):
-    """Apply the legacy CTF-loss convention and return candidate-shaped arrays."""
+def prepare_heterogeneity_images(images, targets, ctf, ctf_type, normalize_target):
+    """
+    This is just a function to apply any additional CTF/normalization to prepare the experimental images (targets)
+    and predicted heterogeneity images (images) to compute losses from them
+    """
     target = targets[..., 0] if targets.shape[-1] == 1 else targets
     predicted = images[..., 0] if images.shape[-1] == 1 else images
     n_candidates = predicted.shape[1]
@@ -1010,7 +1012,11 @@ def _prepare_heterogeneity_images(images, targets, ctf, ctf_type, normalize_targ
     return predicted, target[:, None, ...]
 
 
-def _resize_candidate_images(images, size):
+def resize_candidate_images(images, size):
+    """
+    This is a small helper function to resize images considering the two batch dimensions in ReconSIREN. Useful to
+    compute multi-resolution related losses
+    """
     if images.shape[-1] == size and images.shape[-2] == size:
         return images
     flat = rearrange(images, "b n h w -> (b n) h w 1")
@@ -1019,7 +1025,11 @@ def _resize_candidate_images(images, size):
     return rearrange(flat[..., 0], "(b n) h w -> b n h w", b=images.shape[0])
 
 
-def _circular_loss_mask(size, radius, dtype):
+def circular_loss_mask(size, radius, dtype):
+    """
+    Function to compute on the fly a circular mask with a given radius. Used mainly to focus the losses on the
+    regions where there is protein in the experimental images
+    """
     if radius <= 0.0:
         return jnp.ones((size, size), dtype=dtype)
     axis = (jnp.arange(size, dtype=jnp.float32) + 0.5) / size - 0.5
@@ -1027,21 +1037,22 @@ def _circular_loss_mask(size, radius, dtype):
     return (xx * xx + yy * yy <= radius * radius).astype(dtype)
 
 
-def _heterogeneity_reconstruction_loss(images, targets, ctf, ctf_type,
+def heterogeneity_reconstruction_loss(images, targets, ctf, ctf_type,
                                        scales, weights, mask_radius,
                                        normalize_target, return_prepared=False):
-    """Masked multiresolution reconstruction loss for conformational residuals.
-
-    ``return_prepared`` also returns the full-resolution prediction/target pair
-    (already CTF-treated and normalized) so a whitened term can reuse it.
     """
-    predicted, target = _prepare_heterogeneity_images(
+    Function to prepare the predicted heterogeneity images (images) and experimental images (targets) and compute
+    representation loss from them.
+
+    Additionally, the losses can follow a multi-resolution approximation to improve convergence.
+    """
+    predicted, target = prepare_heterogeneity_images(
         images, targets, ctf, ctf_type, normalize_target)
     loss = jnp.asarray(0.0, dtype=predicted.dtype)
     for size, weight in zip(scales, weights):
-        predicted_level = _resize_candidate_images(predicted, size)
-        target_level = _resize_candidate_images(target, size)
-        mask = _circular_loss_mask(size, mask_radius, predicted.dtype)
+        predicted_level = resize_candidate_images(predicted, size)
+        target_level = resize_candidate_images(target, size)
+        mask = circular_loss_mask(size, mask_radius, predicted.dtype)
         squared = jnp.square(predicted_level - target_level) * mask[None, None, ...]
         loss = loss + weight * jnp.sum(squared) / (
             predicted.shape[0] * predicted.shape[1] * jnp.maximum(jnp.sum(mask), 1.0))
@@ -1050,8 +1061,24 @@ def _heterogeneity_reconstruction_loss(images, targets, ctf, ctf_type,
     return loss
 
 
-def _latent_variance_covariance_loss(latent, minimum_std, bank=None, bank_count=None):
-    """VICReg-style anti-collapse statistics, optionally backed by a frozen bank."""
+def latent_variance_covariance_loss(latent, minimum_std, bank=None, bank_count=None):
+    """
+    Computes a set of losses at latent level to avoid the latent space from collapsing towards the consensus
+    structure (i.e. promotes that the heterogeneous latent space represents "something" always.
+
+    Two losses are computed:
+
+    - Variance loss: For each latent dimension, promotes that the variance of each dimensional component is not driven
+    towards zero. This prevents that any latent dimensions becomes "dead". The variance is computed at the batch size
+    level
+    - Covariance loss: Computes the off-diagonal elements of the covariance matrix defined by the batch of latent
+    vectors and forces them to be driven towards zero. Thanks to this, latent dimensions are driven to be decorrelated,
+    allowing them to spread and represent independent structural information (i.e. no dimensions carries information
+    that is just a copy of another dimension)
+
+    When a bank is given, it uses its samples to improve the statistical significance of the losses (otherwise, they
+    restricted to the number of elements in the batch. Since this might be small, the losses might become extremely noisy)
+    """
     latent_f32 = latent.astype(jnp.float32)
     if bank is None:
         total = jnp.asarray(latent.shape[0], dtype=jnp.float32)
@@ -1077,35 +1104,20 @@ def _latent_variance_covariance_loss(latent, minimum_std, bank=None, bank_count=
     return variance_loss, covariance_loss, jnp.mean(std)
 
 
-def _whitened_reconstruction_loss(predicted, target, whitening_filter):
-    """Noise-whitened MSE so every frequency shell carries comparable gradient.
-
-    The plain real-space MSE is dominated by the low-frequency shells where the
-    cryo-EM signal (and the coloured noise) concentrates, leaving essentially no
-    gradient pressure on the high-resolution shells. Dividing both images by the
-    dataset noise amplitude spectrum equalises the per-shell SNR before the
-    residual is taken.
-
-    ``predicted`` is candidate-shaped ``(B, N, H, W)``, ``target`` is
-    ``(B, 1, H, W)`` and ``whitening_filter`` lies on the unshifted ``fft2``
-    grid (see :func:`hax.utils.whitening_filter_2d`).
-    """
+def whitened_reconstruction_loss(predicted, target, whitening_filter):
+    """Noise-whitened MSE so every frequency shell carries comparable gradient"""
     predicted_white = jnp.real(jnp.fft.ifft2(jnp.fft.fft2(predicted) * whitening_filter))
     target_white = jnp.real(jnp.fft.ifft2(jnp.fft.fft2(target) * whitening_filter))
-    # Dimensionless residual: normalising by the whitened target power keeps the
-    # loss on the same O(1) scale as the plain normalized MSE it blends with.
     scale = jnp.sqrt(jnp.mean(jnp.square(target_white), axis=(-2, -1), keepdims=True)) + 1e-8
     return jnp.mean(jnp.square((predicted_white - target_white) / scale), axis=(-2, -1))
 
 
-def _sharpen_gaussian_envelope(volume, sigma, reg=0.02):
-    """Wiener inverse of the splat envelope ``exp(-2 pi^2 sigma^2 f^2)``.
+def sharpen_gaussian_envelope(volume, sigma, reg=0.02):
+    """Helper function only used when generating the resulting consensus/heterogeneity maps. Since generated volumes
+    low-passed by default with a known sigma (needed by Gaussian-splatting), we can treat this blurring as a B-factor.
 
-    The rendered map always carries the Gaussian splat envelope, so its
-    amplitudes fall off like a B-factor even when the fitted point cloud holds
-    sharper structure. This divides the envelope back out with a bounded-gain
-    Wiener filter (max boost ~ ``1 / (2 * sqrt(reg))``), the same operation as
-    conventional post-hoc map sharpening.
+    Since learned Gaussian positions may carry additional information compared to the blurred map, this function
+    computes analytically the previous envelope to sharpen the map.
     """
     shape = volume.shape
     fz = jnp.fft.fftfreq(shape[0])
@@ -1119,14 +1131,8 @@ def _sharpen_gaussian_envelope(volume, sigma, reg=0.02):
     return jnp.fft.irfftn(jnp.fft.rfftn(volume) * gain, s=shape)
 
 
-def _estimate_particle_extent(images, threshold=0.1, margin=1.15):
-    """Estimate the particle radius in pixels from raw images alone.
-
-    Orientation-free: the per-pixel variance across the batch carries the
-    particle signal (projections change with pose) on top of a flat noise
-    floor taken from the outermost radial shells. Needs no reference volume
-    and no mask. Returns ``None`` when no clear extent stands out.
-    """
+def estimate_particle_extent(images, threshold=0.1, margin=1.15):
+    """Estimate the particle radius in pixels from raw images alone"""
     x = np.asarray(images, np.float32)
     if x.ndim == 4:
         x = x[..., 0]
@@ -1166,7 +1172,7 @@ def _estimate_particle_extent(images, threshold=0.1, margin=1.15):
     return float(np.clip(radius, 4.0, 0.95 * max_radius))
 
 
-def _geometry_prior_losses(coords, values, neighbor_indices, sigma):
+def geometry_prior_losses(coords, values, neighbor_indices, sigma):
     """kNN spacing and amplitude-smoothness priors on the consensus cloud.
 
     Spacing: a mass-weighted penalty when an edge stretches past ~2 sigma (the
@@ -1186,10 +1192,6 @@ def _geometry_prior_losses(coords, values, neighbor_indices, sigma):
 
     edge_weights = jnp.sqrt(amplitudes[:, None] * amplitudes[neighbor_indices] + 1e-12)
     edge_weights = jax.lax.stop_gradient(edge_weights / (jnp.mean(edge_weights) + 1e-12))
-    # The gap term applies to the NEAREST neighbour only (neighbor_indices must
-    # be distance-sorted): connectivity means d_nn < ~2 sigma. Demanding it of
-    # all k neighbours would penalise chain topology itself and squeeze
-    # filaments into clumps. Crowding applies to every neighbour.
     gap = jax.nn.relu(distances[:, 0] - 2.0 * sigma) / sigma
     crowd = jax.nn.relu(0.7 * sigma - distances) / sigma
     spacing_loss = (jnp.mean(edge_weights[:, 0] * jnp.square(gap))
@@ -1201,7 +1203,7 @@ def _geometry_prior_losses(coords, values, neighbor_indices, sigma):
     return spacing_loss, smoothness_loss
 
 
-def _support_loss(coords, values, center, radius, sigma):
+def support_loss(coords, values, center, radius, sigma):
     """Mass outside the shrink-wrapped spherical support, in units of sigma.
 
     The support is derived from the converging cloud itself (no mask needed);
@@ -1219,21 +1221,7 @@ def _support_loss(coords, values, center, radius, sigma):
 @partial(jax.jit, donate_argnums=(1,))
 def recycle_dead_points_reconsiren(graphdef, state, key, dead_fraction=0.05,
                                    new_value_fraction=0.25):
-    """Teleport amplitude-dead Gaussians next to mass-carrying ones.
-
-    Fixed-N counterpart of Gaussian-splatting densify/prune: points whose
-    amplitude collapsed below ``dead_fraction`` of the mean are resampled next
-    to donors drawn proportionally to mass (one splat width of jitter) and
-    restart at a small amplitude, relocating capacity onto the structure
-    without changing any array shape. Only valid for the 'direct' consensus
-    parameterization. Stale Adam moments of moved points are left in place:
-    the inflated second moment just makes their first few updates cautious.
-
-    The low-rank heterogeneity readout is indexed by point, so a recycled point
-    would otherwise arrive at its new location carrying the conformational
-    deltas learned at the old one; its 4-column block is zeroed here. The field
-    decoder is index-free and needs no reset.
-    """
+    """Move amplitude-dead Gaussians next to mass-carrying ones. This allows all Gaussians to contribute to the structure"""
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
     decoder = model.delta_volume_decoder
 
@@ -1260,8 +1248,6 @@ def recycle_dead_points_reconsiren(graphdef, state, key, dead_fraction=0.05,
 
     het_decoder = model.delta_het_decoder
     if isinstance(het_decoder, HetVolumeDecoder):
-        # Readout kernel is (lat_features, 4 * n_gaussians): point j owns the
-        # output columns 4j..4j+3.
         readout = het_decoder.hidden[-1]
         dead_outputs = jnp.repeat(dead, 4)
         kernel = readout.kernel.get_value()
@@ -1274,12 +1260,10 @@ def recycle_dead_points_reconsiren(graphdef, state, key, dead_fraction=0.05,
     return state, jnp.sum(dead)
 
 
-def _equalize_masses(masses, gamma, dust_fraction=0.02):
-    """Gamma-compress Gaussian masses for the tracing map.
-
-    Masses below ``dust_fraction`` of the positive mean are dropped entirely;
-    the rest are compressed toward the mean so one iso-surface threshold shows
-    the whole chain. Returns ``None`` when the cloud carries no mass yet.
+def equalize_masses(masses, gamma, dust_fraction=0.02):
+    """
+    Equalizes the Gaussian amplitudes (masses) so the generated maps are easier to threshold in software
+    like ChimeraX
     """
     masses = np.asarray(masses, np.float32)
     positive = masses[masses > 0.0]
@@ -1293,18 +1277,7 @@ def _equalize_masses(masses, gamma, dust_fraction=0.02):
 
 def volume_optimizer_transform(parameterization, volume_lr, coords_lr=None,
                                amplitude_lr=None):
-    """Optax transform for the consensus volume decoder.
-
-    With the 'network' parameterization this is the plain clipped AdamW the
-    branch always used (state layout unchanged, old checkpoints resume). With
-    'direct' it partitions the parameters so coordinate deltas and amplitude
-    deltas train at their own learning rates: under Adam a wide network
-    readout multiplies the effective step of its outputs by roughly its width
-    (measured ~18-174x in reconsiren), so directly-parameterized deltas need a
-    correspondingly larger LR than the network mode ever did - and amplitudes
-    live on a ~50x smaller scale than normalized coordinates, so they get
-    their own rate.
-    """
+    """Optax transform for the consensus volume decoder"""
     import optax
 
     if parameterization != "direct":
@@ -1328,7 +1301,7 @@ def volume_optimizer_transform(parameterization, volume_lr, coords_lr=None,
             label_params))
 
 
-def _score_candidates(model, x, values, coords, rotations, shifts, ctf, std=None):
+def score_candidates(model, x, values, coords, rotations, shifts, ctf, std=None):
     """Render every candidate once and return its reconstruction loss."""
     chunk = model.candidate_chunk_size
     n_candidates = rotations.shape[1]
@@ -1337,7 +1310,7 @@ def _score_candidates(model, x, values, coords, rotations, shifts, ctf, std=None
         images = model.phys_decoder(
             x, values, coords, model.xsize, rotations, shifts, ctf,
             model.ctf_type, std)
-        return _candidate_reconstruction_losses(images, x, ctf, model.ctf_type)
+        return candidate_reconstruction_losses(images, x, ctf, model.ctf_type)
 
     losses = []
     for start in range(0, n_candidates, chunk):
@@ -1345,7 +1318,7 @@ def _score_candidates(model, x, values, coords, rotations, shifts, ctf, std=None
             x, values, coords, model.xsize,
             rotations[:, start:start + chunk], shifts[:, start:start + chunk],
             ctf, model.ctf_type, std)
-        losses.append(_candidate_reconstruction_losses(
+        losses.append(candidate_reconstruction_losses(
             images, x, ctf, model.ctf_type))
     return jnp.concatenate(losses, axis=1)
 
@@ -1415,7 +1388,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
 
         # The global competition never carries gradients through candidate
         # scoring.  Only its selected pose is rerendered into the consensus.
-        candidate_losses = _score_candidates(
+        candidate_losses = score_candidates(
             model, x, jax.lax.stop_gradient(values), jax.lax.stop_gradient(coords),
             jax.lax.stop_gradient(rotations_eval), jax.lax.stop_gradient(shifts_eval),
             ctf, std=jax.lax.stop_gradient(std_eff))
@@ -1440,13 +1413,13 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         # The prepared pair is free (already-computed intermediates); the
         # whitened loss reuses it.
         selected_losses, selected_predicted, selected_target = (
-            _candidate_reconstruction_losses(
+            candidate_reconstruction_losses(
                 selected_images, x, ctf, model.ctf_type,
                 return_prepared=True))
         recon_loss = selected_losses.mean()
         reconstruction_objective = recon_loss
         if apply_loss_whitening:
-            whitened_recon_loss = _whitened_reconstruction_loss(
+            whitened_recon_loss = whitened_reconstruction_loss(
                 selected_predicted, selected_target, whiten_filter).mean()
             effective_whiten_weight = jnp.clip(
                 jnp.asarray(whiten_weight, dtype=recon_loss.dtype), 0.0, 1.0)
@@ -1478,13 +1451,13 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                 ctf, model.ctf_type, std_eff)[:, 0, ...]
 
             if model.heterogeneity_profile == "legacy":
-                recon_het_loss = _candidate_reconstruction_losses(
+                recon_het_loss = candidate_reconstruction_losses(
                     images_het[:, None, ...], x, ctf, model.ctf_type,
                     normalize_target=False).mean()
-                variance_loss, covariance_loss, _ = _latent_variance_covariance_loss(
+                variance_loss, covariance_loss, _ = latent_variance_covariance_loss(
                     latent, model.het_min_std)
             else:
-                recon_het_loss, het_predicted, het_target = _heterogeneity_reconstruction_loss(
+                recon_het_loss, het_predicted, het_target = heterogeneity_reconstruction_loss(
                     images_het[:, None, ...], x, ctf, model.ctf_type,
                     model.het_loss_scales, model.het_loss_weights,
                     model.het_mask_radius, model.het_normalize_target,
@@ -1493,14 +1466,14 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                     # The whitening filter is built for the full box, so the
                     # whitened term always uses the full-resolution pair - the
                     # multiscale levels above already carry the low frequencies.
-                    whitened_het_loss = _whitened_reconstruction_loss(
+                    whitened_het_loss = whitened_reconstruction_loss(
                         het_predicted, het_target, whiten_filter).mean()
                     effective_whiten_weight = jnp.clip(
                         jnp.asarray(whiten_weight, dtype=recon_het_loss.dtype), 0.0, 1.0)
                     recon_het_loss = (
                         (1.0 - effective_whiten_weight) * recon_het_loss
                         + effective_whiten_weight * whitened_het_loss)
-                variance_loss, covariance_loss, _ = _latent_variance_covariance_loss(
+                variance_loss, covariance_loss, _ = latent_variance_covariance_loss(
                     latent, model.het_min_std,
                     bank=model.latent_memory_bank.get(),
                     bank_count=model.latent_bank_count.get_value())
@@ -1543,23 +1516,23 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         # graph is the consensus one - a valid neighbourhood approximation while
         # the per-particle deltas stay small compared to the point spacing.
         if apply_geometry_priors:
-            spacing_loss, smoothness_loss = _geometry_prior_losses(
+            spacing_loss, smoothness_loss = geometry_prior_losses(
                 coords, values, neighbor_indices, std_eff)
             loss = (loss + spacing_weight * spacing_loss
                     + smoothness_weight * smoothness_loss)
             if train_heterogeneity:
                 het_spacing_loss, het_smoothness_loss = jax.vmap(
-                    _geometry_prior_losses, in_axes=(0, 0, None, None))(
+                    geometry_prior_losses, in_axes=(0, 0, None, None))(
                         coords_het[:, None, ...], values_het[:, None, ...],
                         neighbor_indices, std_eff)
                 loss = (loss + spacing_weight * jnp.mean(het_spacing_loss)
                         + smoothness_weight * jnp.mean(het_smoothness_loss))
         if apply_support:
-            loss = loss + support_weight * _support_loss(
+            loss = loss + support_weight * support_loss(
                 coords, values, support_center, support_radius, std_eff)
             if train_heterogeneity:
                 loss = loss + support_weight * jnp.mean(jax.vmap(
-                    _support_loss, in_axes=(0, 0, None, None, None))(
+                    support_loss, in_axes=(0, 0, None, None, None))(
                         coords_het[:, None, ...], values_het[:, None, ...],
                         support_center, support_radius, std_eff))
         metrics = (recon_loss, recon_het_loss)
@@ -1790,7 +1763,7 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md, k
     rotations = jnp.matmul(current_rotations[:, None, :, :], rotations)  # TODO: The two options seem to work?
     shifts = current_shifts[:, None, :] + shifts
 
-    recon_loss = _score_candidates(
+    recon_loss = score_candidates(
         model, x, values, coords, rotations, shifts, ctf)
 
     # Get minimum indices
@@ -2108,7 +2081,7 @@ def main():
         probe_indices = np.linspace(0, len(generator.md) - 1, n_probe).astype(int)
         probe = np.stack([np.squeeze(generator.md.getMetaDataImage(int(index)))
                           for index in probe_indices])
-        extent_radius_px = _estimate_particle_extent(probe)
+        extent_radius_px = estimate_particle_extent(probe)
         if extent_radius_px is not None:
             print(f"{bcolors.OKCYAN}Estimated particle radius from {n_probe} images: "
                   f"{extent_radius_px:.1f} px ({2.0 * extent_radius_px / xsize:.0%} of the box "
@@ -2469,7 +2442,7 @@ def main():
                             volume = None
                             if intermediate_equalized_enabled:
                                 _, cloud_masses = decode_cloud(reconsiren)
-                                equalized_masses = _equalize_masses(
+                                equalized_masses = equalize_masses(
                                     cloud_masses[0], args.equalized_map_gamma)
                                 if equalized_masses is not None:
                                     values_pair = jnp.stack(
@@ -2733,7 +2706,7 @@ def main():
         if not args.no_sharpened_map:
             # Companion map with the known splat envelope divided back out
             # (bounded-gain Wiener); the standard map above stays untouched.
-            sharpened = _sharpen_gaussian_envelope(jnp.asarray(decoded_volume[0]),
+            sharpened = sharpen_gaussian_envelope(jnp.asarray(decoded_volume[0]),
                                                    reconsiren.get_std(),
                                                    reg=args.sharpened_map_reg)
             ImageHandler().write(np.array(sharpened),
@@ -2746,7 +2719,7 @@ def main():
             # chain. Deliberately decoupled from true occupancy - read topology
             # here, read confidence in the physical map.
             cloud_coords, cloud_values = reconsiren.delta_volume_decoder()
-            equalized_masses = _equalize_masses(cloud_values[0], args.equalized_map_gamma)
+            equalized_masses = equalize_masses(cloud_values[0], args.equalized_map_gamma)
             if equalized_masses is not None:
                 equalized = reconsiren.delta_volume_decoder.decode_volume(
                     coords_values=(cloud_coords, jnp.asarray(equalized_masses)[None, ...]),
@@ -2768,7 +2741,7 @@ def main():
             # raw splat envelope and the un-equalized masses, which makes them
             # look worse than the consensus for reasons unrelated to the states.
             if not args.no_sharpened_map:
-                sharpened = _sharpen_gaussian_envelope(jnp.asarray(decoded[0]),
+                sharpened = sharpen_gaussian_envelope(jnp.asarray(decoded[0]),
                                                        reconsiren.get_std(),
                                                        reg=args.sharpened_map_reg)
                 ImageHandler().write(np.array(sharpened),
@@ -2778,7 +2751,7 @@ def main():
 
             if not args.no_equalized_map:
                 het_coords, het_values = decode_het_cloud(center[None, ...])
-                equalized_masses = _equalize_masses(het_values[0], args.equalized_map_gamma)
+                equalized_masses = equalize_masses(het_values[0], args.equalized_map_gamma)
                 if equalized_masses is not None:
                     equalized = _splat_cloud_volumes(
                         het_coords + reconsiren.delta_het_decoder.factor,

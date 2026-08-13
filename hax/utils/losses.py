@@ -654,25 +654,10 @@ def soft_spherical_occupancy(directions, bin_directions, kappa):
 
 def candidate_coverage_loss(directions, bin_directions, memory_bank, bank_count, key,
                             kappa=32.0, bank_samples=1024, bank_mix=0.5, eps=1e-8):
-    """KL-to-uniform loss for current and historical direction samples.
-
-    The historical occupancy is detached and mixed with equal normalized mass,
-    so a large bank cannot dilute gradients from the current batch. Randomly
-    rotating the equal-area grid avoids imprinting fixed bin boundaries.
-
-    Args:
-        directions: (N, 3) unit vectors carrying the gradient.
-        bin_directions: (K, 3) equal-area bin centers on the sphere.
-        memory_bank: (B, 3) buffer of historical directions.
-        bank_count: number of valid rows currently in the bank.
-        key: PRNG key for the grid rotation and the bank subsample.
-        kappa: concentration of the soft bin assignment.
-        bank_samples: rows drawn from the bank; 0 skips the historical term.
-        bank_mix: weight of the historical occupancy in [0, 1).
-        eps: numerical floor for the logarithm and the normalization.
-
-    Returns:
-        Scalar KL divergence from the mixed occupancy to the uniform one.
+    """Computes uniformity loss based on the relative occupancy of a set of random (uniform) directions over a sphere
+    partition into a set of equal area patches defined by bin_directions. The memory bank represent the set of
+    directions to be compared to the uniform  distribution. Basically, this loss promotes that memory bank directions
+    uniformly occupy the whole projection sphere.
     """
     rotation_key, sample_key = jax.random.split(key)
     n_bins = bin_directions.shape[0]
