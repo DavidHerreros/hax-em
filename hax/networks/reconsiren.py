@@ -206,38 +206,6 @@ def repulsion_loss(
     return jnp.mean(energy)
 
 
-def splat_cloud_volumes(coords, values, volume_size, filter=True, sigma=1.0):
-    grids = jnp.zeros((values.shape[0], volume_size, volume_size, volume_size))
-
-    bposf = jnp.floor(coords)
-    bposi = bposf.astype(jnp.int32)
-    bposf = coords - bposf
-
-    bamp0 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
-    bamp1 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
-    bamp2 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
-    bamp3 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
-    bamp4 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
-    bamp5 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
-    bamp6 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
-    bamp7 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
-
-    bamp = jnp.concat([bamp0, bamp1, bamp2, bamp3, bamp4, bamp5, bamp6, bamp7], axis=1)
-    bposi = jnp.concat([bposi, bposi + jnp.array((1, 0, 0)), bposi + jnp.array((0, 1, 0)), bposi + jnp.array((0, 0, 1)),
-                        bposi + jnp.array((0, 1, 1)), bposi + jnp.array((1, 0, 1)), bposi + jnp.array((1, 1, 0)), bposi + jnp.array((1, 1, 1))], axis=1)
-
-    def scatter_volume(vol, bpos_i, bamp_i):
-        return vol.at[bpos_i[..., 2], bpos_i[..., 1], bpos_i[..., 0]].add(bamp_i)
-
-    grids = jax.vmap(scatter_volume, in_axes=(0, 0, 0))(grids, bposi, bamp)
-
-    # Filter volume
-    if filter:
-        grids = jax.vmap(low_pass_3d_analytic, in_axes=(0, None))(grids, sigma)
-
-    return grids
-
-
 class PoseHead(nnx.Module):
     def __init__(self, is_refine=False, *, rngs: nnx.Rngs):
         if is_refine:
@@ -1536,8 +1504,9 @@ def main():
     parser.add_argument("--heterogeneity_profile", choices=("legacy", "anti_collapse"),
                         default="anti_collapse",
                         help="Heterogeneity training profile. anti_collapse enables staged residual "
-                             "training, resized encoding, multiscale masked loss and latent statistics; "
-                             "legacy preserves the historical objective and decoder.")
+                             "training with decoder centering, a masked/normalized multiscale loss and "
+                             "bank-backed latent variance/covariance statistics; "
+                             "legacy preserves the historical objective.")
     parser.add_argument("--lat_dim", type=int, default=8,
                         help="Dimension of the heterogeneity latent space.")
     parser.add_argument("--het_start_epoch", type=int, default=None,
@@ -1561,11 +1530,11 @@ def main():
     parser.add_argument("--spacing_prior_weight", type=float, default=0.05,
                         help="Weight of the kNN spacing prior: penalizes mass-carrying neighbours further apart "
                              "than ~2 splat widths (density visually fragments) or closer than ~0.7 (redundant "
-                             "stacking). Active only at the final full-resolution curriculum stage. 0 disables.")
+                             "stacking). Active once the pose warm-up finishes. 0 disables.")
     parser.add_argument("--amplitude_smoothness_weight", type=float, default=0.01,
                         help="Weight of the kNN amplitude-smoothness prior (graph Laplacian on Gaussian masses) "
-                             "so one iso-surface threshold traces the whole chain instead of beading. Active only "
-                             "at the final full-resolution curriculum stage. 0 disables.")
+                             "so one iso-surface threshold traces the whole chain instead of beading. Active once "
+                             "the pose warm-up finishes. 0 disables.")
     parser.add_argument("--no_point_recycling", action="store_true",
                         help="Disable periodic recycling of amplitude-dead Gaussians next to mass-carrying ones.")
     parser.add_argument("--recycle_every", type=int, default=5,

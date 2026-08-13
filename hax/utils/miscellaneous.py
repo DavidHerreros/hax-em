@@ -14,6 +14,7 @@ import numpy as np
 from sklearn.neighbors import KDTree
 
 from hax.utils.loggers import bcolors
+from hax.utils.fourier_filters import low_pass_3d_analytic
 
 
 # def estimate_noise_stddev(images, patch_size):
@@ -417,6 +418,38 @@ def equalize_masses(masses, gamma, dust_fraction=0.02):
     return np.where(masses > dust_fraction * mean_mass,
                     mean_mass * (masses / mean_mass) ** gamma,
                     0.0).astype(np.float32)
+
+
+def splat_cloud_volumes(coords, values, volume_size, filter=True, sigma=1.0):
+    grids = jnp.zeros((values.shape[0], volume_size, volume_size, volume_size))
+
+    bposf = jnp.floor(coords)
+    bposi = bposf.astype(jnp.int32)
+    bposf = coords - bposf
+
+    bamp0 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+    bamp1 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+    bamp2 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+    bamp3 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
+    bamp4 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
+    bamp5 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
+    bamp6 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+    bamp7 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
+
+    bamp = jnp.concat([bamp0, bamp1, bamp2, bamp3, bamp4, bamp5, bamp6, bamp7], axis=1)
+    bposi = jnp.concat([bposi, bposi + jnp.array((1, 0, 0)), bposi + jnp.array((0, 1, 0)), bposi + jnp.array((0, 0, 1)),
+                        bposi + jnp.array((0, 1, 1)), bposi + jnp.array((1, 0, 1)), bposi + jnp.array((1, 1, 0)), bposi + jnp.array((1, 1, 1))], axis=1)
+
+    def scatter_volume(vol, bpos_i, bamp_i):
+        return vol.at[bpos_i[..., 2], bpos_i[..., 1], bpos_i[..., 0]].add(bamp_i)
+
+    grids = jax.vmap(scatter_volume, in_axes=(0, 0, 0))(grids, bposi, bamp)
+
+    # Filter volume
+    if filter:
+        grids = jax.vmap(low_pass_3d_analytic, in_axes=(0, None))(grids, sigma)
+
+    return grids
 
 
 @jax.jit
