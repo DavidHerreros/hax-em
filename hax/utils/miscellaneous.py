@@ -345,6 +345,92 @@ def estimate_envelopes(
     vmapped = jax.jit(jax.vmap(per_image, in_axes=(0,0)))
     return vmapped(imgs, ctf)                     # [B, P, Q, 1]
 
+
+def sharpen_gaussian_envelope(volume, sigma, reg=0.02):
+    """Wiener inverse of the splat envelope ``exp(-2 pi^2 sigma^2 f^2)``.
+
+    The rendered map always carries the Gaussian splat envelope, so its
+    amplitudes fall off like a B-factor even when the fitted point cloud holds
+    sharper structure. This divides the envelope back out with a bounded-gain
+    Wiener filter (max boost ~ ``1 / (2 * sqrt(reg))``), the same operation as
+    conventional post-hoc map sharpening.
+    """
+    shape = volume.shape
+    fz = jnp.fft.fftfreq(shape[0])
+    fy = jnp.fft.fftfreq(shape[1])
+    fx = jnp.fft.rfftfreq(shape[2])
+    f_sq = (fz[:, None, None] ** 2 + fy[None, :, None] ** 2
+            + fx[None, None, :] ** 2)
+    sigma_sq = jnp.square(jnp.asarray(sigma, jnp.float32)).reshape(())
+    envelope = jnp.exp(-2.0 * jnp.pi ** 2 * sigma_sq * f_sq)
+    gain = (1.0 + reg) * envelope / (jnp.square(envelope) + reg)
+    return jnp.fft.irfftn(jnp.fft.rfftn(volume) * gain, s=shape)
+
+
+def estimate_particle_extent(images, threshold=0.1, margin=1.15):
+    """Estimate the particle radius in pixels from raw images alone.
+
+    Orientation-free: the per-pixel variance across the batch carries the
+    particle signal (projections change with pose) on top of a flat noise
+    floor taken from the outermost radial shells. Needs no reference volume
+    and no mask. Returns ``None`` when no clear extent stands out.
+    """
+    x = np.asarray(images, np.float32)
+    if x.ndim == 4:
+        x = x[..., 0]
+    x = (x - x.mean(axis=(1, 2), keepdims=True)) / (x.std(axis=(1, 2), keepdims=True) + 1e-8)
+    variance = x.var(axis=0)
+
+    h, w = variance.shape
+    yy, xx = np.indices((h, w))
+    r = np.sqrt((yy - h // 2) ** 2 + (xx - w // 2) ** 2).astype(np.int32)
+    n_shells = int(r.max()) + 1
+    profile = np.bincount(r.ravel(), weights=variance.ravel(), minlength=n_shells)
+    counts = np.bincount(r.ravel(), minlength=n_shells)
+    profile = profile / np.maximum(counts, 1)
+
+    max_radius = min(h, w) // 2
+    if max_radius < 8:
+        return None
+    profile = profile[:max_radius]
+    outer = profile[int(0.85 * max_radius):]
+    noise_floor = np.median(outer)
+    excess = profile - noise_floor
+    # Refuse rather than hallucinate: the variance peak must stand well clear
+    # of the outer-shell scatter (robust MAD scale) to count as a particle.
+    noise_scale = 1.4826 * np.median(np.abs(outer - noise_floor))
+    peak = excess.max()
+    if peak <= 5.0 * max(noise_scale, 1e-12):
+        return None
+    above = np.flatnonzero(excess > threshold * peak)
+    if above.size == 0:
+        return None
+    if above.max() >= int(0.85 * max_radius):
+        # The variance excess reaches into the outer shells the noise floor
+        # was measured from: there is no clean particle boundary inside the
+        # box, so any radius here would be a whole-box hallucination.
+        return None
+    radius = float(above.max()) * margin
+    return float(np.clip(radius, 4.0, 0.95 * max_radius))
+
+
+def equalize_masses(masses, gamma, dust_fraction=0.02):
+    """Gamma-compress Gaussian masses for the tracing map.
+
+    Masses below ``dust_fraction`` of the positive mean are dropped entirely;
+    the rest are compressed toward the mean so one iso-surface threshold shows
+    the whole chain. Returns ``None`` when the cloud carries no mass yet.
+    """
+    masses = np.asarray(masses, np.float32)
+    positive = masses[masses > 0.0]
+    if not positive.size:
+        return None
+    mean_mass = float(positive.mean())
+    return np.where(masses > dust_fraction * mean_mass,
+                    mean_mass * (masses / mean_mass) ** gamma,
+                    0.0).astype(np.float32)
+
+
 @jax.jit
 def sparse_finite_3D_differences(values, inds, vol_dim):
     """

@@ -10,6 +10,7 @@ from .segmentation import get_segmentation_centers, watershed_segmentation
 from .normalizers import min_max_scale, standard_normalization
 from .random_gen import random_rotation_matrices
 from .miscellaneous import (estimate_noise_stddev, filter_latent_space, batched_knn, rigid_registration, estimate_envelopes,
+                            sharpen_gaussian_envelope, estimate_particle_extent, equalize_masses,
                             sparse_finite_3D_differences, build_graph_from_coordinates, sample_mask_points, safe_norm,
                             positional_encoding)
 from .whiten_filter import estimate_noise_psd, create_whitening_fn, whitening_filter_2d
