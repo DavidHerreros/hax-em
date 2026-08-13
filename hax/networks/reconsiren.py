@@ -264,8 +264,6 @@ class PoseHead(nnx.Module):
         self.pose_layer = Linear(1024, 6, rngs=rngs, kernel_init=kernel_init, bias_init=bias_init)
         self.predict_shift_delta = bool(predict_shift_delta)
         if self.predict_shift_delta:
-            # Zero-init so per-candidate shifts start exactly at the shared
-            # trunk shift and only diverge when the data asks for it.
             self.shift_layer = Linear(1024, 2, rngs=rngs,
                                       kernel_init=nnx.initializers.zeros_init(),
                                       bias_init=nnx.initializers.zeros_init())
@@ -414,8 +412,8 @@ class EncoderPose(nnx.Module):
             in_plane_shifts = nnx.gelu(in_plane_shifts + layer(in_plane_shifts))
         in_plane_shifts = self.hidden_shifts[-1](in_plane_shifts)
 
-        # Per-candidate deltas ride on the shared trunk shift, so the winner
-        # competition can co-select an orientation with its matching shift.
+        # Per-candidate deltas further modify the shared in-plane shift to improve its
+        # accuracy for a given image
         if shift_deltas is not None:
             in_plane_shifts = in_plane_shifts[:, None, :] + shift_deltas
         else:
@@ -430,15 +428,11 @@ class EncoderHet(nnx.Module):
                  *, rngs: nnx.Rngs):
         self.input_dim = input_dim
         self.input_conv_dim = int(encoder_size) if architecture == "resize" else 64
-        # Four stride-2 SAME convs: each level is ceil(previous / 2), so the
-        # flattened width is ceil(size / 16) for any input size.
         self.out_conv_dim = -(-self.input_conv_dim // (2 ** 4))
         self.architecture = architecture
 
         if architecture == "convstem":
-            # Bring arbitrary box sizes to the legacy 64x64 grid without the
-            # O(box^2 * 4096) flattened projection.  The final resize handles
-            # non-powers of two and boxes below 64.
+            # Use standard image resizing to achieve the 64px box size
             n_stem = max(0, int(np.floor(np.log2(max(self.input_dim, 1) / self.input_conv_dim))))
             stem = []
             channels = 1
@@ -452,14 +446,12 @@ class EncoderHet(nnx.Module):
             self.stem = nnx.List(stem)
             hidden_layers_conv = []
         elif architecture == "legacy":
+            # Learnable resizing to 64px
             hidden_layers_conv = [
                 Linear(self.input_dim * self.input_dim, self.input_conv_dim * self.input_conv_dim, rngs=rngs,
                        dtype=jnp.bfloat16)]
         elif architecture == "resize":
-            # Heterogeneity is inferred from an anti-aliased image while the
-            # reconstruction loss remains at full resolution.  This avoids the
-            # O(box^2 * 4096) legacy projection (hundreds of millions of weights
-            # for 256/320 boxes) without inserting a learned downsampling stage.
+            # Heterogeneity is inferred from the full resolution image
             hidden_layers_conv = []
         else:
             raise ValueError(f"Unknown ReconSIREN heterogeneity encoder architecture: {architecture}")
@@ -508,14 +500,11 @@ class EncoderHet(nnx.Module):
             for layer in self.stem:
                 x = nnx.leaky_relu(layer(x))
             if x.shape[1] != self.input_conv_dim or x.shape[2] != self.input_conv_dim:
-                x = jax.image.resize(
-                    x, (x.shape[0], self.input_conv_dim, self.input_conv_dim, 1), method="bilinear")
+                x = jax.image.resize(x, (x.shape[0], self.input_conv_dim, self.input_conv_dim, 1), method="bilinear")
             conv_layers = self.hidden_layers_conv
         else:
             if x.shape[1] != self.input_conv_dim or x.shape[2] != self.input_conv_dim:
-                x = jax.image.resize(
-                    x, (x.shape[0], self.input_conv_dim, self.input_conv_dim, 1),
-                    method="lanczos3", antialias=True)
+                x = jax.image.resize(x, (x.shape[0], self.input_conv_dim, self.input_conv_dim, 1), method="lanczos3", antialias=True)
             conv_layers = self.hidden_layers_conv
 
         for layer in conv_layers:
@@ -620,7 +609,7 @@ class DeltaVolumeDecoder(nnx.Module):
 
         return coords, values
 
-    def decode_volume(self, coords_values=None, filter=True, sigma=1.0, analytic=False):
+    def decode_volume(self, coords_values=None, filter=True, sigma=1.0):
         # Decode volume values
         if coords_values is not None:
             coords, values = coords_values
@@ -658,19 +647,11 @@ class DeltaVolumeDecoder(nnx.Module):
 
         # Filter volume
         if filter:
-            low_pass = low_pass_3d_analytic if analytic else low_pass_3d
-            grids = jax.vmap(low_pass, in_axes=(0, None))(grids, sigma)
+            grids = jax.vmap(low_pass_3d_analytic, in_axes=(0, None))(grids, sigma)
 
         return grids
 
-def _splat_cloud_volumes(coords, values, volume_size, filter=True, sigma=1.0,
-                         analytic=False):
-    """Trilinear scatter of per-state Gaussian clouds onto ``B`` volume grids.
-
-    ``coords`` are already displaced to grid units (box corner origin) and vary
-    with the batch, unlike the consensus renderer where one cloud is shared
-    across amplitude sets.
-    """
+def _splat_cloud_volumes(coords, values, volume_size, filter=True, sigma=1.0):
     grids = jnp.zeros((values.shape[0], volume_size, volume_size, volume_size))
 
     bposf = jnp.floor(coords)
@@ -697,8 +678,7 @@ def _splat_cloud_volumes(coords, values, volume_size, filter=True, sigma=1.0,
 
     # Filter volume
     if filter:
-        low_pass = low_pass_3d_analytic if analytic else low_pass_3d
-        grids = jax.vmap(low_pass, in_axes=(0, None))(grids, sigma)
+        grids = jax.vmap(low_pass_3d_analytic, in_axes=(0, None))(grids, sigma)
 
     return grids
 
@@ -727,11 +707,8 @@ class HetVolumeDecoder(nnx.Module):
             hidden.append(
                 Siren2Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, is_first=False,
                              custom_init=True, is_residual=True, w0=1.0, s=0.0, c=6.0))
-        final_init = (nnx.initializers.normal(1e-4) if small_final_init
-                      else nnx.initializers.glorot_uniform())
-        hidden.append(Linear(in_features=8, out_features=4 * n_gaussians, rngs=rngs,
-                             kernel_init=final_init,
-                             bias_init=nnx.initializers.zeros_init()))
+        final_init = (nnx.initializers.normal(1e-4) if small_final_init else nnx.initializers.glorot_uniform())
+        hidden.append(Linear(in_features=8, out_features=4 * n_gaussians, rngs=rngs, kernel_init=final_init, bias_init=nnx.initializers.zeros_init()))
         self.hidden = nnx.List(hidden)
 
     def _decode_deltas(self, x):
@@ -744,9 +721,8 @@ class HetVolumeDecoder(nnx.Module):
     def __call__(self, x, base_coords=None, base_values=None):
         deltas = self._decode_deltas(x)
         if self.center_decoder:
-            # Remove the latent-independent decoder path.  z=0 is therefore the
-            # current consensus exactly, while all conformational changes must
-            # be explained through a latent-dependent residual.
+            # Let z=0 be the consensus map, so any latent vector represents the deviation to be
+            # considered to get a given heterogeneous state
             deltas = deltas - self._decode_deltas(jnp.zeros_like(x))
         delta_coords, delta_values = deltas[..., :3], deltas[..., 3]
 

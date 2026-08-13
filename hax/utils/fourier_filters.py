@@ -75,13 +75,7 @@ def low_pass_3d(x, std=1.0, kernel_size=9):
 
 
 def low_pass_3d_analytic(x, std=1.0):
-    """Exact Gaussian low-pass ``exp(-2 pi^2 std^2 f^2)`` on a 3D grid.
-
-    The 3D counterpart of :func:`gaussian_envelope`: unlike :func:`low_pass_3d`
-    it is not truncated to a tap kernel, so it stays a true Gaussian for any
-    ``std`` and matches the analytic 2D splat envelope used by the fused
-    projection filter.
-    """
+    """Exact Gaussian low-pass on a 3D grid"""
     shape = x.shape
     fz = jnp.fft.fftfreq(shape[0])
     fy = jnp.fft.fftfreq(shape[1])
