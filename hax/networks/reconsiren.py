@@ -179,94 +179,6 @@ def repulsion_loss(
     return jnp.mean(energy)
 
 
-def _assignment_probabilities(losses, temperature, adaptive=True, eps=1e-6):
-    """Turn per-candidate losses into stable responsibilities.
-
-    In adaptive mode ``temperature`` is dimensionless: every particle's loss
-    differences are divided by their own standard deviation first.  This makes
-    the exploration schedule insensitive to map amplitude, box size and CTF
-    mode, unlike the historical absolute ``tau``.
-    """
-    centered = losses - jnp.min(losses, axis=1, keepdims=True)
-    if adaptive:
-        scale = jnp.std(centered, axis=1, keepdims=True)
-        centered = centered / jnp.maximum(scale, eps)
-    temperature = jnp.maximum(jnp.asarray(temperature, dtype=losses.dtype), eps)
-    return jax.nn.softmax(-centered / temperature, axis=1)
-
-
-class _PoseCurriculumController:
-    """Advance the candidate scoring resolution on a staged epoch schedule.
-
-    Each low-pass stage is held for a fixed number of epochs before the
-    frequency band widens, so scoring resolution, assignment temperature and
-    the multiscale blend all move together.
-    """
-
-    def __init__(self, image_size, scales, min_epochs=1, max_epochs=10,
-                 temperatures=None):
-        self.image_size = int(image_size)
-        self.scales = tuple(float(scale) for scale in scales)
-        self.min_epochs = max(1, int(min_epochs))
-        self.max_epochs = max(0, int(max_epochs))
-        if temperatures is None:
-            temperatures = (0.0,) * len(self.scales)
-        temperatures = tuple(float(value) for value in temperatures)
-        if len(temperatures) == 1:
-            temperatures = temperatures * len(self.scales)
-        if len(temperatures) != len(self.scales):
-            raise ValueError(
-                "curriculum temperatures must match the number of scales")
-        self.temperatures = temperatures
-        self.stage = 0
-        self.epochs_in_stage = 0
-
-    @property
-    def temperature(self):
-        """Dimensionless assignment temperature; the final stage is always hard."""
-        if self.is_final:
-            return 0.0
-        return self.temperatures[self.stage]
-
-    @property
-    def is_final(self):
-        return self.stage >= len(self.scales)
-
-    @property
-    def scoring_size(self):
-        if self.is_final:
-            return self.image_size
-        return min(self.image_size,
-                   max(8, int(round(self.image_size * self.scales[self.stage]))))
-
-    @property
-    def multiscale_weight_multiplier(self):
-        if self.is_final:
-            return 0.0
-        return 1.0 - self.stage / (len(self.scales) + 1)
-
-    def observe_epoch(self):
-        """Consume one finished epoch; return True when the stage advances."""
-        if self.is_final:
-            return False
-        self.epochs_in_stage += 1
-        if self.epochs_in_stage < self.min_epochs:
-            return False
-        if 0 < self.max_epochs <= self.epochs_in_stage:
-            self.stage += 1
-            self.epochs_in_stage = 0
-            return True
-        return False
-
-    def state_dict(self):
-        return {"stage": int(self.stage),
-                "epochs_in_stage": int(self.epochs_in_stage)}
-
-    def load_state_dict(self, state):
-        self.stage = min(max(0, int(state.get("stage", 0))), len(self.scales))
-        self.epochs_in_stage = max(0, int(state.get("epochs_in_stage", 0)))
-
-
 def _fibonacci_sphere_directions(n_directions, dtype=jnp.float32):
     """Deterministic equal-area bin centers on S2."""
     indices = jnp.arange(n_directions, dtype=dtype) + 0.5
@@ -330,29 +242,8 @@ def _candidate_coverage_loss(directions, memory_bank, bank_count, key,
     return jnp.sum(occupancy * jnp.log(jnp.maximum(occupancy * n_bins, eps)))
 
 
-class LowRankLinear(nnx.Module):
-    """Independent low-rank replacement for a square dense layer.
-
-    Every pose-hypothesis member owns both factors; no weights are shared between
-    hypotheses.  ``rank=0`` keeps the legacy dense layer for old checkpoints.
-    """
-
-    def __init__(self, features, rank=0, *, rngs: nnx.Rngs, dtype=jnp.bfloat16):
-        self.rank = int(rank or 0)
-        if self.rank > 0:
-            self.down = Linear(features, self.rank, rngs=rngs, dtype=dtype, use_bias=False)
-            self.up = Linear(self.rank, features, rngs=rngs, dtype=dtype)
-        else:
-            self.dense = Linear(features, features, rngs=rngs, dtype=dtype)
-
-    def __call__(self, x):
-        if self.rank > 0:
-            return self.up(self.down(x))
-        return self.dense(x)
-
-
 class PoseHead(nnx.Module):
-    def __init__(self, is_refine=False, low_rank=0, predict_shift_delta=False, *, rngs: nnx.Rngs):
+    def __init__(self, is_refine=False, predict_shift_delta=False, *, rngs: nnx.Rngs):
         if is_refine:
             kernel_init = nnx.initializers.zeros_init()
             bias_init = nnx.initializers.zeros_init()
@@ -368,11 +259,7 @@ class PoseHead(nnx.Module):
 
         hidden_layers = []
         for _ in range(3):
-            if low_rank > 0:
-                hidden_layers.append(LowRankLinear(1024, rank=low_rank, rngs=rngs, dtype=jnp.bfloat16))
-            else:
-                # Keep the exact legacy state-tree path for old checkpoints.
-                hidden_layers.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         self.hidden_layers = nnx.List(hidden_layers)
         self.pose_layer = Linear(1024, 6, rngs=rngs, kernel_init=kernel_init, bias_init=bias_init)
         self.predict_shift_delta = bool(predict_shift_delta)
@@ -394,13 +281,13 @@ class PoseHead(nnx.Module):
 
 
 class PoseHeadEnsemble(nnx.Module):
-    def __init__(self, num_members, is_refine=False, low_rank=0, predict_shift_delta=False, *, rngs: nnx.Rngs):
+    def __init__(self, num_members, is_refine=False, predict_shift_delta=False, *, rngs: nnx.Rngs):
         key = rngs.params()
         member_keys = jax.random.split(key, num_members)
 
         @nnx.vmap(in_axes=(0), out_axes=0)
         def make_member(key):
-            return PoseHead(is_refine=is_refine, low_rank=low_rank,
+            return PoseHead(is_refine=is_refine,
                             predict_shift_delta=predict_shift_delta, rngs=nnx.Rngs(key))
 
         self.ensemble = make_member(member_keys)
@@ -414,7 +301,7 @@ class PoseHeadEnsemble(nnx.Module):
 
 class EncoderPose(nnx.Module):
     def __init__(self, input_dim, pyramid_levels=4, num_components=18, refine_current_assignment=False,
-                 use_anchor_rotations=True, low_rank=0, spatial_pool=1, per_candidate_shifts=False,
+                 use_anchor_rotations=True, per_candidate_shifts=False,
                  *, rngs: nnx.Rngs):
         self.input_dim = input_dim
         self.input_conv_dim = 64  # Original was 64
@@ -423,7 +310,6 @@ class EncoderPose(nnx.Module):
         self.num_components = num_components
         self.refine_current_assignment = refine_current_assignment
         self.use_anchor_rotations = use_anchor_rotations
-        self.spatial_pool = max(1, int(spatial_pool))
         self.per_candidate_shifts = bool(per_candidate_shifts)
 
         # Hidden layers
@@ -442,8 +328,7 @@ class EncoderPose(nnx.Module):
         hidden_layers_conv.append(Conv(512, 512, kernel_size=(3, 3), strides=(1, 1), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
         self.hidden_layers_conv = nnx.List(hidden_layers_conv)
 
-        linear_spatial = max(1, self.out_conv_dim // self.spatial_pool)
-        hidden_layers_linear = [Linear(linear_spatial * linear_spatial * 512, 1024, rngs=rngs, dtype=jnp.bfloat16)]
+        hidden_layers_linear = [Linear(self.out_conv_dim * self.out_conv_dim * 512, 1024, rngs=rngs, dtype=jnp.bfloat16)]
         hidden_layers_linear.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         hidden_layers_linear.append(Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
         # self.hidden_layers_linear.append(Linear(1024, 8, rngs=rngs))
@@ -454,7 +339,6 @@ class EncoderPose(nnx.Module):
 
         # Layers to 9D rotation
         self.ensemble_6d_heads = PoseHeadEnsemble(num_members=num_components, is_refine=False,
-                                                 low_rank=low_rank,
                                                  predict_shift_delta=self.per_candidate_shifts,
                                                  rngs=rngs)
 
@@ -492,10 +376,6 @@ class EncoderPose(nnx.Module):
                 x = nnx.gelu(x + layer(x))
             else:
                 x = nnx.gelu(layer(x))
-
-        if self.spatial_pool > 1:
-            x = nnx.avg_pool(x, window_shape=(self.spatial_pool, self.spatial_pool),
-                             strides=(self.spatial_pool, self.spatial_pool), padding="VALID")
 
         # Linear hidden layers
         x = rearrange(x, 'b h w c -> b (h w c)')
@@ -888,103 +768,6 @@ class HetVolumeDecoder(nnx.Module):
                                     filter=filter, sigma=sigma, analytic=analytic)
 
 
-class HetFieldDecoder(nnx.Module):
-    """Coordinate-conditioned delta field, FiLM-modulated by the latent.
-
-    The low-rank readout of :class:`HetVolumeDecoder` spans at most ``lat_dim``
-    global deformation modes: every Gaussian moves along a fixed direction, and
-    a motion confined to one region has to be paid for out of that same global
-    budget. Here the delta is a continuous SIREN field of the point position,
-    so locality costs latent capacity only where the conformation differs. The
-    price is B x N x width activations instead of B x width.
-    """
-
-    def __init__(self, coords, values, n_gaussians, lat_dim, volume_size,
-                 residual_to_consensus=False, center_decoder=False,
-                 coordinate_scale=1.0, amplitude_scale=1.0, small_final_init=False,
-                 width=64, *, rngs: nnx.Rngs):
-        self.volume_size = volume_size
-        self.n_gaussians = n_gaussians
-        self.coords = coords[None, ...]
-        self.reference_values = values[None, ...]
-        self.residual_to_consensus = bool(residual_to_consensus)
-        self.center_decoder = bool(center_decoder)
-        self.coordinate_scale = float(coordinate_scale)
-        self.amplitude_scale = float(amplitude_scale)
-        self.width = int(width)
-
-        # Indices to (normalized) coords
-        self.factor = 0.5 * volume_size
-
-        self.coordinate_layer = Siren2Linear(
-            in_features=3, out_features=self.width, rngs=rngs, dtype=jnp.bfloat16,
-            is_first=True, w0=30.0, s=0.0, c=1.0)
-        hidden, film_gamma, film_beta = [], [], []
-        for _ in range(2):
-            hidden.append(
-                Siren2Linear(in_features=self.width, out_features=self.width, rngs=rngs,
-                             dtype=jnp.bfloat16, is_first=False, custom_init=True,
-                             is_residual=True, w0=1.0, s=0.0, c=6.0))
-            # Zero-initialized FiLM: the field starts latent-independent, so
-            # centering is exact at init and the untrained latent cannot inject
-            # noise into the consensus geometry.
-            film_gamma.append(Linear(in_features=lat_dim, out_features=self.width, rngs=rngs,
-                                     dtype=jnp.bfloat16,
-                                     kernel_init=nnx.initializers.zeros_init(),
-                                     bias_init=nnx.initializers.zeros_init()))
-            film_beta.append(Linear(in_features=lat_dim, out_features=self.width, rngs=rngs,
-                                    dtype=jnp.bfloat16,
-                                    kernel_init=nnx.initializers.zeros_init(),
-                                    bias_init=nnx.initializers.zeros_init()))
-        self.hidden = nnx.List(hidden)
-        self.film_gamma = nnx.List(film_gamma)
-        self.film_beta = nnx.List(film_beta)
-        final_init = (nnx.initializers.normal(1e-4) if small_final_init
-                      else nnx.initializers.glorot_uniform())
-        self.readout = Linear(in_features=self.width, out_features=4, rngs=rngs,
-                              kernel_init=final_init,
-                              bias_init=nnx.initializers.zeros_init())
-
-    def _decode_deltas(self, x, points):
-        # points: (N, 3) normalized to ~[-1, 1]; x: (B, lat_dim)
-        h = self.coordinate_layer(points)
-        h = jnp.broadcast_to(h[None, ...], (x.shape[0],) + h.shape)
-        for layer, gamma, beta in zip(self.hidden, self.film_gamma, self.film_beta):
-            h = layer(h * (1.0 + gamma(x)[:, None, :]) + beta(x)[:, None, :])
-        return self.readout(h)
-
-    def __call__(self, x, base_coords=None, base_values=None):
-        if self.residual_to_consensus and (base_coords is None or base_values is None):
-            raise ValueError("Consensus-relative heterogeneity requires base coordinates and values")
-        # The field is queried at the CURRENT consensus positions, but must not
-        # push its own gradient back into them through its input.
-        points = base_coords[0] / self.factor if self.residual_to_consensus else self.coords[0]
-        points = jax.lax.stop_gradient(points)
-
-        deltas = self._decode_deltas(x, points)
-        if self.center_decoder:
-            # Remove the latent-independent decoder path.  z=0 is therefore the
-            # current consensus exactly, while all conformational changes must
-            # be explained through a latent-dependent residual.
-            deltas = deltas - self._decode_deltas(jnp.zeros_like(x), points)
-        delta_coords, delta_values = deltas[..., :3], deltas[..., 3]
-
-        if self.residual_to_consensus:
-            coords = base_coords + self.factor * self.coordinate_scale * delta_coords
-            values = nnx.relu(base_values + self.amplitude_scale * delta_values)
-        else:
-            coords = self.factor * (self.coords + delta_coords)
-            values = nnx.relu(self.reference_values + delta_values)
-
-        return coords, values
-
-    def decode_volume(self, x, filter=True, sigma=1.0, base_coords=None, base_values=None,
-                      analytic=False):
-        coords, values = self.__call__(x, base_coords=base_coords, base_values=base_values)
-        return _splat_cloud_volumes(coords + self.factor, values, self.volume_size,
-                                    filter=filter, sigma=sigma, analytic=analytic)
-
-
 class PhysDecoder:
     def __init__(self, xsize, render_chunk_size=0, fused_envelope=False):
         self.xsize = xsize
@@ -1090,21 +873,19 @@ class ReconSIREN(nnx.Module):
     @save_config
     def __init__(self, coords, values, xsize, sr, bank_size=1024, ctf_type="apply", lat_dim=8, sigma=1.0,
                  symmetry_group="c1", refine_current_assignment=False, learn_delta_volume=True, num_components=18,
-                 use_anchor_rotations=True, optimization_profile="legacy", pose_head_rank=None,
-                 pose_spatial_pool=None,
+                 use_anchor_rotations=True, optimization_profile="legacy",
                  het_encoder_architecture=None,
                  consensus_parameterization=None, render_chunk_size=None,
-                 candidate_chunk_size=None, coarse_topk=None, coarse_scale=None, coarse_gaussians=None,
+                 candidate_chunk_size=None, coarse_topk=None, coarse_scale=None,
                  heterogeneity_profile="legacy", het_encoder_size=None,
                  het_residual_to_consensus=None, het_center_decoder=None,
                  het_coordinate_scale=1.0, het_amplitude_scale=1.0,
-                 het_decoder_architecture="lowrank", het_decoder_width=64,
                  het_loss_scales=None, het_loss_weights=None, het_mask_radius=None,
                  het_normalize_target=None, het_variance_weight=None,
                  het_covariance_weight=None, het_min_std=0.1,
                  het_start_epoch=None, het_freeze_consensus=None,
                  het_latent_bank_size=2048,
-                 fused_envelope=False, sigma_bounds=None, per_candidate_shifts=False,
+                 fused_envelope=False, per_candidate_shifts=False,
                  *, rngs: nnx.Rngs, **kwargs):
         super(ReconSIREN, self).__init__()
         aggressive = optimization_profile == "aggressive"
@@ -1113,12 +894,6 @@ class ReconSIREN(nnx.Module):
             raise ValueError("optimization_profile must be 'legacy' or 'aggressive'")
         if heterogeneity_profile not in ("legacy", "anti_collapse"):
             raise ValueError("heterogeneity_profile must be 'legacy' or 'anti_collapse'")
-        if het_decoder_architecture not in ("lowrank", "field"):
-            raise ValueError("het_decoder_architecture must be 'lowrank' or 'field'")
-        if int(het_decoder_width) < 1:
-            raise ValueError("het_decoder_width must be positive")
-        pose_head_rank = (128 if aggressive else 0) if pose_head_rank is None else int(pose_head_rank)
-        pose_spatial_pool = (4 if aggressive else 1) if pose_spatial_pool is None else int(pose_spatial_pool)
         if het_encoder_architecture is None:
             het_encoder_architecture = "resize" if anti_collapse else ("convstem" if aggressive else "legacy")
         consensus_parameterization = ("direct" if aggressive else "network") if consensus_parameterization is None else consensus_parameterization
@@ -1126,7 +901,6 @@ class ReconSIREN(nnx.Module):
         candidate_chunk_size = (3 if aggressive else 0) if candidate_chunk_size is None else int(candidate_chunk_size)
         coarse_topk = (4 if aggressive else num_components) if coarse_topk is None else int(coarse_topk)
         coarse_scale = (0.5 if aggressive else 1.0) if coarse_scale is None else float(coarse_scale)
-        coarse_gaussians = (2048 if aggressive else 0) if coarse_gaussians is None else int(coarse_gaussians)
         default_het_size = min(128, max(16, (int(xsize) // 16) * 16))
         het_encoder_size = (default_het_size if anti_collapse else 64) if het_encoder_size is None else int(het_encoder_size)
         het_residual_to_consensus = anti_collapse if het_residual_to_consensus is None else bool(het_residual_to_consensus)
@@ -1172,7 +946,6 @@ class ReconSIREN(nnx.Module):
             raise ValueError("coarse_scale must be in (0, 1]")
         self.coarse_topk = max(1, min(int(coarse_topk), int(num_components)))
         self.coarse_scale = float(coarse_scale)
-        self.coarse_gaussians = max(0, int(coarse_gaussians))
         self.candidate_chunk_size = max(0, int(candidate_chunk_size))
         self.het_loss_scales = het_loss_scales
         self.het_loss_weights = het_loss_weights
@@ -1187,15 +960,8 @@ class ReconSIREN(nnx.Module):
         self.refine_current_assignment = refine_current_assignment
         self.learn_delta_volume = learn_delta_volume
         self.fused_envelope = bool(fused_envelope)
-        if sigma_bounds is not None:
-            lo, hi = float(sigma_bounds[0]), float(sigma_bounds[1])
-            if not 0.0 < lo < hi:
-                raise ValueError("sigma_bounds must satisfy 0 < min < max")
-            sigma_bounds = (lo, hi)
-        self.sigma_bounds = sigma_bounds
         self.encoder_pose = EncoderPose(self.xsize, num_components=num_components, refine_current_assignment=refine_current_assignment,
-                                        use_anchor_rotations=use_anchor_rotations, low_rank=pose_head_rank,
-                                        spatial_pool=pose_spatial_pool,
+                                        use_anchor_rotations=use_anchor_rotations,
                                         per_candidate_shifts=per_candidate_shifts, rngs=rngs)
         self.encoder_het = EncoderHet(self.xsize, lat_dim=lat_dim,
                                       architecture=het_encoder_architecture,
@@ -1203,34 +969,16 @@ class ReconSIREN(nnx.Module):
         self.delta_volume_decoder = DeltaVolumeDecoder(coords=coords, values=values, volume_size=self.xsize,
                                                        learn_delta_volume=learn_delta_volume,
                                                        parameterization=consensus_parameterization, rngs=rngs)
-        # Both heterogeneity decoders live under the SAME attribute name: the
-        # optimizer/parameter filters select by path, so the architecture must
-        # not move in the tree.
-        self.het_decoder_architecture = het_decoder_architecture
-        self.het_decoder_width = int(het_decoder_width)
-        het_decoder_kwargs = dict(
+        self.delta_het_decoder = HetVolumeDecoder(
             coords=coords, values=values, n_gaussians=coords.shape[0], lat_dim=lat_dim,
             volume_size=self.xsize, residual_to_consensus=het_residual_to_consensus,
             center_decoder=het_center_decoder, coordinate_scale=het_coordinate_scale,
-            amplitude_scale=het_amplitude_scale, small_final_init=anti_collapse)
-        if het_decoder_architecture == "field":
-            self.delta_het_decoder = HetFieldDecoder(
-                width=self.het_decoder_width, rngs=rngs, **het_decoder_kwargs)
-        else:
-            self.delta_het_decoder = HetVolumeDecoder(rngs=rngs, **het_decoder_kwargs)
+            amplitude_scale=het_amplitude_scale, small_final_init=anti_collapse, rngs=rngs)
         self.phys_decoder = PhysDecoder(self.xsize, render_chunk_size=render_chunk_size,
                                         fused_envelope=self.fused_envelope)
 
-        # Gaussian std. When bounds are active the parameter stores a logit and
-        # the width lives on a sigmoid between them: a plain clip would zero the
-        # gradient at the bound and freeze sigma there for good.
-        sigma_init = jnp.asarray(sigma, dtype=jnp.float32)
-        if self.sigma_bounds is None:
-            self.log_std = nnx.Param(jnp.log(sigma_init))
-        else:
-            lo, hi = self.sigma_bounds
-            frac = jnp.clip((sigma_init - lo) / (hi - lo), 1e-3, 1.0 - 1e-3)
-            self.log_std = nnx.Param(jnp.log(frac) - jnp.log1p(-frac))
+        # Gaussian std
+        self.log_std = nnx.Param(jnp.log(sigma))
 
         #### Memory bank for latent spaces ####
         self.bank_size = bank_size
@@ -1254,11 +1002,7 @@ class ReconSIREN(nnx.Module):
         return self.encoder_pose(x, rngs=rngs)
     
     def get_std(self):
-        raw = self.log_std.get_value()
-        if self.sigma_bounds is None:
-            return jnp.exp(raw)
-        lo, hi = self.sigma_bounds
-        return lo + (hi - lo) * jax.nn.sigmoid(raw)
+        return jnp.exp(self.log_std.get_value())
 
     def decode_image(self, x, labels, md, ctf_type=None):
         # Precompute batch CTFs
@@ -1323,8 +1067,7 @@ class ReconSIREN(nnx.Module):
 
 
 def _candidate_reconstruction_losses(images, targets, ctf, ctf_type,
-                                     normalize_target=True, return_prepared=False,
-                                     scoring_size=None):
+                                     normalize_target=True, return_prepared=False):
     """Per-particle, per-candidate loss without materialising target copies."""
     target = targets[..., 0] if targets.shape[-1] == 1 else targets
     predicted = images[..., 0] if images.shape[-1] == 1 else images
@@ -1348,10 +1091,6 @@ def _candidate_reconstruction_losses(images, targets, ctf, ctf_type,
             rearrange(ctf_candidates, "b n w h -> (b n) w h"), pad_factor=2)
         predicted = rearrange(predicted, "(b n) w h -> b n w h",
                               b=target.shape[0], n=n_candidates)
-
-    if scoring_size is not None and scoring_size < target.shape[-1]:
-        predicted = _resize_candidate_images(predicted, scoring_size)
-        target = _resize_candidate_images(target[:, None, ...], scoring_size)[:, 0]
 
     # The legacy path normalized identical target copies independently.  Taking
     # the same reduction once per particle produces the same value and lets
@@ -1717,81 +1456,46 @@ def _gather_candidates(values, indices):
     return values[jnp.arange(values.shape[0])[:, None], indices]
 
 
-def _score_candidates(model, x, values, coords, rotations, shifts, ctf,
-                      scoring_size=None, std=None):
-    """Render candidates once and return curriculum and full-resolution losses."""
+def _score_candidates(model, x, values, coords, rotations, shifts, ctf, std=None):
+    """Render every candidate once and return its reconstruction loss."""
     chunk = model.candidate_chunk_size
     n_candidates = rotations.shape[1]
-    scoring_size = model.xsize if scoring_size is None else scoring_size
     std = model.get_std() if std is None else std
     if chunk <= 0 or chunk >= n_candidates:
         images = model.phys_decoder(
             x, values, coords, model.xsize, rotations, shifts, ctf,
             model.ctf_type, std)
-        full_losses = _candidate_reconstruction_losses(
-            images, x, ctf, model.ctf_type)
-        if scoring_size >= model.xsize:
-            return full_losses, full_losses
-        scoring_losses = _candidate_reconstruction_losses(
-            images, x, ctf, model.ctf_type, scoring_size=scoring_size)
-        return scoring_losses, full_losses
+        return _candidate_reconstruction_losses(images, x, ctf, model.ctf_type)
 
-    scoring_losses = []
-    full_losses = []
+    losses = []
     for start in range(0, n_candidates, chunk):
         images = model.phys_decoder(
             x, values, coords, model.xsize,
             rotations[:, start:start + chunk], shifts[:, start:start + chunk],
             ctf, model.ctf_type, std)
-        full_chunk = _candidate_reconstruction_losses(
-            images, x, ctf, model.ctf_type)
-        full_losses.append(full_chunk)
-        if scoring_size >= model.xsize:
-            scoring_losses.append(full_chunk)
-        else:
-            scoring_losses.append(_candidate_reconstruction_losses(
-                images, x, ctf, model.ctf_type, scoring_size=scoring_size))
-    return (jnp.concatenate(scoring_losses, axis=1),
-            jnp.concatenate(full_losses, axis=1))
+        losses.append(_candidate_reconstruction_losses(
+            images, x, ctf, model.ctf_type))
+    return jnp.concatenate(losses, axis=1)
 
 
-def _consensus_multiscale_size_and_weight(
-        image_size, hard_step, steps_per_epoch, curriculum_epochs, scales):
-    """Return a discrete loss size and a smooth curriculum multiplier."""
-    curriculum_steps = float(curriculum_epochs) * int(steps_per_epoch)
-    if curriculum_steps <= 0.0 or hard_step >= curriculum_steps:
-        return int(image_size), 0.0
-    progress = max(float(hard_step), 0.0) / curriculum_steps
-    stage = min(int(progress * len(scales)), len(scales) - 1)
-    size = min(int(image_size), max(8, int(round(image_size * scales[stage]))))
-    return size, 1.0 - progress
-
-
-@partial(jax.jit, static_argnames=("use_tau", "assignment_mode",
+@partial(jax.jit, static_argnames=("use_tau",
                                    "apply_candidate_coverage", "candidate_coverage_bins",
                                    "candidate_bank_samples",
-                                   "candidate_scoring_size",
-                                   "consensus_multiscale_size",
-                                   "apply_loss_whitening", "apply_amplitude_l1",
+                                   "apply_loss_whitening",
                                    "apply_geometry_priors", "apply_support",
                                    "train_pose_volume", "train_heterogeneity", "return_metrics"),
          donate_argnums=(1,))
 def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
-                          use_tau=False, assignment_mode="hard", lambda_uniform=0.1,
+                          use_tau=False, lambda_uniform=0.1,
                           apply_candidate_coverage=False,
                           candidate_coverage_weight=0.0,
                           candidate_coverage_bins=256,
                           candidate_coverage_kappa=32.0,
                           candidate_bank_samples=1024,
                           candidate_bank_mix=0.5,
-                          candidate_scoring_size=0,
-                          consensus_multiscale_size=0,
-                          consensus_multiscale_weight=0.0,
                           apply_loss_whitening=False,
                           whiten_weight=0.0,
                           whiten_filter=None,
-                          apply_amplitude_l1=False,
-                          amplitude_l1_weight=0.0,
                           extra_blur=0.0,
                           apply_geometry_priors=False,
                           spacing_weight=0.0,
@@ -1804,10 +1508,6 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           train_pose_volume=True, train_heterogeneity=True,
                           return_metrics=False):
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
-    scoring_size = (model.xsize if candidate_scoring_size <= 0
-                    else min(int(candidate_scoring_size), model.xsize))
-    multiscale_size = (model.xsize if consensus_multiscale_size <= 0
-                       else min(int(consensus_multiscale_size), model.xsize))
 
     # Random keys
     key, coverage_key, swd_key, choice_key, distributions_key = jax.random.split(key, 5)
@@ -1839,22 +1539,14 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         random_indices = jax.random.choice(choice_key, jnp.arange(model.symmetry_matrices.shape[0]), shape=(rotations.shape[0],))
         rotations = jnp.matmul(jnp.transpose(model.symmetry_matrices[random_indices], (0, 2, 1))[:, None, :, :], rotations)
 
-        # Low-frequency curriculum scoring evaluates all candidates.  The
-        # optional coarse screen remains available once full-resolution scoring
-        # resumes, and is disabled during legacy stochastic exploration.
+        # The optional coarse screen is disabled during the stochastic
+        # exploration warm-up.
         rotations_eval, shifts_eval = rotations, shifts
-        if (not use_tau and assignment_mode == "hard"
-                and scoring_size >= model.xsize
-                and model.coarse_topk < rotations.shape[1]):
+        if (not use_tau and model.coarse_topk < rotations.shape[1]):
             screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
             x_screen = jax.image.resize(
                 x, (x.shape[0], screen_size, screen_size, x.shape[-1]), method="bilinear")
             coords_screen, values_screen = coords, values
-            if 0 < model.coarse_gaussians < coords.shape[1]:
-                keep = model.coarse_gaussians
-                idx = (jnp.arange(keep) * coords.shape[1]) // keep
-                coords_screen = coords[:, idx]
-                values_screen = values[:, idx] * (coords.shape[1] / keep)
             coarse_images = model.phys_decoder(
                 x_screen, jax.lax.stop_gradient(values_screen),
                 jax.lax.stop_gradient(coords_screen), model.xsize,
@@ -1869,10 +1561,10 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
 
         # The global competition never carries gradients through candidate
         # scoring.  Only its selected pose is rerendered into the consensus.
-        candidate_losses, full_candidate_losses = _score_candidates(
+        candidate_losses = _score_candidates(
             model, x, jax.lax.stop_gradient(values), jax.lax.stop_gradient(coords),
             jax.lax.stop_gradient(rotations_eval), jax.lax.stop_gradient(shifts_eval),
-            ctf, scoring_size=scoring_size, std=jax.lax.stop_gradient(std_eff))
+            ctf, std=jax.lax.stop_gradient(std_eff))
 
         # Candidate responsibilities are used only to pick a single global
         # winner.  Categorical exploration therefore remains safe for volume
@@ -1881,23 +1573,13 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             responsibilities = jax.nn.softmax(-candidate_losses / tau, axis=1)
             min_indices = jax.random.categorical(
                 key, jnp.log(jnp.maximum(responsibilities, 1e-12)), axis=-1)
-        elif assignment_mode == "sampled":
-            # Dimensionless temperature: the winner is drawn from margin-aware
-            # responsibilities so symmetry breaks gradually instead of at an
-            # abrupt argmin switch.
-            responsibilities = _assignment_probabilities(candidate_losses, tau)
-            min_indices = jax.random.categorical(
-                key, jnp.log(jnp.maximum(responsibilities, 1e-12)), axis=-1)
         else:
             min_indices = jnp.argmin(candidate_losses, axis=1)
-            responsibilities = jax.nn.one_hot(
-                min_indices, candidate_losses.shape[1], dtype=candidate_losses.dtype)
 
         batch_indices = jnp.arange(x.shape[0])
 
         rotations_selected = rotations_eval[batch_indices, min_indices][:, None, ...]
         shifts_selected = shifts_eval[batch_indices, min_indices][:, None, ...]
-        low_frequency_recon_loss = jnp.asarray(0.0, dtype=x.dtype)
         reconstruction_objective = jnp.asarray(0.0, dtype=x.dtype)
         if train_pose_volume:
             selected_images = model.phys_decoder(
@@ -1910,29 +1592,17 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                     selected_images, x, ctf, model.ctf_type,
                     return_prepared=True))
             recon_loss = selected_losses.mean()
-            full_band_recon_loss = recon_loss
+            reconstruction_objective = recon_loss
             if apply_loss_whitening:
                 whitened_recon_loss = _whitened_reconstruction_loss(
                     selected_predicted, selected_target, whiten_filter).mean()
                 effective_whiten_weight = jnp.clip(
                     jnp.asarray(whiten_weight, dtype=recon_loss.dtype), 0.0, 1.0)
-                full_band_recon_loss = (
+                reconstruction_objective = (
                     (1.0 - effective_whiten_weight) * recon_loss
                     + effective_whiten_weight * whitened_recon_loss)
-            low_frequency_recon_loss = recon_loss
-            effective_multiscale_weight = jnp.clip(
-                jnp.asarray(consensus_multiscale_weight, dtype=recon_loss.dtype),
-                0.0, 1.0)
-            if multiscale_size < model.xsize:
-                low_frequency_recon_loss = _candidate_reconstruction_losses(
-                    selected_images, x, ctf, model.ctf_type,
-                    scoring_size=multiscale_size).mean()
-            reconstruction_objective = (
-                (1.0 - effective_multiscale_weight) * full_band_recon_loss
-                + effective_multiscale_weight * low_frequency_recon_loss)
         else:
-            recon_loss = full_candidate_losses[batch_indices, min_indices].mean()
-            low_frequency_recon_loss = recon_loss
+            recon_loss = candidate_losses[batch_indices, min_indices].mean()
             reconstruction_objective = recon_loss
 
         min_indices_het = jnp.argmin(candidate_losses, axis=1)
@@ -2017,15 +1687,6 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
             loss = (loss + 0.5 * recon_het_loss
                     + model.het_variance_weight * variance_loss
                     + model.het_covariance_weight * covariance_loss)
-        if apply_amplitude_l1:
-            # Values are ReLU'd, so the mean is the L1 density prior: it shrinks
-            # noise-fitted background mass toward zero without touching coords.
-            amplitude_l1 = jnp.asarray(0.0, dtype=recon_loss.dtype)
-            if train_pose_volume:
-                amplitude_l1 = amplitude_l1 + jnp.mean(values)
-            if train_heterogeneity:
-                amplitude_l1 = amplitude_l1 + jnp.mean(values_het)
-            loss = loss + amplitude_l1_weight * amplitude_l1
         # Geometry/support priors constrain whatever cloud is being trained.
         # The deformed cloud needs them at least as much as the consensus: it is
         # the one free to tear the chain apart or fling dust out of the support,
@@ -2087,9 +1748,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         ctf = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
 
     coarse_ctf = ctf
-    if (not use_tau and assignment_mode == "hard"
-            and scoring_size >= model.xsize
-            and model.coarse_topk < model.encoder_pose.num_components):
+    if (not use_tau and model.coarse_topk < model.encoder_pose.num_components):
         screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
         if model.ctf_type not in (None, "None"):
             coarse_ctf = computeCTF(
@@ -2315,11 +1974,6 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md, k
         x_screen = jax.image.resize(
             x, (x.shape[0], screen_size, screen_size, x.shape[-1]), method="bilinear")
         coords_screen, values_screen = coords, values
-        if 0 < model.coarse_gaussians < coords.shape[1]:
-            keep = model.coarse_gaussians
-            idx = (jnp.arange(keep) * coords.shape[1]) // keep
-            coords_screen = coords[:, idx]
-            values_screen = values[:, idx] * (coords.shape[1] / keep)
         coarse_images = model.phys_decoder(
             x_screen, values_screen, coords_screen, model.xsize, rotations, shifts,
             coarse_ctf, model.ctf_type, model.get_std(), render_size=screen_size)
@@ -2329,7 +1983,7 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md, k
         rotations = _gather_candidates(rotations, top_indices)
         shifts = _gather_candidates(shifts, top_indices)
 
-    recon_loss, _ = _score_candidates(
+    recon_loss = _score_candidates(
         model, x, values, coords, rotations, shifts, ctf)
 
     # Get minimum indices
@@ -2350,7 +2004,6 @@ def xmippEulerFromMatrix(matrix):
 def main():
     import os
     import sys
-    import json
     import shutil
     from tqdm import tqdm
     import random
@@ -2410,12 +2063,6 @@ def main():
                         help="Execution/model profile. aggressive enables the optimized architecture and "
                              "coarse-to-fine pose scoring; legacy preserves the historical architecture. "
                              "Old checkpoints load as legacy automatically.")
-    parser.add_argument("--pose_head_rank", type=int, default=None,
-                        help="Rank of each independent factorized pose-head layer; 0 uses dense layers. "
-                             "Profile default: aggressive=128, legacy=0.")
-    parser.add_argument("--pose_spatial_pool", type=int, default=None,
-                        help="Average-pooling factor before the pose dense trunk. "
-                             "Profile default: aggressive=4, legacy=1.")
     parser.add_argument("--candidate_coverage_epochs", type=float, default=10.0,
                         help="Epochs during which the bank-aware candidate sphere-coverage loss is active; "
                              "0 disables it.")
@@ -2431,37 +2078,6 @@ def main():
     parser.add_argument("--candidate_bank_mix", type=float, default=0.5,
                         help="Historical occupancy fraction in [0,1); current candidates retain the "
                              "remaining mass so their gradients are not diluted by bank size.")
-    parser.add_argument("--consensus_multiscale_epochs", type=float, default=0.0,
-                        help="Hard-assignment epochs using a blended full- and low-frequency loss on the "
-                             "selected consensus projection. 0 keeps the legacy full-resolution objective.")
-    parser.add_argument("--consensus_multiscale_scales", type=comma_separated_floats,
-                        default=(0.25, 0.5, 0.75),
-                        help="Comma-separated image-size fractions used in equal stages by the selected "
-                             "consensus reconstruction curriculum.")
-    parser.add_argument("--consensus_multiscale_weight", type=float, default=0.5,
-                        help="Initial low-frequency weight in the selected reconstruction objective. The "
-                             "weight decays linearly to zero while retaining the complementary full-resolution term.")
-    parser.add_argument("--pose_curriculum", choices=("adaptive", "fixed"), default="adaptive",
-                        help=f"Candidate scoring-resolution schedule. {bcolors.BOLD}adaptive{bcolors.ENDC} ranks "
-                             "candidates at progressively higher low-pass resolutions and advances a stage only "
-                             "once per-particle winners are stable at the current one (this also drives the "
-                             f"consensus multiscale loss). {bcolors.BOLD}fixed{bcolors.ENDC} preserves the "
-                             "full-resolution scoring and epoch-scheduled multiscale loss.")
-    parser.add_argument("--candidate_frequency_scales", type=comma_separated_floats,
-                        default=(0.25, 0.5, 0.75),
-                        help="Comma-separated image-size fractions used as adaptive curriculum stages before "
-                             "full resolution is restored.")
-    parser.add_argument("--pose_curriculum_min_epochs", type=int, default=1,
-                        help="Minimum epochs spent in each curriculum stage before it may advance.")
-    parser.add_argument("--pose_curriculum_max_epochs", type=int, default=10,
-                        help="Epochs spent in each curriculum stage before it advances. Must be at least 1 "
-                             "and at least --pose_curriculum_min_epochs.")
-    parser.add_argument("--pose_curriculum_temperatures", type=comma_separated_floats,
-                        default=(0.3, 0.15, 0.05),
-                        help="Dimensionless assignment temperatures per adaptive curriculum stage (a single "
-                             "value applies to every stage). Winners are sampled from margin-aware "
-                             "responsibilities instead of taken by argmin; the final full-resolution stage "
-                             "is always hard. 0 disables sampling for clean A/B runs.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Optional reproducible seed for Gaussian-cloud and network initialization.")
     parser.add_argument("--heterogeneity_profile", choices=("legacy", "anti_collapse"),
@@ -2484,15 +2100,6 @@ def main():
                         help="Multiplier for heterogeneous coordinate residuals.")
     parser.add_argument("--het_amplitude_scale", type=float, default=1.0,
                         help="Multiplier for heterogeneous amplitude residuals.")
-    parser.add_argument("--het_decoder_architecture", choices=("lowrank", "field"), default="lowrank",
-                        help=f"Heterogeneity decoder. {bcolors.BOLD}lowrank{bcolors.ENDC} (default) is the shared "
-                             f"SIREN trunk with a per-Gaussian readout: it spans at most --lat_dim GLOBAL "
-                             f"deformation modes, so a motion confined to one domain competes for the same "
-                             f"budget as whole-body motion. {bcolors.BOLD}field{bcolors.ENDC} decodes the delta as a "
-                             f"coordinate-conditioned SIREN field modulated by the latent, making local motion "
-                             f"cheap; it costs batch x n_gaussians x --het_decoder_width activations.")
-    parser.add_argument("--het_decoder_width", type=int, default=64,
-                        help="Hidden width of the 'field' heterogeneity decoder (ignored by 'lowrank').")
     parser.add_argument("--lat_dim", type=int, default=8,
                         help="Dimension of the heterogeneity latent space.")
     parser.add_argument("--het_learning_rate", type=float, default=1e-4,
@@ -2548,35 +2155,15 @@ def main():
                              "Profile default: aggressive=4, legacy=all.")
     parser.add_argument("--coarse_scale", type=float, default=None,
                         help="Linear image scale for coarse pose ranking. Profile default: aggressive=0.5.")
-    parser.add_argument("--coarse_gaussians", type=int, default=None,
-                        help="Deterministic Gaussian subset for coarse ranking; 0 uses the full cloud. "
-                             "Profile default: aggressive=2048, legacy=all.")
     parser.add_argument("--no_fused_envelope", action="store_true",
                         help="Disable the fused analytic Gaussian-envelope + CTF Fourier filter and go back to "
                              "the legacy truncated 9-tap spatial blur followed by a separate CTF pass.")
-    parser.add_argument("--sigma_bounds", type=str, default="auto",
-                        help="Bounds 'min,max' (in voxels) for the learned splat width. Bounding stops the "
-                             "optimizer from inflating sigma to hide pose error (which blurs the map) and from "
-                             "collapsing it below the splat sampling limit. 'auto' derives the bounds from the "
-                             "fitted initial width.")
-    parser.add_argument("--no_sigma_bounds", action="store_true",
-                        help="Keep the legacy unbounded learned splat width.")
-    parser.add_argument("--no_adaptive_sigma", action="store_true",
-                        help=f"Disable the spacing-derived minimum splat width in {bcolors.ITALIC}ab initio{bcolors.ENDC} mode. "
-                             f"By default the 'auto' sigma bounds floor the width at half the mean point spacing "
-                             f"implied by --num_gaussians and the estimated particle extent (narrower splats "
-                             f"render beads, not continuous density), raising the fixed 1.0 initialization when "
-                             f"it falls below that floor.")
     parser.add_argument("--whiten_loss_weight", type=float, default=0.5,
                         help="Blend weight in [0,1] for the noise-whitened consensus reconstruction loss. The "
                              "dataset noise spectrum is estimated once from the particle solvent corners; "
                              "whitening equalises the per-frequency-shell SNR so high-resolution shells receive "
                              "real gradient instead of being drowned by the low-frequency power. Only active at "
                              "the final (full-resolution) pose-curriculum stage. 0 disables.")
-    parser.add_argument("--amplitude_l1", type=float, default=0.0,
-                        help="Weight of an L1 prior on Gaussian amplitudes (consensus and heterogeneous) that "
-                             "suppresses noise-fitted background dust. Off by default: measure its scale against "
-                             "the reconstruction loss on your dataset before trusting a non-zero value.")
     parser.add_argument("--no_per_candidate_shifts", action="store_true",
                         help="Disable the per-candidate in-plane shift deltas and go back to one shared shift "
                              "broadcast to every pose hypothesis.")
@@ -2618,9 +2205,9 @@ def main():
                         help="A point is considered dead when its amplitude falls below this fraction of the "
                              "mean amplitude.")
     parser.add_argument("--cloud_blur_max", type=float, default=1.5,
-                        help="Maximum extra render blur (voxels, added in quadrature to the learned splat width) "
-                             "at the start of training, annealed to zero as the pose curriculum reaches full "
-                             "resolution: the cloud stays coarse while poses are coarse. 0 disables.")
+                        help="Extra render blur (voxels, added in quadrature to the learned splat width) during "
+                             "the stochastic warm-up, dropped to zero once winners are taken by argmin: the "
+                             "cloud stays coarse while poses are coarse. 0 disables.")
     parser.add_argument("--no_equalized_map", action="store_true",
                         help="Do not write the amplitude-equalized tracing map in predict mode.")
     parser.add_argument("--equalized_map_gamma", type=float, default=0.5,
@@ -2665,49 +2252,13 @@ def main():
         parser.error("--candidate_bank_mix must be in [0,1)")
     if args.candidate_coverage_weight < 0.0:
         parser.error("--candidate_coverage_weight must be non-negative")
-    if args.consensus_multiscale_epochs < 0.0:
-        parser.error("--consensus_multiscale_epochs must be non-negative")
-    if not 0.0 <= args.consensus_multiscale_weight <= 1.0:
-        parser.error("--consensus_multiscale_weight must be in [0,1]")
-    if (not args.consensus_multiscale_scales
-            or any(scale <= 0.0 or scale > 1.0
-                   for scale in args.consensus_multiscale_scales)):
-        parser.error("--consensus_multiscale_scales values must be in (0,1]")
-    if any(right <= left for left, right in zip(
-            args.consensus_multiscale_scales,
-            args.consensus_multiscale_scales[1:])):
-        parser.error("--consensus_multiscale_scales must be strictly increasing")
-    if (not args.candidate_frequency_scales
-            or any(scale <= 0.0 or scale > 1.0
-                   for scale in args.candidate_frequency_scales)):
-        parser.error("--candidate_frequency_scales values must be in (0,1]")
-    if any(right <= left for left, right in zip(
-            args.candidate_frequency_scales,
-            args.candidate_frequency_scales[1:])):
-        parser.error("--candidate_frequency_scales must be strictly increasing")
-    if args.pose_curriculum_min_epochs < 1:
-        parser.error("--pose_curriculum_min_epochs must be at least 1")
-    if args.pose_curriculum_max_epochs < 1:
-        parser.error("--pose_curriculum_max_epochs must be at least 1")
-    if args.pose_curriculum_max_epochs < args.pose_curriculum_min_epochs:
-        parser.error("--pose_curriculum_max_epochs must be >= --pose_curriculum_min_epochs")
-    if (not args.pose_curriculum_temperatures
-            or any(value < 0.0 for value in args.pose_curriculum_temperatures)):
-        parser.error("--pose_curriculum_temperatures values must be non-negative")
-    if len(args.pose_curriculum_temperatures) not in (
-            1, len(args.candidate_frequency_scales)):
-        parser.error("--pose_curriculum_temperatures must be a single value or one "
-                     "per --candidate_frequency_scales entry")
     if args.disable_quality_features:
         args.no_fused_envelope = True
-        args.no_sigma_bounds = True
         args.whiten_loss_weight = 0.0
-        args.amplitude_l1 = 0.0
         args.no_per_candidate_shifts = True
         args.no_sharpened_map = True
     if args.disable_geometry_features:
         args.no_extent_estimation = True
-        args.no_adaptive_sigma = True
         args.support_weight = 0.0
         args.spacing_prior_weight = 0.0
         args.amplitude_smoothness_weight = 0.0
@@ -2736,18 +2287,8 @@ def main():
             parser.error(f"--{lr_name} must be positive")
     if not 0.0 <= args.whiten_loss_weight <= 1.0:
         parser.error("--whiten_loss_weight must be in [0,1]")
-    if args.amplitude_l1 < 0.0:
-        parser.error("--amplitude_l1 must be non-negative")
     if args.sharpened_map_reg <= 0.0:
         parser.error("--sharpened_map_reg must be positive")
-    explicit_sigma_bounds = None
-    if not args.no_sigma_bounds and str(args.sigma_bounds).strip().lower() != "auto":
-        try:
-            explicit_sigma_bounds = tuple(ca.list_of_floats(args.sigma_bounds))
-        except ValueError:
-            parser.error("--sigma_bounds must be 'auto' or 'min,max'")
-        if len(explicit_sigma_bounds) != 2 or not 0.0 < explicit_sigma_bounds[0] < explicit_sigma_bounds[1]:
-            parser.error("--sigma_bounds must satisfy 0 < min < max")
     if args.seed is not None:
         if args.seed < 0:
             parser.error("--seed must be non-negative")
@@ -2877,36 +2418,11 @@ def main():
     #     shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap"))
 
     # Mean point spacing implied by tiling the (estimated) support with N
-    # points: the geometric quantity behind both the adaptive sigma floor and
-    # the startup connectivity check.
+    # points: the geometric quantity behind the startup connectivity check.
     implied_spacing = None
     if args.vol is None and args.mode == "train":
         radius_check = extent_radius_px if extent_radius_px is not None else 0.25 * xsize
         implied_spacing = ((4.0 / 3.0) * np.pi * radius_check ** 3 / num_gaussians) ** (1.0 / 3.0)
-
-    # Bounds for the learned splat width. 'auto' anchors them to the fitted
-    # initial width: enough head-room to adapt, not enough to blur the map into
-    # hiding pose error or to collapse below the splat sampling limit.
-    if args.no_sigma_bounds:
-        sigma_bounds = None
-    elif explicit_sigma_bounds is not None:
-        sigma_bounds = explicit_sigma_bounds
-    else:
-        sigma_init_value = float(np.mean(np.asarray(sigma)))
-        sigma_lo = min(0.5, 0.75 * sigma_init_value)
-        if implied_spacing is not None and not args.no_adaptive_sigma:
-            # Spacing-derived floor: a splat narrower than half the mean point
-            # spacing renders beads instead of continuous density, so the
-            # minimum width follows the measured cloud geometry rather than a
-            # fixed guess. If the fixed 1.0 init sits at/below that floor,
-            # raise it so sigma starts inside the usable range.
-            sigma_lo = max(sigma_lo, 0.5 * implied_spacing)
-            if sigma_init_value < 1.1 * sigma_lo:
-                sigma = 1.1 * sigma_lo
-                print(f"{bcolors.OKCYAN}Raised the initial splat width to {sigma:.2f} px to sit "
-                      f"above the spacing-derived floor ({sigma_lo:.2f} px){bcolors.ENDC}")
-                sigma_init_value = float(sigma)
-        sigma_bounds = (sigma_lo, max(2.0, 1.5 * sigma_init_value))
 
     # Startup connectivity check: with N points tiling the support, mean point
     # spacing must stay below ~2 splat widths or the rendered density cannot be
@@ -2914,14 +2430,13 @@ def main():
     # reference map to eyeball, so say it up front.
     if implied_spacing is not None:
         sigma_now = float(np.mean(np.asarray(sigma)))
-        sigma_max = sigma_bounds[1] if sigma_bounds is not None else 2.0 * sigma_now
         print(f"{bcolors.OKCYAN}Cloud geometry: {num_gaussians} points, implied spacing "
-              f"{implied_spacing:.2f} px, splat width {sigma_now:.2f} px (max {sigma_max:.2f}){bcolors.ENDC}")
-        if implied_spacing > 2.0 * sigma_max:
-            print(f"{bcolors.WARNING}WARNING: implied point spacing exceeds twice the maximum splat "
+              f"{implied_spacing:.2f} px, splat width {sigma_now:.2f} px{bcolors.ENDC}")
+        if implied_spacing > 2.0 * sigma_now:
+            print(f"{bcolors.WARNING}WARNING: implied point spacing exceeds twice the splat "
                   f"width - the rendered density cannot be continuous. Increase --num_gaussians to "
-                  f"~{int((4.0 / 3.0) * np.pi * radius_check ** 3 / (1.6 * sigma_now) ** 3)} or widen "
-                  f"--sigma_bounds.{bcolors.ENDC}")
+                  f"~{int((4.0 / 3.0) * np.pi * radius_check ** 3 / (1.6 * sigma_now) ** 3)}."
+                  f"{bcolors.ENDC}")
 
     # Random keys
     rng_seed = args.seed if args.seed is not None else random.randint(0, 2 ** 32 - 1)
@@ -2935,23 +2450,18 @@ def main():
                             num_components=args.num_components,
                             use_anchor_rotations=not args.do_not_use_anchor_rotations,
                             optimization_profile=args.optimization_profile,
-                            pose_head_rank=args.pose_head_rank,
-                            pose_spatial_pool=args.pose_spatial_pool,
                             het_encoder_architecture=args.het_encoder_architecture,
                             consensus_parameterization=args.consensus_parameterization,
                             render_chunk_size=args.render_chunk_size,
                             candidate_chunk_size=args.candidate_chunk_size,
                             coarse_topk=args.coarse_topk,
                             coarse_scale=args.coarse_scale,
-                            coarse_gaussians=args.coarse_gaussians,
                             heterogeneity_profile=args.heterogeneity_profile,
                             het_encoder_size=args.het_encoder_size,
                             het_residual_to_consensus=args.het_residual_to_consensus,
                             het_center_decoder=args.het_center_decoder,
                             het_coordinate_scale=args.het_coordinate_scale,
                             het_amplitude_scale=args.het_amplitude_scale,
-                            het_decoder_architecture=args.het_decoder_architecture,
-                            het_decoder_width=args.het_decoder_width,
                             het_loss_scales=args.het_loss_scales,
                             het_loss_weights=args.het_loss_weights,
                             het_mask_radius=args.het_mask_radius,
@@ -2963,7 +2473,6 @@ def main():
                             het_freeze_consensus=args.het_freeze_consensus,
                             het_latent_bank_size=args.het_latent_bank_size,
                             fused_envelope=not args.no_fused_envelope,
-                            sigma_bounds=sigma_bounds,
                             per_candidate_shifts=not args.no_per_candidate_shifts,
                             rngs=nnx.Rngs(model_key))
 
@@ -3119,15 +2628,6 @@ def main():
         support_radius_value = None
         intermediate_equalized_enabled = (not args.no_equalized_map
                                           and not args.do_not_learn_volume)
-        pose_curriculum_controller = (
-            _PoseCurriculumController(
-                xsize, args.candidate_frequency_scales,
-                min_epochs=args.pose_curriculum_min_epochs,
-                max_epochs=args.pose_curriculum_max_epochs,
-                temperatures=args.pose_curriculum_temperatures)
-            if args.pose_curriculum == "adaptive" else None)
-        curriculum_state_path = os.path.join(
-            args.output_path, "ReconSIREN_CHECKPOINT", "pose_curriculum.json")
         graphdef, state = nnx.split((reconsiren, optimizer_pose, optimizer_volume, optimizer_het))
 
         # Resume if checkpoint exists
@@ -3135,10 +2635,6 @@ def main():
             graphdef, state, resume_epoch = NeuralNetworkCheckpointer.load_intermediate(os.path.join(args.output_path, "ReconSIREN_CHECKPOINT"),
                                                                                         optimizer_pose, optimizer_volume, optimizer_het)
             print(f"{bcolors.WARNING}\nCheckpoint detected: resuming training from epoch {resume_epoch}{bcolors.ENDC}")
-            if (pose_curriculum_controller is not None
-                    and os.path.isfile(curriculum_state_path)):
-                with open(curriculum_state_path) as fid:
-                    pose_curriculum_controller.load_state_dict(json.load(fid))
         else:
             resume_epoch = 0
 
@@ -3165,22 +2661,11 @@ def main():
                 epoch_index = total_steps // steps_per_epoch
 
                 if total_steps % steps_per_epoch == 0:
-                    # Let the adaptive curriculum consume the finished epoch.
-                    stage_advanced = False
-                    if (pose_curriculum_controller is not None
-                            and total_steps > 1500):
-                        if pose_curriculum_controller.observe_epoch():
-                            stage_advanced = True
-                            new_size = pose_curriculum_controller.scoring_size
-                            print(f"\n{bcolors.OKCYAN}Pose curriculum advanced to stage "
-                                  f"{pose_curriculum_controller.stage}: scoring candidates "
-                                  f"at {new_size}/{xsize} pixels{bcolors.ENDC}")
-
                     # Refresh the geometry state from the live cloud: recycle
                     # dead points on schedule, then rebuild the kNN graph and
                     # the shrink-wrap support from the updated positions.
                     if recycling_enabled and total_steps > 1500 and (
-                            stage_advanced or epoch_index % args.recycle_every == 0):
+                            epoch_index % args.recycle_every == 0):
                         state, n_recycled = recycle_dead_points_reconsiren(
                             graphdef, state, rng, args.recycle_dead_fraction)
                         rng, _ = jax.random.split(rng)
@@ -3311,84 +2796,39 @@ def main():
                             NeuralNetworkCheckpointer.save_intermediate(graphdef, state,
                                                                         os.path.join(args.output_path, "ReconSIREN_CHECKPOINT"),
                                                                         epoch=i, wait=False)
-                            if pose_curriculum_controller is not None:
-                                os.makedirs(os.path.dirname(curriculum_state_path),
-                                            exist_ok=True)
-                                with open(curriculum_state_path, "w") as fid:
-                                    json.dump(pose_curriculum_controller.state_dict(), fid)
 
                     i += 1
 
-                # Preserve the historical 1,500-step stochastic warm-up.  The
-                # selected-projection curriculum begins with hard assignment.
+                # Preserve the historical 1,500-step stochastic warm-up.
                 if total_steps <= 1500:
                     tau = 1e-3
                     use_tau = True
-                    assignment_mode = "hard"
-                    candidate_scoring_size = xsize
-                    consensus_multiscale_size = xsize
-                    consensus_multiscale_weight = 0.0
                 else:
                     tau = 0.0
                     use_tau = False
-                    assignment_mode = "hard"
-                    if pose_curriculum_controller is not None:
-                        # Score candidates in the stability-gated band and keep
-                        # the consensus multiscale loss on the same band.
-                        candidate_scoring_size = pose_curriculum_controller.scoring_size
-                        consensus_multiscale_size = candidate_scoring_size
-                        consensus_multiscale_weight = (
-                            args.consensus_multiscale_weight
-                            * pose_curriculum_controller.multiscale_weight_multiplier)
-                        tau = pose_curriculum_controller.temperature
-                        assignment_mode = "sampled" if tau > 0.0 else "hard"
-                    else:
-                        candidate_scoring_size = xsize
-                        (consensus_multiscale_size,
-                         multiscale_weight_multiplier) = _consensus_multiscale_size_and_weight(
-                            xsize, total_steps - 1501, steps_per_epoch,
-                            args.consensus_multiscale_epochs,
-                            args.consensus_multiscale_scales)
-                        consensus_multiscale_weight = (
-                            args.consensus_multiscale_weight
-                            * multiscale_weight_multiplier)
                 uniform_weight = 0.1
 
-                # Whitening only makes sense once poses are scored at full
-                # resolution: before that the boosted shells are pure noise.
-                # It ramps in as the multiscale curriculum ramps out.
-                whiten_weight_step = 0.0
-                if (whiten_filter is not None and not use_tau
-                        and candidate_scoring_size >= xsize):
-                    whiten_weight_step = (args.whiten_loss_weight
-                                          * (1.0 - consensus_multiscale_weight))
+                # Whitening only makes sense once the winners settle: during the
+                # stochastic warm-up the boosted shells are pure noise.
+                whiten_weight_step = (args.whiten_loss_weight
+                                      if whiten_filter is not None and not use_tau
+                                      else 0.0)
                 apply_loss_whitening = whiten_weight_step > 0.0
 
-                # Connectivity priors also wait for full-resolution scoring:
+                # Connectivity priors also wait for the warm-up to finish:
                 # equalising or gap-closing a cloud that still has wrong poses
                 # would only make garbage look connected.
                 apply_geometry_priors_step = (
                     geometry_priors_enabled and knn_indices is not None
-                    and not use_tau and candidate_scoring_size >= xsize)
+                    and not use_tau)
                 apply_support_step = (support_enabled
                                       and support_radius_value is not None)
 
-                # Coarse-to-fine cloud: extra render blur annealed with the
-                # pose curriculum, so cloud detail waits for pose stability.
-                extra_blur_step = 0.0
-                if args.cloud_blur_max > 0.0:
-                    if total_steps <= 1500:
-                        coarse_fraction = 1.0
-                    elif pose_curriculum_controller is not None:
-                        n_stages = len(pose_curriculum_controller.scales)
-                        coarse_fraction = 1.0 - (
-                            min(pose_curriculum_controller.stage, n_stages) / n_stages)
-                    elif args.consensus_multiscale_weight > 0.0:
-                        coarse_fraction = (consensus_multiscale_weight
-                                           / args.consensus_multiscale_weight)
-                    else:
-                        coarse_fraction = 0.0
-                    extra_blur_step = args.cloud_blur_max * coarse_fraction
+                # Coarse-to-fine cloud: extra render blur during the stochastic
+                # warm-up, so cloud detail waits for pose stability.
+                extra_blur_step = (args.cloud_blur_max
+                                   if args.cloud_blur_max > 0.0 and total_steps <= 1500
+                                   else 0.0)
 
                 coverage_steps = args.candidate_coverage_epochs * steps_per_epoch
                 apply_candidate_coverage = (
@@ -3404,21 +2844,15 @@ def main():
                 loss, metrics, state, rng = train_step_reconsiren(
                     graphdef, state, x, labels, md_columns, rng,
                     lambda_uniform=uniform_weight, tau=tau, use_tau=use_tau,
-                    assignment_mode=assignment_mode,
                     apply_candidate_coverage=apply_candidate_coverage,
                     candidate_coverage_weight=candidate_coverage_weight,
                     candidate_coverage_bins=args.candidate_coverage_bins,
                     candidate_coverage_kappa=args.candidate_coverage_kappa,
                     candidate_bank_samples=args.candidate_bank_samples,
                     candidate_bank_mix=args.candidate_bank_mix,
-                    candidate_scoring_size=candidate_scoring_size,
-                    consensus_multiscale_size=consensus_multiscale_size,
-                    consensus_multiscale_weight=consensus_multiscale_weight,
                     apply_loss_whitening=apply_loss_whitening,
                     whiten_weight=whiten_weight_step,
                     whiten_filter=whiten_filter,
-                    apply_amplitude_l1=args.amplitude_l1 > 0.0,
-                    amplitude_l1_weight=args.amplitude_l1,
                     extra_blur=extra_blur_step,
                     apply_geometry_priors=apply_geometry_priors_step,
                     spacing_weight=args.spacing_prior_weight,
@@ -3450,13 +2884,6 @@ def main():
                                        {"consensus": mean_recon_loss,
                                         "heterogeneity": mean_recon_het_loss},
                                        i * steps_per_epoch + step)
-
-                    if pose_curriculum_controller is not None:
-                        writer.add_scalars('Pose curriculum (ReconSIREN)',
-                                           {"stage": float(pose_curriculum_controller.stage),
-                                            "scoring_resolution_pixels": float(candidate_scoring_size),
-                                            "scoring_resolution_fraction": float(candidate_scoring_size) / xsize},
-                                           i * steps_per_epoch + step)
 
                     # Progress bar update  (TQDM)
                     stage = "joint" if train_pose_volume and train_heterogeneity else (
