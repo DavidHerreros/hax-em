@@ -1098,74 +1098,6 @@ def _whitened_reconstruction_loss(predicted, target, whitening_filter):
     return jnp.mean(jnp.square((predicted_white - target_white) / scale), axis=(-2, -1))
 
 
-def _sharpen_gaussian_envelope(volume, sigma, reg=0.02):
-    """Wiener inverse of the splat envelope ``exp(-2 pi^2 sigma^2 f^2)``.
-
-    The rendered map always carries the Gaussian splat envelope, so its
-    amplitudes fall off like a B-factor even when the fitted point cloud holds
-    sharper structure. This divides the envelope back out with a bounded-gain
-    Wiener filter (max boost ~ ``1 / (2 * sqrt(reg))``), the same operation as
-    conventional post-hoc map sharpening.
-    """
-    shape = volume.shape
-    fz = jnp.fft.fftfreq(shape[0])
-    fy = jnp.fft.fftfreq(shape[1])
-    fx = jnp.fft.rfftfreq(shape[2])
-    f_sq = (fz[:, None, None] ** 2 + fy[None, :, None] ** 2
-            + fx[None, None, :] ** 2)
-    sigma_sq = jnp.square(jnp.asarray(sigma, jnp.float32)).reshape(())
-    envelope = jnp.exp(-2.0 * jnp.pi ** 2 * sigma_sq * f_sq)
-    gain = (1.0 + reg) * envelope / (jnp.square(envelope) + reg)
-    return jnp.fft.irfftn(jnp.fft.rfftn(volume) * gain, s=shape)
-
-
-def _estimate_particle_extent(images, threshold=0.1, margin=1.15):
-    """Estimate the particle radius in pixels from raw images alone.
-
-    Orientation-free: the per-pixel variance across the batch carries the
-    particle signal (projections change with pose) on top of a flat noise
-    floor taken from the outermost radial shells. Needs no reference volume
-    and no mask. Returns ``None`` when no clear extent stands out.
-    """
-    x = np.asarray(images, np.float32)
-    if x.ndim == 4:
-        x = x[..., 0]
-    x = (x - x.mean(axis=(1, 2), keepdims=True)) / (x.std(axis=(1, 2), keepdims=True) + 1e-8)
-    variance = x.var(axis=0)
-
-    h, w = variance.shape
-    yy, xx = np.indices((h, w))
-    r = np.sqrt((yy - h // 2) ** 2 + (xx - w // 2) ** 2).astype(np.int32)
-    n_shells = int(r.max()) + 1
-    profile = np.bincount(r.ravel(), weights=variance.ravel(), minlength=n_shells)
-    counts = np.bincount(r.ravel(), minlength=n_shells)
-    profile = profile / np.maximum(counts, 1)
-
-    max_radius = min(h, w) // 2
-    if max_radius < 8:
-        return None
-    profile = profile[:max_radius]
-    outer = profile[int(0.85 * max_radius):]
-    noise_floor = np.median(outer)
-    excess = profile - noise_floor
-    # Refuse rather than hallucinate: the variance peak must stand well clear
-    # of the outer-shell scatter (robust MAD scale) to count as a particle.
-    noise_scale = 1.4826 * np.median(np.abs(outer - noise_floor))
-    peak = excess.max()
-    if peak <= 5.0 * max(noise_scale, 1e-12):
-        return None
-    above = np.flatnonzero(excess > threshold * peak)
-    if above.size == 0:
-        return None
-    if above.max() >= int(0.85 * max_radius):
-        # The variance excess reaches into the outer shells the noise floor
-        # was measured from: there is no clean particle boundary inside the
-        # box, so any radius here would be a whole-box hallucination.
-        return None
-    radius = float(above.max()) * margin
-    return float(np.clip(radius, 4.0, 0.95 * max_radius))
-
-
 def _geometry_prior_losses(coords, values, neighbor_indices, sigma):
     """kNN spacing and amplitude-smoothness priors on the consensus cloud.
 
@@ -1272,23 +1204,6 @@ def recycle_dead_points_reconsiren(graphdef, state, key, dead_fraction=0.05,
 
     state = nnx.state((model, optimizer_pose, optimizer_volume, optimizer_het))
     return state, jnp.sum(dead)
-
-
-def _equalize_masses(masses, gamma, dust_fraction=0.02):
-    """Gamma-compress Gaussian masses for the tracing map.
-
-    Masses below ``dust_fraction`` of the positive mean are dropped entirely;
-    the rest are compressed toward the mean so one iso-surface threshold shows
-    the whole chain. Returns ``None`` when the cloud carries no mass yet.
-    """
-    masses = np.asarray(masses, np.float32)
-    positive = masses[masses > 0.0]
-    if not positive.size:
-        return None
-    mean_mass = float(positive.mean())
-    return np.where(masses > dust_fraction * mean_mass,
-                    mean_mass * (masses / mean_mass) ** gamma,
-                    0.0).astype(np.float32)
 
 
 def volume_optimizer_transform(parameterization, volume_lr, coords_lr=None,
@@ -2108,7 +2023,7 @@ def main():
         probe_indices = np.linspace(0, len(generator.md) - 1, n_probe).astype(int)
         probe = np.stack([np.squeeze(generator.md.getMetaDataImage(int(index)))
                           for index in probe_indices])
-        extent_radius_px = _estimate_particle_extent(probe)
+        extent_radius_px = estimate_particle_extent(probe)
         if extent_radius_px is not None:
             print(f"{bcolors.OKCYAN}Estimated particle radius from {n_probe} images: "
                   f"{extent_radius_px:.1f} px ({2.0 * extent_radius_px / xsize:.0%} of the box "
@@ -2469,7 +2384,7 @@ def main():
                             volume = None
                             if intermediate_equalized_enabled:
                                 _, cloud_masses = decode_cloud(reconsiren)
-                                equalized_masses = _equalize_masses(
+                                equalized_masses = equalize_masses(
                                     cloud_masses[0], args.equalized_map_gamma)
                                 if equalized_masses is not None:
                                     values_pair = jnp.stack(
@@ -2733,7 +2648,7 @@ def main():
         if not args.no_sharpened_map:
             # Companion map with the known splat envelope divided back out
             # (bounded-gain Wiener); the standard map above stays untouched.
-            sharpened = _sharpen_gaussian_envelope(jnp.asarray(decoded_volume[0]),
+            sharpened = sharpen_gaussian_envelope(jnp.asarray(decoded_volume[0]),
                                                    reconsiren.get_std(),
                                                    reg=args.sharpened_map_reg)
             ImageHandler().write(np.array(sharpened),
@@ -2746,7 +2661,7 @@ def main():
             # chain. Deliberately decoupled from true occupancy - read topology
             # here, read confidence in the physical map.
             cloud_coords, cloud_values = reconsiren.delta_volume_decoder()
-            equalized_masses = _equalize_masses(cloud_values[0], args.equalized_map_gamma)
+            equalized_masses = equalize_masses(cloud_values[0], args.equalized_map_gamma)
             if equalized_masses is not None:
                 equalized = reconsiren.delta_volume_decoder.decode_volume(
                     coords_values=(cloud_coords, jnp.asarray(equalized_masses)[None, ...]),
@@ -2768,7 +2683,7 @@ def main():
             # raw splat envelope and the un-equalized masses, which makes them
             # look worse than the consensus for reasons unrelated to the states.
             if not args.no_sharpened_map:
-                sharpened = _sharpen_gaussian_envelope(jnp.asarray(decoded[0]),
+                sharpened = sharpen_gaussian_envelope(jnp.asarray(decoded[0]),
                                                        reconsiren.get_std(),
                                                        reg=args.sharpened_map_reg)
                 ImageHandler().write(np.array(sharpened),
@@ -2778,7 +2693,7 @@ def main():
 
             if not args.no_equalized_map:
                 het_coords, het_values = decode_het_cloud(center[None, ...])
-                equalized_masses = _equalize_masses(het_values[0], args.equalized_map_gamma)
+                equalized_masses = equalize_masses(het_values[0], args.equalized_map_gamma)
                 if equalized_masses is not None:
                     equalized = _splat_cloud_volumes(
                         het_coords + reconsiren.delta_het_decoder.factor,
