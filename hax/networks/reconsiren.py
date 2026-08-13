@@ -2044,16 +2044,10 @@ def main():
         radius_check = extent_radius_px if extent_radius_px is not None else 0.25 * xsize
         implied_spacing = ((4.0 / 3.0) * np.pi * radius_check ** 3 / num_gaussians) ** (1.0 / 3.0)
 
-    # Startup connectivity check
     if implied_spacing is not None:
         sigma_now = float(np.mean(np.asarray(sigma)))
         print(f"{bcolors.OKCYAN}Cloud geometry: {num_gaussians} points, implied spacing "
               f"{implied_spacing:.2f} px, splat width {sigma_now:.2f} px{bcolors.ENDC}")
-        if implied_spacing > 2.0 * sigma_now:
-            print(f"{bcolors.WARNING}WARNING: implied point spacing exceeds twice the splat "
-                  f"width - the rendered density cannot be continuous. Increase --num_gaussians to "
-                  f"~{int((4.0 / 3.0) * np.pi * radius_check ** 3 / (1.6 * sigma_now) ** 3)}."
-                  f"{bcolors.ENDC}")
 
     # Random keys
     rng_seed = random.randint(0, 2 ** 32 - 1)
