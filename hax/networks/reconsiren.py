@@ -39,6 +39,9 @@ HET_LEARNING_RATE = 1e-4
 HET_MIN_STD = 0.1
 HET_LATENT_BANK_SIZE = 2048
 
+# Extra render blur during the early warm-up phase, to avoid dusty collapse
+CLOUD_BLUR_WARMUP = 1.5
+
 # Ab initio geometry features
 KNN_NEIGHBORS = 6
 RECYCLE_DEAD_FRACTION = 0.05
@@ -754,6 +757,7 @@ class ReconSIREN(nnx.Module):
                  consensus_parameterization=None,
                  heterogeneity_profile="legacy",
                  het_start_epoch=None,
+                 sigma_min=0.0,
                  *, rngs: nnx.Rngs, **kwargs):
         super(ReconSIREN, self).__init__()
         anti_collapse = heterogeneity_profile == "anti_collapse"
@@ -812,8 +816,10 @@ class ReconSIREN(nnx.Module):
             small_final_init=anti_collapse, rngs=rngs)
         self.phys_decoder = PhysDecoder(self.xsize)
 
-        # Gaussian std
-        self.log_std = nnx.Param(jnp.log(sigma))
+        # Gaussian std, floored so splats can't collapse below sigma_min
+        self.sigma_min = float(sigma_min)
+        init = jnp.maximum(jnp.asarray(sigma, jnp.float32) - self.sigma_min, 0.05)
+        self.raw_std = nnx.Param(jnp.log(jnp.expm1(init)))
 
         #### Memory bank for latent spaces ####
         self.bank_size = bank_size
@@ -836,7 +842,7 @@ class ReconSIREN(nnx.Module):
         return self.encoder_pose(x, rngs=rngs)
     
     def get_std(self):
-        return jnp.exp(self.log_std.get_value())
+        return self.sigma_min + jax.nn.softplus(self.raw_std.get_value())
 
     def decode_image(self, x, labels, md, ctf_type=None):
         # Precompute batch CTFs
@@ -1212,7 +1218,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           support_radius=0.0,
                           support_weight=0.0,
                           train_heterogeneity=True,
-                          return_metrics=False):
+                          return_metrics=False,
+                          extra_blur=0.0):
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
 
     # Random keys
@@ -1232,7 +1239,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         # Decode consensus values and coords
         coords, values = model.delta_volume_decoder()
 
-        std_eff = model.get_std()
+        std_eff = jnp.sqrt(jnp.square(model.get_std()) + jnp.square(extra_blur))
 
         # Refine current assignment (if provided)
         # rotations = jnp.matmul(rotations, current_rotations[:, None, :, :])
@@ -1877,10 +1884,12 @@ def main():
         radius_check = extent_radius_px if extent_radius_px is not None else 0.25 * xsize
         implied_spacing = ((4.0 / 3.0) * np.pi * radius_check ** 3 / num_gaussians) ** (1.0 / 3.0)
 
+    sigma_min = implied_spacing / 2.8 if implied_spacing is not None else 0.0
     if implied_spacing is not None:
         sigma_now = float(np.mean(np.asarray(sigma)))
+        floor_str = f" (min {sigma_min:.2f})" if sigma_min > 0.0 else ""
         print(f"{bcolors.OKCYAN}Cloud geometry: {num_gaussians} points, implied spacing "
-              f"{implied_spacing:.2f} px, splat width {sigma_now:.2f} px{bcolors.ENDC}")
+              f"{implied_spacing:.2f} px, splat width {sigma_now:.2f} px{floor_str}{bcolors.ENDC}")
 
     # Random keys
     rng_seed = random.randint(0, 2 ** 32 - 1)
@@ -1897,6 +1906,7 @@ def main():
                             consensus_parameterization=args.consensus_parameterization,
                             heterogeneity_profile=args.heterogeneity_profile,
                             het_start_epoch=args.het_start_epoch,
+                            sigma_min=sigma_min,
                             rngs=nnx.Rngs(model_key))
 
     # Reload network
@@ -2226,7 +2236,8 @@ def main():
                     support_radius=support_radius_value if apply_support_step else 0.0,
                     support_weight=args.support_weight,
                     train_heterogeneity=train_heterogeneity,
-                    return_metrics=True)
+                    return_metrics=True,
+                    extra_blur=CLOUD_BLUR_WARMUP if use_tau else 0.0)
                 recon_loss, recon_het_loss = metrics
                 total_loss += loss
                 total_recon_loss += recon_loss
