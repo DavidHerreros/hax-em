@@ -1262,7 +1262,6 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           apply_loss_whitening=False,
                           whiten_weight=0.0,
                           whiten_filter=None,
-                          extra_blur=0.0,
                           apply_geometry_priors=False,
                           spacing_weight=0.0,
                           smoothness_weight=0.0,
@@ -1292,10 +1291,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         # Decode consensus values and coords
         coords, values = model.delta_volume_decoder()
 
-        # Coarse-to-fine render width: extra blur in quadrature on top of the
-        # learned splat, annealed to zero as the pose curriculum finishes, so
-        # the cloud cannot burn in fine detail while poses are still coarse.
-        std_eff = jnp.sqrt(jnp.square(model.get_std()) + jnp.square(extra_blur))
+        std_eff = model.get_std()
 
         # Refine current assignment (if provided)
         # rotations = jnp.matmul(rotations, current_rotations[:, None, :, :])
@@ -1768,8 +1764,6 @@ def main():
     parser.add_argument("--candidate_bank_mix", type=float, default=0.5,
                         help="Historical occupancy fraction in [0,1); current candidates retain the "
                              "remaining mass so their gradients are not diluted by bank size.")
-    parser.add_argument("--seed", type=int, default=None,
-                        help="Optional reproducible seed for Gaussian-cloud and network initialization.")
     parser.add_argument("--heterogeneity_profile", choices=("legacy", "anti_collapse"),
                         default="anti_collapse",
                         help="Heterogeneity training profile. anti_collapse enables staged residual "
@@ -1862,10 +1856,6 @@ def main():
     parser.add_argument("--recycle_dead_fraction", type=float, default=0.05,
                         help="A point is considered dead when its amplitude falls below this fraction of the "
                              "mean amplitude.")
-    parser.add_argument("--cloud_blur_max", type=float, default=1.5,
-                        help="Extra render blur (voxels, added in quadrature to the learned splat width) during "
-                             "the stochastic warm-up, dropped to zero once winners are taken by argmin: the "
-                             "cloud stays coarse while poses are coarse. 0 disables.")
     parser.add_argument("--no_equalized_map", action="store_true",
                         help="Do not write the amplitude-equalized tracing map in predict mode.")
     parser.add_argument("--equalized_map_gamma", type=float, default=0.5,
@@ -1875,7 +1865,7 @@ def main():
     parser.add_argument("--disable_geometry_features", action="store_true",
                         help=f"Master switch that turns off every {bcolors.ITALIC}ab initio{bcolors.ENDC} geometry feature at once "
                              f"(extent estimation, shrink-wrap support, spacing/smoothness priors, point "
-                             f"recycling, cloud blur curriculum, equalized map) for A/B testing.")
+                             f"recycling, equalized map) for A/B testing.")
     ca.add_ctf_type(parser)
     ca.add_mode(parser)
     ca.add_epochs(parser)
@@ -1910,7 +1900,6 @@ def main():
         args.spacing_prior_weight = 0.0
         args.amplitude_smoothness_weight = 0.0
         args.no_point_recycling = True
-        args.cloud_blur_max = 0.0
         args.no_equalized_map = True
     if args.support_weight < 0.0:
         parser.error("--support_weight must be non-negative")
@@ -1922,8 +1911,6 @@ def main():
         parser.error("--recycle_every must be at least 1")
     if not 0.0 < args.recycle_dead_fraction < 1.0:
         parser.error("--recycle_dead_fraction must be in (0,1)")
-    if args.cloud_blur_max < 0.0:
-        parser.error("--cloud_blur_max must be non-negative")
     if not 0.0 < args.equalized_map_gamma <= 1.0:
         parser.error("--equalized_map_gamma must be in (0,1]")
     if args.num_gaussians is not None and args.num_gaussians < 1:
@@ -1936,12 +1923,6 @@ def main():
         parser.error("--whiten_loss_weight must be in [0,1]")
     if args.sharpened_map_reg <= 0.0:
         parser.error("--sharpened_map_reg must be positive")
-    if args.seed is not None:
-        if args.seed < 0:
-            parser.error("--seed must be non-negative")
-        random.seed(args.seed)
-        np.random.seed(args.seed % (2 ** 32))
-
     # Matplotlib plot style
     plt.style.use('dark_background')  # This sets many defaults for a dark theme
     plt.rcParams['text.color'] = 'white'
@@ -2075,7 +2056,7 @@ def main():
                   f"{bcolors.ENDC}")
 
     # Random keys
-    rng_seed = args.seed if args.seed is not None else random.randint(0, 2 ** 32 - 1)
+    rng_seed = random.randint(0, 2 ** 32 - 1)
     rng = jax.random.PRNGKey(rng_seed)
     rng, model_key, choice_key = jax.random.split(rng, 3)
 
@@ -2415,12 +2396,6 @@ def main():
                 apply_support_step = (support_enabled
                                       and support_radius_value is not None)
 
-                # Coarse-to-fine cloud: extra render blur during the stochastic
-                # warm-up, so cloud detail waits for pose stability.
-                extra_blur_step = (args.cloud_blur_max
-                                   if args.cloud_blur_max > 0.0 and total_steps <= 1500
-                                   else 0.0)
-
                 coverage_steps = args.candidate_coverage_epochs * steps_per_epoch
                 apply_candidate_coverage = (
                     coverage_steps > 0 and total_steps < coverage_steps
@@ -2441,7 +2416,6 @@ def main():
                     apply_loss_whitening=apply_loss_whitening,
                     whiten_weight=whiten_weight_step,
                     whiten_filter=whiten_filter,
-                    extra_blur=extra_blur_step,
                     apply_geometry_priors=apply_geometry_priors_step,
                     spacing_weight=args.spacing_prior_weight,
                     smoothness_weight=args.amplitude_smoothness_weight,

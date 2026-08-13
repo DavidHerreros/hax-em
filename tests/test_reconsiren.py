@@ -14,7 +14,7 @@ networks.  Coverage:
 * optimized/legacy profiles    : independent low-rank heads, direct consensus,
                                   candidate and Gaussian render chunking
 * pose exploration             : bank-aware candidate coverage, low-frequency
-                                  candidate scoring curriculum and reproducible seed
+                                  candidate scoring curriculum
 * heterogeneity profiles       : legacy and staged anti-collapse residual training
 * ``--do_not_learn_volume``    : pose/shift-only refinement against a reference
 * ``--refine_current_assignment`` / ``--symmetry_group``
@@ -116,7 +116,7 @@ def scenarios(workdir, data):
             "--candidate_coverage_epochs", "1",
             "--candidate_coverage_weight", "0.01", "--candidate_coverage_bins", "64",
             "--candidate_coverage_kappa", "24", "--candidate_bank_samples", "64",
-            "--candidate_bank_mix", "0.5", "--seed", "7",
+            "--candidate_bank_mix", "0.5",
             "--heterogeneity_profile", "anti_collapse", "--het_start_epoch", "1"]
 
     scn = []
