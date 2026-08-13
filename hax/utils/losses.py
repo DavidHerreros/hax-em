@@ -679,3 +679,87 @@ def candidate_coverage_loss(directions, bin_directions, memory_bank, bank_count,
 
     occupancy = occupancy / jnp.maximum(jnp.sum(occupancy), eps)
     return jnp.sum(occupancy * jnp.log(jnp.maximum(occupancy * n_bins, eps)))
+
+
+def latent_variance_covariance_loss(latent, minimum_std, bank=None, bank_count=None):
+    """
+    Computes a set of losses at latent level to avoid the latent space from collapsing towards the consensus
+    structure (i.e. promotes that the heterogeneous latent space represents "something" always.
+
+    Two losses are computed:
+
+    - Variance loss: For each latent dimension, promotes that the variance of each dimensional component is not driven
+    towards zero. This prevents that any latent dimensions becomes "dead". The variance is computed at the batch size
+    level
+    - Covariance loss: Computes the off-diagonal elements of the covariance matrix defined by the batch of latent
+    vectors and forces them to be driven towards zero. Thanks to this, latent dimensions are driven to be decorrelated,
+    allowing them to spread and represent independent structural information (i.e. no dimensions carries information
+    that is just a copy of another dimension)
+
+    When a bank is given, it uses its samples to improve the statistical significance of the losses (otherwise, they
+    restricted to the number of elements in the batch. Since this might be small, the losses might become extremely noisy)
+    """
+    latent_f32 = latent.astype(jnp.float32)
+    if bank is None:
+        total = jnp.asarray(latent.shape[0], dtype=jnp.float32)
+        mean = jnp.mean(latent_f32, axis=0)
+        centered = latent_f32 - mean
+        covariance = centered.T @ centered / jnp.maximum(total - 1.0, 1.0)
+        variance = jnp.mean(jnp.square(centered), axis=0)
+    else:
+        bank_f32 = jax.lax.stop_gradient(bank.astype(jnp.float32))
+        valid = (jnp.arange(bank.shape[0]) < bank_count).astype(jnp.float32)[:, None]
+        total = latent.shape[0] + jnp.sum(valid)
+        mean = (jnp.sum(latent_f32, axis=0) + jnp.sum(bank_f32 * valid, axis=0)) / total
+        centered = latent_f32 - mean
+        bank_centered = (bank_f32 - mean) * valid
+        covariance = (centered.T @ centered + bank_centered.T @ bank_centered) / jnp.maximum(total - 1.0, 1.0)
+        variance = (jnp.sum(jnp.square(centered), axis=0)
+                    + jnp.sum(jnp.square(bank_centered), axis=0)) / total
+
+    std = jnp.sqrt(variance + 1e-6)
+    variance_loss = jnp.mean(jnp.square(jax.nn.relu(minimum_std - std)))
+    off_diagonal = covariance - jnp.diag(jnp.diag(covariance))
+    covariance_loss = jnp.mean(jnp.square(off_diagonal))
+    return variance_loss, covariance_loss, jnp.mean(std)
+
+
+def geometry_prior_losses(coords, values, neighbor_indices, sigma):
+    """Based on a set of precomputed nearest neighbor indices, this function computes two losses from coords and values:
+
+     - Spacing loss: Penalizes the nearest neighbors of a point that is farther than 2*sigma distance. This promotes
+     that Gaussians are render as a continuous mass. Also, it penalizes neighbors being at a distance smaller than
+     0.7*sigma, as they would be rendered as a single clump of mass (i.e. Gaussian splatting losses expressivity)
+
+     - Smoothness loss: Makes the amplitude of the closes neighbors to a point close to a given point. Thus, it imposes
+     smoothness at the level of amplitudes between neighbors
+     """
+    positions = coords[0]
+    amplitudes = values[0]
+    neighbor_positions = positions[neighbor_indices]  # (N, k, 3)
+    distances = jnp.sqrt(jnp.sum(jnp.square(
+        positions[:, None, :] - neighbor_positions), axis=-1) + 1e-12)
+    sigma = jax.lax.stop_gradient(jnp.mean(sigma))
+
+    edge_weights = jnp.sqrt(amplitudes[:, None] * amplitudes[neighbor_indices] + 1e-12)
+    edge_weights = jax.lax.stop_gradient(edge_weights / (jnp.mean(edge_weights) + 1e-12))
+    gap = jax.nn.relu(distances[:, 0] - 2.0 * sigma) / sigma
+    crowd = jax.nn.relu(0.7 * sigma - distances) / sigma
+    spacing_loss = (jnp.mean(edge_weights[:, 0] * jnp.square(gap))
+                    + jnp.mean(edge_weights * jnp.square(crowd)))
+
+    amplitude_scale = jax.lax.stop_gradient(jnp.mean(amplitudes) + 1e-12)
+    smoothness_loss = jnp.mean(edge_weights * jnp.square(
+        (amplitudes[:, None] - amplitudes[neighbor_indices]) / amplitude_scale))
+    return spacing_loss, smoothness_loss
+
+
+def support_loss(coords, values, center, radius, sigma):
+    """Penalizes coordinates moving away from a sphere containing the Gaussians covering the signal"""
+    positions = coords[0]
+    amplitudes = values[0]
+    distances = jnp.sqrt(jnp.sum(jnp.square(positions - center[None, :]), axis=-1) + 1e-12)
+    sigma = jax.lax.stop_gradient(jnp.mean(sigma))
+    outside = jax.nn.relu(distances - radius) / sigma
+    total_mass = jax.lax.stop_gradient(jnp.sum(amplitudes) + 1e-12)
+    return jnp.sum(amplitudes * outside) / total_mass

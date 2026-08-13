@@ -326,8 +326,7 @@ class EncoderPose(nnx.Module):
         self.anchor_rotations = jnp.array(generate_spherical_rotations(num_components))
 
         # Layers to 9D rotation
-        self.ensemble_6d_heads = PoseHeadEnsemble(num_members=num_components, is_refine=False,
-                                                 rngs=rngs)
+        self.ensemble_6d_heads = PoseHeadEnsemble(num_members=num_components, is_refine=False, rngs=rngs)
 
         # Layers to shifts
         hidden_shifts = [Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16)]
@@ -1024,98 +1023,6 @@ def heterogeneity_reconstruction_loss(images, targets, ctf, ctf_type,
     if return_prepared:
         return loss, predicted, target
     return loss
-
-
-def latent_variance_covariance_loss(latent, minimum_std, bank=None, bank_count=None):
-    """
-    Computes a set of losses at latent level to avoid the latent space from collapsing towards the consensus
-    structure (i.e. promotes that the heterogeneous latent space represents "something" always.
-
-    Two losses are computed:
-
-    - Variance loss: For each latent dimension, promotes that the variance of each dimensional component is not driven
-    towards zero. This prevents that any latent dimensions becomes "dead". The variance is computed at the batch size
-    level
-    - Covariance loss: Computes the off-diagonal elements of the covariance matrix defined by the batch of latent
-    vectors and forces them to be driven towards zero. Thanks to this, latent dimensions are driven to be decorrelated,
-    allowing them to spread and represent independent structural information (i.e. no dimensions carries information
-    that is just a copy of another dimension)
-
-    When a bank is given, it uses its samples to improve the statistical significance of the losses (otherwise, they
-    restricted to the number of elements in the batch. Since this might be small, the losses might become extremely noisy)
-    """
-    latent_f32 = latent.astype(jnp.float32)
-    if bank is None:
-        total = jnp.asarray(latent.shape[0], dtype=jnp.float32)
-        mean = jnp.mean(latent_f32, axis=0)
-        centered = latent_f32 - mean
-        covariance = centered.T @ centered / jnp.maximum(total - 1.0, 1.0)
-        variance = jnp.mean(jnp.square(centered), axis=0)
-    else:
-        bank_f32 = jax.lax.stop_gradient(bank.astype(jnp.float32))
-        valid = (jnp.arange(bank.shape[0]) < bank_count).astype(jnp.float32)[:, None]
-        total = latent.shape[0] + jnp.sum(valid)
-        mean = (jnp.sum(latent_f32, axis=0) + jnp.sum(bank_f32 * valid, axis=0)) / total
-        centered = latent_f32 - mean
-        bank_centered = (bank_f32 - mean) * valid
-        covariance = (centered.T @ centered + bank_centered.T @ bank_centered) / jnp.maximum(total - 1.0, 1.0)
-        variance = (jnp.sum(jnp.square(centered), axis=0)
-                    + jnp.sum(jnp.square(bank_centered), axis=0)) / total
-
-    std = jnp.sqrt(variance + 1e-6)
-    variance_loss = jnp.mean(jnp.square(jax.nn.relu(minimum_std - std)))
-    off_diagonal = covariance - jnp.diag(jnp.diag(covariance))
-    covariance_loss = jnp.mean(jnp.square(off_diagonal))
-    return variance_loss, covariance_loss, jnp.mean(std)
-
-
-def whitened_reconstruction_loss(predicted, target, whitening_filter):
-    """Noise-whitened MSE so every frequency shell carries comparable gradient"""
-    predicted_white = jnp.real(jnp.fft.ifft2(jnp.fft.fft2(predicted) * whitening_filter))
-    target_white = jnp.real(jnp.fft.ifft2(jnp.fft.fft2(target) * whitening_filter))
-    scale = jnp.sqrt(jnp.mean(jnp.square(target_white), axis=(-2, -1), keepdims=True)) + 1e-8
-    return jnp.mean(jnp.square((predicted_white - target_white) / scale), axis=(-2, -1))
-
-
-def geometry_prior_losses(coords, values, neighbor_indices, sigma):
-    """Based on a set of precomputed nearest neighbor indices, this function computes two losses from coords and values:
-
-     - Spacing loss: Penalizes the nearest neighbors of a point that is farther than 2*sigma distance. This promotes
-     that Gaussians are render as a continuous mass. Also, it penalizes neighbors being at a distance smaller than
-     0.7*sigma, as they would be rendered as a single clump of mass (i.e. Gaussian splatting losses expressivity)
-
-     - Smoothness loss: Makes the amplitude of the closes neighbors to a point close to a given point. Thus, it imposes
-     smoothness at the level of amplitudes between neighbors
-     """
-    positions = coords[0]
-    amplitudes = values[0]
-    neighbor_positions = positions[neighbor_indices]  # (N, k, 3)
-    distances = jnp.sqrt(jnp.sum(jnp.square(
-        positions[:, None, :] - neighbor_positions), axis=-1) + 1e-12)
-    sigma = jax.lax.stop_gradient(jnp.mean(sigma))
-
-    edge_weights = jnp.sqrt(amplitudes[:, None] * amplitudes[neighbor_indices] + 1e-12)
-    edge_weights = jax.lax.stop_gradient(edge_weights / (jnp.mean(edge_weights) + 1e-12))
-    gap = jax.nn.relu(distances[:, 0] - 2.0 * sigma) / sigma
-    crowd = jax.nn.relu(0.7 * sigma - distances) / sigma
-    spacing_loss = (jnp.mean(edge_weights[:, 0] * jnp.square(gap))
-                    + jnp.mean(edge_weights * jnp.square(crowd)))
-
-    amplitude_scale = jax.lax.stop_gradient(jnp.mean(amplitudes) + 1e-12)
-    smoothness_loss = jnp.mean(edge_weights * jnp.square(
-        (amplitudes[:, None] - amplitudes[neighbor_indices]) / amplitude_scale))
-    return spacing_loss, smoothness_loss
-
-
-def support_loss(coords, values, center, radius, sigma):
-    """Penalizes coordinates moving away from a sphere containing the Gaussians covering the signal"""
-    positions = coords[0]
-    amplitudes = values[0]
-    distances = jnp.sqrt(jnp.sum(jnp.square(positions - center[None, :]), axis=-1) + 1e-12)
-    sigma = jax.lax.stop_gradient(jnp.mean(sigma))
-    outside = jax.nn.relu(distances - radius) / sigma
-    total_mass = jax.lax.stop_gradient(jnp.sum(amplitudes) + 1e-12)
-    return jnp.sum(amplitudes * outside) / total_mass
 
 
 @partial(jax.jit, donate_argnums=(1,))
@@ -1892,8 +1799,7 @@ def main():
               f"{implied_spacing:.2f} px, splat width {sigma_now:.2f} px{floor_str}{bcolors.ENDC}")
 
     # Random keys
-    rng_seed = random.randint(0, 2 ** 32 - 1)
-    rng = jax.random.PRNGKey(rng_seed)
+    rng = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
     rng, model_key, choice_key = jax.random.split(rng, 3)
 
     # Prepare network (ReconSIREN)
@@ -2158,28 +2064,27 @@ def main():
                                 fig, _ = plot_angular_distribution(euler_angles)
                                 writer.add_figure(title, fig, global_step=i)
 
+                            # Predict some heterogeneous volumes
+                            n_latent_steps = int(min(steps_per_epoch,
+                                                     np.ceil(LATENTS_FOR_CLUSTERING / args.batch_size)))
+                            n_latent_steps = n_latent_steps if epoch_index >= het_start_epoch else 0
+                            latents = []
                             decoded_centers = []
-                            if epoch_index >= het_start_epoch:
-                                n_latent_steps = int(min(
-                                    steps_per_epoch,
-                                    np.ceil(LATENTS_FOR_CLUSTERING / args.batch_size)))
-                                latents = []
-                                graphdef_aux, state_aux = nnx.split(reconsiren)
-                                for _ in range(n_latent_steps):
-                                    (x_latent, labels_latent) = next(iter_data_loader_train)
-                                    _, _, latent = predict_angular_assignment_step_reconsiren(
-                                        graphdef_aux, state_aux, x_latent, labels_latent,
-                                        md_columns, rng)
-                                    latents.append(np.array(latent))
+                            graphdef_aux, state_aux = nnx.split(reconsiren)
+                            for _ in range(n_latent_steps):
+                                (x_latent, labels_latent) = next(iter_data_loader_train)
+                                _, _, latent = predict_angular_assignment_step_reconsiren(graphdef_aux, state_aux,
+                                                                                          x_latent, labels_latent,
+                                                                                          md_columns, rng)
+                                latents.append(np.array(latent))
+                            if latents:
                                 latents = np.concatenate(latents, axis=0)
                                 n_clusters = int(min(10, latents.shape[0]))
                                 kmeans = KMeans(n_clusters=n_clusters).fit(latents)
-                                decoded_centers = [
-                                    np.array(decode_het_volume(reconsiren, center[None, ...]))
-                                    for center in kmeans.cluster_centers_]
+                                decoded_centers = [np.array(decode_het_volume(reconsiren, center[None, ...]))
+                                                   for center in kmeans.cluster_centers_]
 
-                        if decoded_centers:
-                            logger.submit(write_het_volumes, decoded_centers, args.output_path)
+                        logger.submit(write_het_volumes, decoded_centers, args.output_path)
 
                     # Save checkpoint model
                     if logger.should("checkpoint", i):
@@ -2324,8 +2229,7 @@ def main():
         md_pred = generator.md
         latents = []
         for (x, labels) in pbar:
-            rotations, shifts, latent = predict_angular_assignment_step_reconsiren(
-                graphdef, state, x, labels, md_columns, rng)
+            rotations, shifts, latent = predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md_columns, rng)
 
             # Convert rotation to Euler angles in Xmipp format
             euler_angles = xmippEulerFromMatrix(rotations)
