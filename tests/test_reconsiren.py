@@ -11,8 +11,7 @@ networks.  Coverage:
 * ``--mode``                   : train, predict
 * ``--vol`` / ``--mask``       : reference-volume start (Gaussian fitting path)
 * ``--num_gaussians``          : size of the Gaussian point cloud
-* optimized/legacy profiles    : independent low-rank heads, direct consensus,
-                                  candidate and Gaussian render chunking
+* optimized/legacy profiles    : independent low-rank heads, direct consensus
 * pose exploration             : bank-aware candidate coverage, low-frequency
                                   candidate scoring curriculum
 * heterogeneity profiles       : legacy and staged anti-collapse residual training
@@ -112,11 +111,7 @@ def scenarios(workdir, data):
 
     base = ["--sr", str(SR), "--epochs", str(EPOCHS),
             "--num_gaussians", str(NUM_GAUSS), "--load_images_to_ram",
-            "--render_chunk_size", "128", "--candidate_chunk_size", "3",
-            "--candidate_coverage_epochs", "1",
-            "--candidate_coverage_weight", "0.01", "--candidate_coverage_bins", "64",
-            "--candidate_coverage_kappa", "24", "--candidate_bank_samples", "64",
-            "--candidate_bank_mix", "0.5",
+            "--candidate_coverage_weight", "0.01",
             "--heterogeneity_profile", "anti_collapse", "--het_start_epoch", "1"]
 
     scn = []
@@ -157,12 +152,7 @@ def scenarios(workdir, data):
               "--batch_size", "4", "--learning_rate", "5e-5",
               "--dataset_split_fraction", "0.7,0.3",
               "--num_gaussians", str(NUM_GAUSS),
-              "--candidate_coverage_epochs", "1",
               "--candidate_coverage_weight", "0.01",
-              "--candidate_coverage_bins", "64",
-              "--candidate_coverage_kappa", "24",
-              "--candidate_bank_samples", "64",
-              "--candidate_bank_mix", "0.5",
               "--heterogeneity_profile", "legacy",
               "--ssd_scratch_folder", out("train_apply_mmap_scratch"),
               "--sr", str(SR), "--epochs", str(EPOCHS),

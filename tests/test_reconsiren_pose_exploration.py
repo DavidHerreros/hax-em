@@ -59,7 +59,6 @@ def _tiny_reconsiren_split():
         xsize=16, sr=1.0, bank_size=32, ctf_type=None,
         num_components=3,
         consensus_parameterization="direct",
-        render_chunk_size=0, candidate_chunk_size=0,
         heterogeneity_profile="legacy",
         rngs=nnx.Rngs(3))
     pose_params = nnx.All(nnx.Param, nnx.PathContains("encoder_pose"))
