@@ -1,4 +1,4 @@
-from .losses import simae, correlation_coefficient_loss, ncc_loss, gradient_loss, diceLoss, contrastive_ce_loss, triplet_loss, sliced_wasserstein_loss, FRCLoss, dynamic_band_mask, recommended_band, chamfer_distance, soft_spherical_occupancy, candidate_coverage_loss, latent_variance_covariance_loss, geometry_prior_losses, support_loss
+from .losses import simae, correlation_coefficient_loss, ncc_loss, gradient_loss, diceLoss, contrastive_ce_loss, triplet_loss, sliced_wasserstein_loss, FRCLoss, dynamic_band_mask, recommended_band, chamfer_distance, soft_spherical_occupancy, candidate_coverage_loss, latent_variance_covariance_loss, geometry_prior_losses, support_loss, whitened_reconstruction_loss
 from .geometric_losses import calculate_deformation_regularity_loss, calculate_outlier_loss, calculate_neighbour_loss, calculate_repulsion_loss, calculate_deformation_coherence_loss, calculate_arap_loss, decoder_jacobian, geometric_correction_loss, composed_geometric_correction_loss
 from .ctf import computeCTF, ctf_freqs
 from .euler import euler_matrix_batch, euler_from_matrix
@@ -14,7 +14,7 @@ from .miscellaneous import (estimate_noise_stddev, filter_latent_space, batched_
                             splat_cloud_volumes,
                             sparse_finite_3D_differences, build_graph_from_coordinates, sample_mask_points, safe_norm,
                             positional_encoding)
-from .whiten_filter import estimate_noise_psd, create_whitening_fn, whitening_filter_2d, whitened_reconstruction_loss
+from .whiten_filter import estimate_noise_psd, create_whitening_fn, whitening_filter_2d
 from .loggers import bcolors
 from .symmetry_groups import symmetry_matrices
 from .reconstruction import reconstruct_consensus_volume, consensus_mask

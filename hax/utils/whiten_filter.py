@@ -170,14 +170,6 @@ def whitening_filter_2d(
     return fft.ifftshift(radial_filter[r])
 
 
-def whitened_reconstruction_loss(predicted, target, whitening_filter):
-    """Noise-whitened MSE so every frequency shell carries comparable gradient"""
-    predicted_white = jnp.real(jnp.fft.ifft2(jnp.fft.fft2(predicted) * whitening_filter))
-    target_white = jnp.real(jnp.fft.ifft2(jnp.fft.fft2(target) * whitening_filter))
-    scale = jnp.sqrt(jnp.mean(jnp.square(target_white), axis=(-2, -1), keepdims=True)) + 1e-8
-    return jnp.mean(jnp.square((predicted_white - target_white) / scale), axis=(-2, -1))
-
-
 def create_whitening_fn(
         noise_psd_1d: jax.Array,
         image_shape: Tuple[int, int]
