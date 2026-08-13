@@ -4,26 +4,32 @@ import numpy as np
 import optax
 from flax import nnx
 
+from hax.utils import candidate_coverage_loss
 from hax.networks.reconsiren import (
     ReconSIREN,
-    _candidate_coverage_loss,
-    _fibonacci_sphere_directions,
+    generate_spherical_rotations,
     train_step_reconsiren,
 )
 
 
+def _sphere_directions(n):
+    """Fibonacci-lattice directions, as used for the coverage bins."""
+    return jnp.asarray(generate_spherical_rotations(n)[:, :, 2], dtype=jnp.float32)
+
+
 def test_candidate_coverage_penalizes_anchor_quantization():
-    dense = _fibonacci_sphere_directions(256)
-    anchors = _fibonacci_sphere_directions(16)
+    dense = _sphere_directions(256)
+    anchors = _sphere_directions(16)
     quantized = jnp.repeat(anchors, 16, axis=0)
+    bins = _sphere_directions(128)
     empty_bank = jnp.zeros((512, 3), dtype=jnp.float32)
     key = jax.random.PRNGKey(4)
 
-    dense_loss = _candidate_coverage_loss(
-        dense, empty_bank, 0, key, n_bins=128, kappa=32.0,
+    dense_loss = candidate_coverage_loss(
+        dense, bins, empty_bank, 0, key, kappa=32.0,
         bank_samples=128, bank_mix=0.5)
-    quantized_loss = _candidate_coverage_loss(
-        quantized, empty_bank, 0, key, n_bins=128, kappa=32.0,
+    quantized_loss = candidate_coverage_loss(
+        quantized, bins, empty_bank, 0, key, kappa=32.0,
         bank_samples=128, bank_mix=0.5)
 
     assert float(quantized_loss) > float(dense_loss)
@@ -31,15 +37,16 @@ def test_candidate_coverage_penalizes_anchor_quantization():
 
 
 def test_candidate_coverage_has_finite_direction_gradients():
-    directions = _fibonacci_sphere_directions(32)
-    bank = _fibonacci_sphere_directions(64)
+    directions = _sphere_directions(32)
+    bank = _sphere_directions(64)
+    bins = _sphere_directions(64)
 
     def loss_fn(raw_directions):
         unit_directions = raw_directions / jnp.linalg.norm(
             raw_directions, axis=-1, keepdims=True)
-        return _candidate_coverage_loss(
-            unit_directions, bank, bank.shape[0], jax.random.PRNGKey(6),
-            n_bins=64, kappa=24.0, bank_samples=32, bank_mix=0.5)
+        return candidate_coverage_loss(
+            unit_directions, bins, bank, bank.shape[0], jax.random.PRNGKey(6),
+            kappa=24.0, bank_samples=32, bank_mix=0.5)
 
     gradients = jax.grad(loss_fn)(directions)
     assert np.all(np.isfinite(np.asarray(gradients)))
@@ -50,9 +57,9 @@ def _tiny_reconsiren_split():
     model = ReconSIREN(
         coords=jnp.zeros((4, 3)), values=jnp.full((4,), 0.01),
         xsize=16, sr=1.0, bank_size=32, ctf_type=None,
-        num_components=3, optimization_profile="aggressive",
+        num_components=3,
         consensus_parameterization="direct",
-        render_chunk_size=0, candidate_chunk_size=0, coarse_topk=3,
+        render_chunk_size=0, candidate_chunk_size=0,
         heterogeneity_profile="legacy",
         rngs=nnx.Rngs(3))
     pose_params = nnx.All(nnx.Param, nnx.PathContains("encoder_pose"))

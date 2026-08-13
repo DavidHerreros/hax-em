@@ -7,6 +7,8 @@ import math
 import chex
 import dm_pix
 
+from .random_gen import random_rotation_matrices
+
 
 def gradient_loss(s, penalty='l2'):
     dy = jnp.abs(s[:, :, 1:, :, :] - s[:, :, :-1, :, :])
@@ -632,3 +634,63 @@ def chamfer_distance(x, y):
     x_to_y = jnp.min(d2, axis=1)              # (N,) nearest y for each x
     y_to_x = jnp.min(d2, axis=0)              # (M,) nearest x for each y
     return jnp.mean(x_to_y) + jnp.mean(y_to_x)
+
+
+def soft_spherical_occupancy(directions, bin_directions, kappa):
+    """Soft histogram of unit directions over equal-area spherical bins.
+
+    Args:
+        directions: (N, 3) unit vectors.
+        bin_directions: (K, 3) unit vectors marking the bin centers.
+        kappa: von Mises-Fisher-like concentration of the soft assignment.
+
+    Returns:
+        (K,) mean occupancy, summing to one.
+    """
+    logits = jnp.asarray(kappa, dtype=directions.dtype) * jnp.einsum(
+        "nd,kd->nk", directions, bin_directions)
+    return jnp.mean(jax.nn.softmax(logits, axis=-1), axis=0)
+
+
+def candidate_coverage_loss(directions, bin_directions, memory_bank, bank_count, key,
+                            kappa=32.0, bank_samples=1024, bank_mix=0.5, eps=1e-8):
+    """KL-to-uniform loss for current and historical direction samples.
+
+    The historical occupancy is detached and mixed with equal normalized mass,
+    so a large bank cannot dilute gradients from the current batch. Randomly
+    rotating the equal-area grid avoids imprinting fixed bin boundaries.
+
+    Args:
+        directions: (N, 3) unit vectors carrying the gradient.
+        bin_directions: (K, 3) equal-area bin centers on the sphere.
+        memory_bank: (B, 3) buffer of historical directions.
+        bank_count: number of valid rows currently in the bank.
+        key: PRNG key for the grid rotation and the bank subsample.
+        kappa: concentration of the soft bin assignment.
+        bank_samples: rows drawn from the bank; 0 skips the historical term.
+        bank_mix: weight of the historical occupancy in [0, 1).
+        eps: numerical floor for the logarithm and the normalization.
+
+    Returns:
+        Scalar KL divergence from the mixed occupancy to the uniform one.
+    """
+    rotation_key, sample_key = jax.random.split(key)
+    n_bins = bin_directions.shape[0]
+    rotation = random_rotation_matrices(1, rotation_key)[0].astype(directions.dtype)
+    bins = jnp.einsum("ij,nj->ni", rotation, bin_directions)
+    current_occupancy = soft_spherical_occupancy(directions, bins, kappa)
+
+    occupancy = current_occupancy
+    if bank_samples > 0:
+        valid_count = jnp.maximum(jnp.asarray(bank_count, dtype=jnp.int32), 1)
+        indices = jax.random.randint(
+            sample_key, (bank_samples,), minval=0, maxval=valid_count)
+        historical = jax.lax.stop_gradient(memory_bank[indices])
+        historical_occupancy = soft_spherical_occupancy(historical, bins, kappa)
+        effective_mix = jnp.asarray(bank_mix, directions.dtype) * (
+            jnp.asarray(bank_count) > 0).astype(directions.dtype)
+        occupancy = ((1.0 - effective_mix) * current_occupancy
+                     + effective_mix * historical_occupancy)
+
+    occupancy = occupancy / jnp.maximum(jnp.sum(occupancy), eps)
+    return jnp.sum(occupancy * jnp.log(jnp.maximum(occupancy * n_bins, eps)))

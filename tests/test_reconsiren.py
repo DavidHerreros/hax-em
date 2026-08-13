@@ -112,7 +112,6 @@ def scenarios(workdir, data):
 
     base = ["--sr", str(SR), "--epochs", str(EPOCHS),
             "--num_gaussians", str(NUM_GAUSS), "--load_images_to_ram",
-            "--optimization_profile", "aggressive",
             "--render_chunk_size", "128", "--candidate_chunk_size", "3",
             "--candidate_coverage_epochs", "1",
             "--candidate_coverage_weight", "0.01", "--candidate_coverage_bins", "64",
@@ -158,7 +157,6 @@ def scenarios(workdir, data):
               "--batch_size", "4", "--learning_rate", "5e-5",
               "--dataset_split_fraction", "0.7,0.3",
               "--num_gaussians", str(NUM_GAUSS),
-              "--optimization_profile", "legacy",
               "--candidate_coverage_epochs", "1",
               "--candidate_coverage_weight", "0.01",
               "--candidate_coverage_bins", "64",

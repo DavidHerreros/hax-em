@@ -179,67 +179,36 @@ def repulsion_loss(
     return jnp.mean(energy)
 
 
-def _fibonacci_sphere_directions(n_directions, dtype=jnp.float32):
-    """Deterministic equal-area bin centers on S2."""
-    indices = jnp.arange(n_directions, dtype=dtype) + 0.5
-    z = 1.0 - 2.0 * indices / n_directions
-    radius = jnp.sqrt(jnp.maximum(1.0 - z ** 2, 0.0))
-    golden_ratio = (1.0 + jnp.sqrt(jnp.asarray(5.0, dtype=dtype))) / 2.0
-    theta = 2.0 * jnp.pi * indices / golden_ratio
-    return jnp.stack([radius * jnp.cos(theta), radius * jnp.sin(theta), z], axis=-1)
+def _splat_cloud_volumes(coords, values, volume_size, filter=True, sigma=1.0):
+    grids = jnp.zeros((values.shape[0], volume_size, volume_size, volume_size))
 
+    bposf = jnp.floor(coords)
+    bposi = bposf.astype(jnp.int32)
+    bposf = coords - bposf
 
-def _random_rotation_matrix(key, dtype=jnp.float32):
-    """Sample a Haar-uniform rotation through a normalized quaternion."""
-    quaternion = jax.random.normal(key, (4,), dtype=dtype)
-    quaternion = quaternion / jnp.maximum(jnp.linalg.norm(quaternion), 1e-8)
-    w, x, y, z = quaternion
-    return jnp.asarray([
-        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w),
-         2.0 * (x * z + y * w)],
-        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z),
-         2.0 * (y * z - x * w)],
-        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w),
-         1.0 - 2.0 * (x * x + y * y)],
-    ], dtype=dtype)
+    bamp0 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+    bamp1 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+    bamp2 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+    bamp3 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
+    bamp4 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
+    bamp5 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
+    bamp6 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+    bamp7 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
 
+    bamp = jnp.concat([bamp0, bamp1, bamp2, bamp3, bamp4, bamp5, bamp6, bamp7], axis=1)
+    bposi = jnp.concat([bposi, bposi + jnp.array((1, 0, 0)), bposi + jnp.array((0, 1, 0)), bposi + jnp.array((0, 0, 1)),
+                        bposi + jnp.array((0, 1, 1)), bposi + jnp.array((1, 0, 1)), bposi + jnp.array((1, 1, 0)), bposi + jnp.array((1, 1, 1))], axis=1)
 
-def _soft_spherical_occupancy(directions, bin_directions, kappa):
-    """Soft histogram over equal-area spherical bins."""
-    logits = jnp.asarray(kappa, dtype=directions.dtype) * jnp.einsum(
-        "nd,kd->nk", directions, bin_directions)
-    return jnp.mean(jax.nn.softmax(logits, axis=-1), axis=0)
+    def scatter_volume(vol, bpos_i, bamp_i):
+        return vol.at[bpos_i[..., 2], bpos_i[..., 1], bpos_i[..., 0]].add(bamp_i)
 
+    grids = jax.vmap(scatter_volume, in_axes=(0, 0, 0))(grids, bposi, bamp)
 
-def _candidate_coverage_loss(directions, memory_bank, bank_count, key,
-                             n_bins=256, kappa=32.0, bank_samples=1024,
-                             bank_mix=0.5, eps=1e-8):
-    """KL-to-uniform loss for current and historical candidate directions.
+    # Filter volume
+    if filter:
+        grids = jax.vmap(low_pass_3d_analytic, in_axes=(0, None))(grids, sigma)
 
-    The historical occupancy is detached and mixed with equal normalized mass,
-    so a large bank cannot dilute gradients from the current batch.  Randomly
-    rotating the equal-area grid avoids imprinting fixed bin boundaries.
-    """
-    rotation_key, sample_key = jax.random.split(key)
-    bins = _fibonacci_sphere_directions(n_bins, dtype=directions.dtype)
-    bins = jnp.einsum(
-        "ij,nj->ni", _random_rotation_matrix(rotation_key, directions.dtype), bins)
-    current_occupancy = _soft_spherical_occupancy(directions, bins, kappa)
-
-    occupancy = current_occupancy
-    if bank_samples > 0:
-        valid_count = jnp.maximum(jnp.asarray(bank_count, dtype=jnp.int32), 1)
-        indices = jax.random.randint(
-            sample_key, (bank_samples,), minval=0, maxval=valid_count)
-        historical = jax.lax.stop_gradient(memory_bank[indices])
-        historical_occupancy = _soft_spherical_occupancy(historical, bins, kappa)
-        effective_mix = jnp.asarray(bank_mix, directions.dtype) * (
-            jnp.asarray(bank_count) > 0).astype(directions.dtype)
-        occupancy = ((1.0 - effective_mix) * current_occupancy
-                     + effective_mix * historical_occupancy)
-
-    occupancy = occupancy / jnp.maximum(jnp.sum(occupancy), eps)
-    return jnp.sum(occupancy * jnp.log(jnp.maximum(occupancy * n_bins, eps)))
+    return grids
 
 
 class PoseHead(nnx.Module):
@@ -651,42 +620,11 @@ class DeltaVolumeDecoder(nnx.Module):
 
         return grids
 
-def _splat_cloud_volumes(coords, values, volume_size, filter=True, sigma=1.0):
-    grids = jnp.zeros((values.shape[0], volume_size, volume_size, volume_size))
-
-    bposf = jnp.floor(coords)
-    bposi = bposf.astype(jnp.int32)
-    bposf = coords - bposf
-
-    bamp0 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
-    bamp1 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
-    bamp2 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
-    bamp3 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
-    bamp4 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
-    bamp5 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
-    bamp6 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
-    bamp7 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
-
-    bamp = jnp.concat([bamp0, bamp1, bamp2, bamp3, bamp4, bamp5, bamp6, bamp7], axis=1)
-    bposi = jnp.concat([bposi, bposi + jnp.array((1, 0, 0)), bposi + jnp.array((0, 1, 0)), bposi + jnp.array((0, 0, 1)),
-                        bposi + jnp.array((0, 1, 1)), bposi + jnp.array((1, 0, 1)), bposi + jnp.array((1, 1, 0)), bposi + jnp.array((1, 1, 1))], axis=1)
-
-    def scatter_volume(vol, bpos_i, bamp_i):
-        return vol.at[bpos_i[..., 2], bpos_i[..., 1], bpos_i[..., 0]].add(bamp_i)
-
-    grids = jax.vmap(scatter_volume, in_axes=(0, 0, 0))(grids, bposi, bamp)
-
-    # Filter volume
-    if filter:
-        grids = jax.vmap(low_pass_3d_analytic, in_axes=(0, None))(grids, sigma)
-
-    return grids
-
 
 class HetVolumeDecoder(nnx.Module):
     def __init__(self, coords, values, n_gaussians, lat_dim, volume_size,
                  residual_to_consensus=False, center_decoder=False,
-                 coordinate_scale=1.0, amplitude_scale=1.0, small_final_init=False,
+                 small_final_init=False,
                  *, rngs: nnx.Rngs):
         self.volume_size = volume_size
         self.n_gaussians = n_gaussians
@@ -694,8 +632,6 @@ class HetVolumeDecoder(nnx.Module):
         self.reference_values = values[None, ...]
         self.residual_to_consensus = bool(residual_to_consensus)
         self.center_decoder = bool(center_decoder)
-        self.coordinate_scale = float(coordinate_scale)
-        self.amplitude_scale = float(amplitude_scale)
 
         # Indices to (normalized) coords
         self.factor = 0.5 * volume_size
@@ -729,26 +665,24 @@ class HetVolumeDecoder(nnx.Module):
         if self.residual_to_consensus:
             if base_coords is None or base_values is None:
                 raise ValueError("Consensus-relative heterogeneity requires base coordinates and values")
-            coords = base_coords + self.factor * self.coordinate_scale * delta_coords
-            values = nnx.relu(base_values + self.amplitude_scale * delta_values)
+            coords = base_coords + self.factor * delta_coords
+            values = nnx.relu(base_values + delta_values)
         else:
             coords = self.factor * (self.coords + delta_coords)
             values = nnx.relu(self.reference_values + delta_values)
 
         return coords, values
 
-    def decode_volume(self, x, filter=True, sigma=1.0, base_coords=None, base_values=None,
-                      analytic=False):
+    def decode_volume(self, x, filter=True, sigma=1.0, base_coords=None, base_values=None):
         coords, values = self.__call__(x, base_coords=base_coords, base_values=base_values)
         return _splat_cloud_volumes(coords + self.factor, values, self.volume_size,
-                                    filter=filter, sigma=sigma, analytic=analytic)
+                                    filter=filter, sigma=sigma)
 
 
 class PhysDecoder:
-    def __init__(self, xsize, render_chunk_size=0, fused_envelope=False):
+    def __init__(self, xsize, render_chunk_size=0):
         self.xsize = xsize
         self.render_chunk_size = int(render_chunk_size or 0)
-        self.fused_envelope = bool(fused_envelope)
 
     def _scatter(self, values, coords, xsize, rotations_flat, shifts_flat, dtype):
         # Volume factor
@@ -808,37 +742,23 @@ class PhysDecoder:
         return images
 
     def __call__(self, x, values, coords, xsize, rotations, shifts, ctf, ctf_type, std,
-                 filter=True, render_size=None):
-        render_size = xsize if render_size is None else int(render_size)
-        scale = render_size / xsize
-
+                 filter=True):
         rotations_flat = rearrange(rotations, "b n m d -> (b n) m d")
-        shifts_flat = rearrange(shifts, "b n m -> (b n) m") * scale
-        coords = coords * scale
+        shifts_flat = rearrange(shifts, "b n m -> (b n) m")
 
         blocked = 0 < self.render_chunk_size < coords.shape[1]
         scatter = self._scatter_chunked if blocked else self._scatter
-        images = scatter(values, coords, render_size, rotations_flat, shifts_flat, x.dtype)
+        images = scatter(values, coords, xsize, rotations_flat, shifts_flat, x.dtype)
 
         apply_ctf = ctf_type in ["apply", "wiener", "squared"]
         if apply_ctf:
             ctf = jnp.broadcast_to(ctf[:, None, :], (ctf.shape[0], rotations.shape[1], ctf.shape[1], ctf.shape[2]))
             ctf = rearrange(ctf, "b n w h -> (b n) w h")
 
-        if self.fused_envelope:
-            # Analytic splat envelope and CTF in a single Fourier pass: exact for
-            # any std (the tap kernel below truncates past +-4 px) and one fewer
-            # filtering pass per projection.
-            images = gaussianCTFFilter(images, sigma=std * scale if filter else None,
-                                       ctf=ctf if apply_ctf else None, pad_factor=2)
-        else:
-            # Gaussian filter (needed by forward interpolation)
-            if filter:
-                images = dm_pix.gaussian_blur(images[..., None], std * scale, kernel_size=9)[..., 0]
-
-            # Apply CTF
-            if apply_ctf:
-                images = ctfFilter(images, ctf, pad_factor=2)
+        # Analytic splat envelope and CTF in a single Fourier pass: exact for
+        # any std and one fewer filtering pass per projection.
+        images = gaussianCTFFilter(images, sigma=std if filter else None,
+                                   ctf=ctf if apply_ctf else None, pad_factor=2)
 
         images = rearrange(images, "(b n) w h -> b n w h", b=rotations.shape[0], n=rotations.shape[1])
 
@@ -849,44 +769,35 @@ class ReconSIREN(nnx.Module):
     @save_config
     def __init__(self, coords, values, xsize, sr, bank_size=1024, ctf_type="apply", lat_dim=8, sigma=1.0,
                  symmetry_group="c1", refine_current_assignment=False, learn_delta_volume=True, num_components=18,
-                 use_anchor_rotations=True, optimization_profile="legacy",
+                 use_anchor_rotations=True,
                  het_encoder_architecture=None,
                  consensus_parameterization=None, render_chunk_size=None,
-                 candidate_chunk_size=None, coarse_topk=None, coarse_scale=None,
+                 candidate_chunk_size=None,
                  heterogeneity_profile="legacy", het_encoder_size=None,
-                 het_residual_to_consensus=None, het_center_decoder=None,
-                 het_coordinate_scale=1.0, het_amplitude_scale=1.0,
-                 het_loss_scales=None, het_loss_weights=None, het_mask_radius=None,
-                 het_normalize_target=None, het_variance_weight=None,
-                 het_covariance_weight=None, het_min_std=0.1,
-                 het_start_epoch=None, het_freeze_consensus=None,
+                 het_loss_scales=None, het_loss_weights=None,
+                 het_min_std=0.1,
+                 het_start_epoch=None,
                  het_latent_bank_size=2048,
-                 fused_envelope=False, per_candidate_shifts=False,
+                 per_candidate_shifts=False,
                  *, rngs: nnx.Rngs, **kwargs):
         super(ReconSIREN, self).__init__()
-        aggressive = optimization_profile == "aggressive"
         anti_collapse = heterogeneity_profile == "anti_collapse"
-        if optimization_profile not in ("legacy", "aggressive"):
-            raise ValueError("optimization_profile must be 'legacy' or 'aggressive'")
         if heterogeneity_profile not in ("legacy", "anti_collapse"):
             raise ValueError("heterogeneity_profile must be 'legacy' or 'anti_collapse'")
         if het_encoder_architecture is None:
-            het_encoder_architecture = "resize" if anti_collapse else ("convstem" if aggressive else "legacy")
-        consensus_parameterization = ("direct" if aggressive else "network") if consensus_parameterization is None else consensus_parameterization
-        render_chunk_size = (2048 if aggressive else 0) if render_chunk_size is None else int(render_chunk_size)
-        candidate_chunk_size = (3 if aggressive else 0) if candidate_chunk_size is None else int(candidate_chunk_size)
-        coarse_topk = (4 if aggressive else num_components) if coarse_topk is None else int(coarse_topk)
-        coarse_scale = (0.5 if aggressive else 1.0) if coarse_scale is None else float(coarse_scale)
+            het_encoder_architecture = "resize" if anti_collapse else "legacy"
+        consensus_parameterization = "direct" if consensus_parameterization is None else consensus_parameterization
+        render_chunk_size = 0 if render_chunk_size is None else int(render_chunk_size)
+        candidate_chunk_size = 0 if candidate_chunk_size is None else int(candidate_chunk_size)
         default_het_size = min(128, max(16, (int(xsize) // 16) * 16))
         het_encoder_size = (default_het_size if anti_collapse else 64) if het_encoder_size is None else int(het_encoder_size)
-        het_residual_to_consensus = anti_collapse if het_residual_to_consensus is None else bool(het_residual_to_consensus)
-        het_center_decoder = anti_collapse if het_center_decoder is None else bool(het_center_decoder)
-        het_mask_radius = (0.45 if anti_collapse else 0.0) if het_mask_radius is None else float(het_mask_radius)
-        het_normalize_target = anti_collapse if het_normalize_target is None else bool(het_normalize_target)
-        het_variance_weight = (1e-2 if anti_collapse else 0.0) if het_variance_weight is None else float(het_variance_weight)
-        het_covariance_weight = (1e-3 if anti_collapse else 0.0) if het_covariance_weight is None else float(het_covariance_weight)
+        het_residual_to_consensus = anti_collapse
+        het_center_decoder = anti_collapse
+        het_mask_radius = 0.45 if anti_collapse else 0.0
+        het_normalize_target = anti_collapse
+        het_variance_weight = 1e-2 if anti_collapse else 0.0
+        het_covariance_weight = 1e-3 if anti_collapse else 0.0
         het_start_epoch = (5 if anti_collapse else 0) if het_start_epoch is None else int(het_start_epoch)
-        het_freeze_consensus = anti_collapse if het_freeze_consensus is None else bool(het_freeze_consensus)
 
         if het_loss_scales is None:
             het_loss_scales = tuple(dict.fromkeys(
@@ -910,18 +821,11 @@ class ReconSIREN(nnx.Module):
         het_loss_weights = tuple(weight / weight_sum for weight in het_loss_weights)
         if het_encoder_architecture == "resize" and het_encoder_size < 16:
             raise ValueError("het_encoder_size must be at least 16 for the resize encoder")
-        if not 0.0 <= het_mask_radius <= 0.5:
-            raise ValueError("het_mask_radius must be in [0, 0.5]")
 
         self.xsize = xsize
         self.ctf_type = ctf_type
         self.sr = sr
-        self.optimization_profile = optimization_profile
         self.heterogeneity_profile = heterogeneity_profile
-        if coarse_scale <= 0.0 or coarse_scale > 1.0:
-            raise ValueError("coarse_scale must be in (0, 1]")
-        self.coarse_topk = max(1, min(int(coarse_topk), int(num_components)))
-        self.coarse_scale = float(coarse_scale)
         self.candidate_chunk_size = max(0, int(candidate_chunk_size))
         self.het_loss_scales = het_loss_scales
         self.het_loss_weights = het_loss_weights
@@ -931,11 +835,9 @@ class ReconSIREN(nnx.Module):
         self.het_covariance_weight = het_covariance_weight
         self.het_min_std = float(het_min_std)
         self.het_start_epoch = max(0, het_start_epoch)
-        self.het_freeze_consensus = het_freeze_consensus
         self.symmetry_matrices = symmetry_matrices(symmetry_group)
         self.refine_current_assignment = refine_current_assignment
         self.learn_delta_volume = learn_delta_volume
-        self.fused_envelope = bool(fused_envelope)
         self.encoder_pose = EncoderPose(self.xsize, num_components=num_components, refine_current_assignment=refine_current_assignment,
                                         use_anchor_rotations=use_anchor_rotations,
                                         per_candidate_shifts=per_candidate_shifts, rngs=rngs)
@@ -948,10 +850,9 @@ class ReconSIREN(nnx.Module):
         self.delta_het_decoder = HetVolumeDecoder(
             coords=coords, values=values, n_gaussians=coords.shape[0], lat_dim=lat_dim,
             volume_size=self.xsize, residual_to_consensus=het_residual_to_consensus,
-            center_decoder=het_center_decoder, coordinate_scale=het_coordinate_scale,
-            amplitude_scale=het_amplitude_scale, small_final_init=anti_collapse, rngs=rngs)
-        self.phys_decoder = PhysDecoder(self.xsize, render_chunk_size=render_chunk_size,
-                                        fused_envelope=self.fused_envelope)
+            center_decoder=het_center_decoder,
+            small_final_init=anti_collapse, rngs=rngs)
+        self.phys_decoder = PhysDecoder(self.xsize, render_chunk_size=render_chunk_size)
 
         # Gaussian std
         self.log_std = nnx.Param(jnp.log(sigma))
@@ -1036,8 +937,7 @@ class ReconSIREN(nnx.Module):
             base_coords, base_values = self.delta_volume_decoder()
         vol = self.delta_het_decoder.decode_volume(
             x, filter=filter, sigma=self.get_std(),
-            base_coords=base_coords, base_values=base_values,
-            analytic=self.fused_envelope)
+            base_coords=base_coords, base_values=base_values)
 
         return vol
 
@@ -1428,10 +1328,6 @@ def volume_optimizer_transform(parameterization, volume_lr, coords_lr=None,
             label_params))
 
 
-def _gather_candidates(values, indices):
-    return values[jnp.arange(values.shape[0])[:, None], indices]
-
-
 def _score_candidates(model, x, values, coords, rotations, shifts, ctf, std=None):
     """Render every candidate once and return its reconstruction loss."""
     chunk = model.candidate_chunk_size
@@ -1459,7 +1355,7 @@ def _score_candidates(model, x, values, coords, rotations, shifts, ctf, std=None
                                    "candidate_bank_samples",
                                    "apply_loss_whitening",
                                    "apply_geometry_priors", "apply_support",
-                                   "train_pose_volume", "train_heterogeneity", "return_metrics"),
+                                   "train_heterogeneity", "return_metrics"),
          donate_argnums=(1,))
 def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           use_tau=False, lambda_uniform=0.1,
@@ -1481,7 +1377,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                           support_center=None,
                           support_radius=0.0,
                           support_weight=0.0,
-                          train_pose_volume=True, train_heterogeneity=True,
+                          train_heterogeneity=True,
                           return_metrics=False):
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
 
@@ -1515,25 +1411,7 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         random_indices = jax.random.choice(choice_key, jnp.arange(model.symmetry_matrices.shape[0]), shape=(rotations.shape[0],))
         rotations = jnp.matmul(jnp.transpose(model.symmetry_matrices[random_indices], (0, 2, 1))[:, None, :, :], rotations)
 
-        # The optional coarse screen is disabled during the stochastic
-        # exploration warm-up.
         rotations_eval, shifts_eval = rotations, shifts
-        if (not use_tau and model.coarse_topk < rotations.shape[1]):
-            screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
-            x_screen = jax.image.resize(
-                x, (x.shape[0], screen_size, screen_size, x.shape[-1]), method="bilinear")
-            coords_screen, values_screen = coords, values
-            coarse_images = model.phys_decoder(
-                x_screen, jax.lax.stop_gradient(values_screen),
-                jax.lax.stop_gradient(coords_screen), model.xsize,
-                jax.lax.stop_gradient(rotations), jax.lax.stop_gradient(shifts),
-                coarse_ctf, model.ctf_type, jax.lax.stop_gradient(std_eff),
-                render_size=screen_size)
-            coarse_losses = _candidate_reconstruction_losses(
-                coarse_images, x_screen, coarse_ctf, model.ctf_type)
-            _, top_indices = jax.lax.top_k(-coarse_losses, model.coarse_topk)
-            rotations_eval = _gather_candidates(rotations, top_indices)
-            shifts_eval = _gather_candidates(shifts, top_indices)
 
         # The global competition never carries gradients through candidate
         # scoring.  Only its selected pose is rerendered into the consensus.
@@ -1556,30 +1434,25 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
 
         rotations_selected = rotations_eval[batch_indices, min_indices][:, None, ...]
         shifts_selected = shifts_eval[batch_indices, min_indices][:, None, ...]
-        reconstruction_objective = jnp.asarray(0.0, dtype=x.dtype)
-        if train_pose_volume:
-            selected_images = model.phys_decoder(
-                x, values, coords, model.xsize, rotations_selected, shifts_selected,
-                ctf, model.ctf_type, std_eff)
-            # The prepared pair is free (already-computed intermediates); the
-            # whitened loss reuses it.
-            selected_losses, selected_predicted, selected_target = (
-                _candidate_reconstruction_losses(
-                    selected_images, x, ctf, model.ctf_type,
-                    return_prepared=True))
-            recon_loss = selected_losses.mean()
-            reconstruction_objective = recon_loss
-            if apply_loss_whitening:
-                whitened_recon_loss = _whitened_reconstruction_loss(
-                    selected_predicted, selected_target, whiten_filter).mean()
-                effective_whiten_weight = jnp.clip(
-                    jnp.asarray(whiten_weight, dtype=recon_loss.dtype), 0.0, 1.0)
-                reconstruction_objective = (
-                    (1.0 - effective_whiten_weight) * recon_loss
-                    + effective_whiten_weight * whitened_recon_loss)
-        else:
-            recon_loss = candidate_losses[batch_indices, min_indices].mean()
-            reconstruction_objective = recon_loss
+        selected_images = model.phys_decoder(
+            x, values, coords, model.xsize, rotations_selected, shifts_selected,
+            ctf, model.ctf_type, std_eff)
+        # The prepared pair is free (already-computed intermediates); the
+        # whitened loss reuses it.
+        selected_losses, selected_predicted, selected_target = (
+            _candidate_reconstruction_losses(
+                selected_images, x, ctf, model.ctf_type,
+                return_prepared=True))
+        recon_loss = selected_losses.mean()
+        reconstruction_objective = recon_loss
+        if apply_loss_whitening:
+            whitened_recon_loss = _whitened_reconstruction_loss(
+                selected_predicted, selected_target, whiten_filter).mean()
+            effective_whiten_weight = jnp.clip(
+                jnp.asarray(whiten_weight, dtype=recon_loss.dtype), 0.0, 1.0)
+            reconstruction_objective = (
+                (1.0 - effective_whiten_weight) * recon_loss
+                + effective_whiten_weight * whitened_recon_loss)
 
         min_indices_het = jnp.argmin(candidate_losses, axis=1)
         rotations_het = rotations_eval[jnp.arange(x.shape[0]), min_indices_het, :][:, None, ...]
@@ -1639,26 +1512,26 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         candidate_directions = rotations_flat[:, :, 2]
         winner_directions = rotations_selected[:, 0, :, 2]
 
-        loss_uniform = jnp.asarray(0.0, dtype=recon_loss.dtype)
-        if train_pose_volume:
-            loss_swd = sliced_wasserstein_sphere(
-                candidate_directions, rng=swd_key, n_projections=64)
-            loss_uniform = lambda_uniform * loss_swd
+        loss_swd = sliced_wasserstein_sphere(
+            candidate_directions, rng=swd_key, n_projections=64)
+        loss_uniform = lambda_uniform * loss_swd
 
-        candidate_coverage_loss = jnp.asarray(0.0, dtype=recon_loss.dtype)
-        if apply_candidate_coverage and train_pose_volume:
-            candidate_coverage_loss = _candidate_coverage_loss(
-                candidate_directions, model.memory_bank.get(),
+        coverage_loss = jnp.asarray(0.0, dtype=recon_loss.dtype)
+        if apply_candidate_coverage:
+            # n_bins is a static model attribute, so the Fibonacci lattice is
+            # built at trace time and folded into the graph as a constant.
+            coverage_bins = jnp.asarray(
+                generate_spherical_rotations(candidate_coverage_bins)[:, :, 2],
+                dtype=candidate_directions.dtype)
+            coverage_loss = candidate_coverage_loss(
+                candidate_directions, coverage_bins, model.memory_bank.get(),
                 model.candidate_bank_count.get_value(), coverage_key,
-                n_bins=candidate_coverage_bins,
                 kappa=candidate_coverage_kappa,
                 bank_samples=candidate_bank_samples,
                 bank_mix=candidate_bank_mix)
 
-        loss = jnp.asarray(0.0, dtype=recon_loss.dtype)
-        if train_pose_volume:
-            loss = (loss + 0.5 * reconstruction_objective + loss_uniform
-                    + candidate_coverage_weight * candidate_coverage_loss)
+        loss = (0.5 * reconstruction_objective + loss_uniform
+                + candidate_coverage_weight * coverage_loss)
         if train_heterogeneity:
             loss = (loss + 0.5 * recon_het_loss
                     + model.het_variance_weight * variance_loss
@@ -1670,11 +1543,10 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
         # graph is the consensus one - a valid neighbourhood approximation while
         # the per-particle deltas stay small compared to the point spacing.
         if apply_geometry_priors:
-            if train_pose_volume:
-                spacing_loss, smoothness_loss = _geometry_prior_losses(
-                    coords, values, neighbor_indices, std_eff)
-                loss = (loss + spacing_weight * spacing_loss
-                        + smoothness_weight * smoothness_loss)
+            spacing_loss, smoothness_loss = _geometry_prior_losses(
+                coords, values, neighbor_indices, std_eff)
+            loss = (loss + spacing_weight * spacing_loss
+                    + smoothness_weight * smoothness_loss)
             if train_heterogeneity:
                 het_spacing_loss, het_smoothness_loss = jax.vmap(
                     _geometry_prior_losses, in_axes=(0, 0, None, None))(
@@ -1683,9 +1555,8 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
                 loss = (loss + spacing_weight * jnp.mean(het_spacing_loss)
                         + smoothness_weight * jnp.mean(het_smoothness_loss))
         if apply_support:
-            if train_pose_volume:
-                loss = loss + support_weight * _support_loss(
-                    coords, values, support_center, support_radius, std_eff)
+            loss = loss + support_weight * _support_loss(
+                coords, values, support_center, support_radius, std_eff)
             if train_heterogeneity:
                 loss = loss + support_weight * jnp.mean(jax.vmap(
                     _support_loss, in_axes=(0, 0, None, None, None))(
@@ -1723,18 +1594,6 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
     else:
         ctf = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
 
-    coarse_ctf = ctf
-    if (not use_tau and model.coarse_topk < model.encoder_pose.num_components):
-        screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
-        if model.ctf_type not in (None, "None"):
-            coarse_ctf = computeCTF(
-                defocusU, defocusV, defocusAngle, cs, kv,
-                model.sr / (screen_size / model.xsize),
-                [2 * screen_size, screen_size + 1], x.shape[0], True)
-        else:
-            coarse_ctf = jnp.ones(
-                [x.shape[0], 2 * screen_size, screen_size + 1], dtype=x.dtype)
-
     if model.ctf_type == "precorrect":
         # Wiener filter
         x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
@@ -1745,21 +1604,19 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
 
     grads_pose, grads_volume, grads_het = grads_combined.split(params_pose, params_volume, params_het)
 
-    if train_pose_volume:
-        optimizer_pose.update(model, grads_pose)
-        optimizer_volume.update(model, grads_volume)
+    optimizer_pose.update(model, grads_pose)
+    optimizer_volume.update(model, grads_volume)
     if train_heterogeneity:
         optimizer_het.update(model, grads_het)
 
-    if train_pose_volume:
-        model.memory_bank.enqueue(jax.lax.stop_gradient(candidate_directions))
-        model.winner_memory_bank.enqueue(jax.lax.stop_gradient(winner_directions))
-        model.candidate_bank_count.value = jnp.minimum(
-            model.memory_bank.buffer_size,
-            model.candidate_bank_count.get_value() + candidate_directions.shape[0])
-        model.winner_bank_count.value = jnp.minimum(
-            model.winner_memory_bank.buffer_size,
-            model.winner_bank_count.get_value() + winner_directions.shape[0])
+    model.memory_bank.enqueue(jax.lax.stop_gradient(candidate_directions))
+    model.winner_memory_bank.enqueue(jax.lax.stop_gradient(winner_directions))
+    model.candidate_bank_count.value = jnp.minimum(
+        model.memory_bank.buffer_size,
+        model.candidate_bank_count.get_value() + candidate_directions.shape[0])
+    model.winner_bank_count.value = jnp.minimum(
+        model.winner_memory_bank.buffer_size,
+        model.winner_bank_count.get_value() + winner_directions.shape[0])
     if train_heterogeneity and model.heterogeneity_profile == "anti_collapse":
         model.latent_memory_bank.enqueue(jax.lax.stop_gradient(latent))
         model.latent_bank_count.value = jnp.minimum(
@@ -1911,18 +1768,6 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md, k
     else:
         ctf = jnp.ones([x.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
 
-    coarse_ctf = ctf
-    if model.coarse_topk < model.encoder_pose.num_components:
-        screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
-        if model.ctf_type not in (None, "None"):
-            coarse_ctf = computeCTF(
-                defocusU, defocusV, defocusAngle, cs, kv,
-                model.sr / (screen_size / model.xsize),
-                [2 * screen_size, screen_size + 1], x.shape[0], True)
-        else:
-            coarse_ctf = jnp.ones(
-                [x.shape[0], 2 * screen_size, screen_size + 1], dtype=x.dtype)
-
     if model.ctf_type == "precorrect":
         # Wiener filter
         x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
@@ -1944,20 +1789,6 @@ def predict_angular_assignment_step_reconsiren(graphdef, state, x, labels, md, k
     # rotations = jnp.matmul(rotations, current_rotations[:, None, :, :])
     rotations = jnp.matmul(current_rotations[:, None, :, :], rotations)  # TODO: The two options seem to work?
     shifts = current_shifts[:, None, :] + shifts
-
-    if model.coarse_topk < rotations.shape[1]:
-        screen_size = max(8, int(round(model.xsize * model.coarse_scale)))
-        x_screen = jax.image.resize(
-            x, (x.shape[0], screen_size, screen_size, x.shape[-1]), method="bilinear")
-        coords_screen, values_screen = coords, values
-        coarse_images = model.phys_decoder(
-            x_screen, values_screen, coords_screen, model.xsize, rotations, shifts,
-            coarse_ctf, model.ctf_type, model.get_std(), render_size=screen_size)
-        coarse_losses = _candidate_reconstruction_losses(
-            coarse_images, x_screen, coarse_ctf, model.ctf_type)
-        _, top_indices = jax.lax.top_k(-coarse_losses, model.coarse_topk)
-        rotations = _gather_candidates(rotations, top_indices)
-        shifts = _gather_candidates(shifts, top_indices)
 
     recon_loss = _score_candidates(
         model, x, values, coords, rotations, shifts, ctf)
@@ -2035,10 +1866,6 @@ def main():
                              f"best-matching one. A larger value covers orientation space more densely, making the pose search more robust to local minima, but increases GPU "
                              f"memory and compute roughly linearly (this is the main driver of ReconSIREN's training footprint). Set it lower to fit a smaller GPU at the cost of a "
                              f"coarser pose search. Default: 18.")
-    parser.add_argument("--optimization_profile", choices=("legacy", "aggressive"), default="aggressive",
-                        help="Execution/model profile. aggressive enables the optimized architecture and "
-                             "coarse-to-fine pose scoring; legacy preserves the historical architecture. "
-                             "Old checkpoints load as legacy automatically.")
     parser.add_argument("--candidate_coverage_epochs", type=float, default=10.0,
                         help="Epochs during which the bank-aware candidate sphere-coverage loss is active; "
                              "0 disables it.")
@@ -2062,20 +1889,12 @@ def main():
                              "training, resized encoding, multiscale masked loss and latent statistics; "
                              "legacy preserves the historical objective and decoder.")
     parser.add_argument("--het_encoder_architecture", choices=("legacy", "convstem", "resize"), default=None,
-                        help="Heterogeneity encoder input projection. Profile default: "
-                             "anti_collapse=resize; legacy CLI profile=legacy.")
+                        help="Heterogeneity encoder input projection. Default: "
+                             "anti_collapse=resize; legacy=legacy.")
     parser.add_argument("--het_encoder_size", type=int, default=None,
                         help="Anti-aliased encoder image size for the resize architecture. "
                              "Any size >= 16; matching the box size skips the resize entirely. "
                              "Anti-collapse default: min(128, box size).")
-    parser.add_argument("--het_disable_consensus_residual", action="store_true",
-                        help="Disable decoding heterogeneous states as residuals from the learned consensus.")
-    parser.add_argument("--het_disable_decoder_centering", action="store_true",
-                        help="Disable subtracting decoder(z=0) from heterogeneous states.")
-    parser.add_argument("--het_coordinate_scale", type=float, default=1.0,
-                        help="Multiplier for heterogeneous coordinate residuals.")
-    parser.add_argument("--het_amplitude_scale", type=float, default=1.0,
-                        help="Multiplier for heterogeneous amplitude residuals.")
     parser.add_argument("--lat_dim", type=int, default=8,
                         help="Dimension of the heterogeneity latent space.")
     parser.add_argument("--het_learning_rate", type=float, default=1e-4,
@@ -2086,25 +1905,15 @@ def main():
                              "run is 64,128,full.")
     parser.add_argument("--het_loss_weights", type=comma_separated_floats, default=None,
                         help="Comma-separated weights matching --het_loss_scales; normalized internally.")
-    parser.add_argument("--het_mask_radius", type=float, default=None,
-                        help="Circular heterogeneity-loss radius as a box fraction in [0, 0.5].")
-    parser.add_argument("--het_disable_target_normalization", action="store_true",
-                        help="Disable the per-particle target standardization used by consensus training.")
-    parser.add_argument("--het_variance_weight", type=float, default=None,
-                        help="Weight of the latent standard-deviation floor penalty.")
-    parser.add_argument("--het_covariance_weight", type=float, default=None,
-                        help="Weight of the off-diagonal latent covariance penalty.")
     parser.add_argument("--het_min_std", type=float, default=0.1,
                         help="Minimum latent standard deviation targeted by the variance penalty.")
     parser.add_argument("--het_start_epoch", type=int, default=None,
                         help="First epoch that trains heterogeneity, providing a consensus-only warm-up. "
                              "Profile defaults: legacy heterogeneity=0, anti-collapse=5.")
-    parser.add_argument("--het_train_consensus", action="store_true",
-                        help="Continue training pose and consensus after heterogeneity training begins.")
     parser.add_argument("--het_latent_bank_size", type=int, default=2048,
                         help="Number of prior latent vectors used for stable variance/covariance statistics.")
     parser.add_argument("--consensus_parameterization", choices=("network", "direct"), default=None,
-                        help="Consensus Gaussian delta parameterization. Profile default: aggressive=direct.")
+                        help="Consensus Gaussian delta parameterization. Default: direct.")
     parser.add_argument("--volume_learning_rate", type=float, default=None,
                         help="Learning rate of the consensus volume decoder. Default: 1e-4 with the 'network' "
                              "parameterization, 3e-3 with 'direct'. The 30x direct default compensates Adam's "
@@ -2122,18 +1931,10 @@ def main():
                              "coordinates (on a ~50x larger normalized scale) keep the higher coords LR.")
     parser.add_argument("--render_chunk_size", type=int, default=None,
                         help="Gaussians per rematerialized scatter block; 0 disables point chunking. "
-                             "Profile default: aggressive=2048, legacy=0.")
+                             "Default: 0.")
     parser.add_argument("--candidate_chunk_size", type=int, default=None,
                         help="Full-resolution pose candidates scored together; 0 scores all together. "
-                             "Profile default: aggressive=3, legacy=0.")
-    parser.add_argument("--coarse_topk", type=int, default=None,
-                        help="Coarse-ranked candidates evaluated at full resolution. "
-                             "Profile default: aggressive=4, legacy=all.")
-    parser.add_argument("--coarse_scale", type=float, default=None,
-                        help="Linear image scale for coarse pose ranking. Profile default: aggressive=0.5.")
-    parser.add_argument("--no_fused_envelope", action="store_true",
-                        help="Disable the fused analytic Gaussian-envelope + CTF Fourier filter and go back to "
-                             "the legacy truncated 9-tap spatial blur followed by a separate CTF pass.")
+                             "Default: 0.")
     parser.add_argument("--whiten_loss_weight", type=float, default=0.5,
                         help="Blend weight in [0,1] for the noise-whitened consensus reconstruction loss. The "
                              "dataset noise spectrum is estimated once from the particle solvent corners; "
@@ -2149,9 +1950,9 @@ def main():
                         help="Wiener regularizer for the envelope-sharpened map (bounds the maximum gain to "
                              "~1/(2*sqrt(reg))).")
     parser.add_argument("--disable_quality_features", action="store_true",
-                        help=f"Master switch that turns off every quality feature at once (fused envelope, sigma "
-                             f"bounds, loss whitening, amplitude L1, per-candidate shifts, sharpened map) for "
-                             f"A/B testing against the previous behaviour.")
+                        help=f"Master switch that turns off every quality feature at once (loss whitening, "
+                             f"per-candidate shifts, sharpened map) for A/B testing against the previous "
+                             f"behaviour.")
     parser.add_argument("--no_extent_estimation", action="store_true",
                         help=f"Disable the {bcolors.ITALIC}ab initio{bcolors.ENDC} particle-extent estimation from the raw images "
                              f"(per-pixel variance excess over the noise floor) and fall back to the fixed "
@@ -2206,16 +2007,6 @@ def main():
                   help="Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data).")
     ca.add_ssd_scratch_folder(parser)
     args = ca.parse_with_config(parser)
-    # None keeps the selected profile's default; the store_true overrides only
-    # opt out of individual anti-collapse behaviours.
-    args.het_residual_to_consensus = (False if args.het_disable_consensus_residual else None)
-    args.het_center_decoder = (False if args.het_disable_decoder_centering else None)
-    args.het_normalize_target = (False if args.het_disable_target_normalization else None)
-    args.het_freeze_consensus = (False if args.het_train_consensus else None)
-    if args.heterogeneity_profile == "legacy" and args.het_encoder_architecture is None:
-        # A single profile switch should reproduce the historical heterogeneity
-        # architecture even when execution optimizations remain enabled.
-        args.het_encoder_architecture = "legacy"
     if args.candidate_coverage_epochs < 0.0:
         parser.error("--candidate_coverage_epochs must be non-negative")
     if args.candidate_coverage_bins < 2:
@@ -2229,7 +2020,6 @@ def main():
     if args.candidate_coverage_weight < 0.0:
         parser.error("--candidate_coverage_weight must be non-negative")
     if args.disable_quality_features:
-        args.no_fused_envelope = True
         args.whiten_loss_weight = 0.0
         args.no_per_candidate_shifts = True
         args.no_sharpened_map = True
@@ -2425,30 +2215,17 @@ def main():
                             bank_size=10000, learn_delta_volume=not args.do_not_learn_volume,
                             num_components=args.num_components,
                             use_anchor_rotations=not args.do_not_use_anchor_rotations,
-                            optimization_profile=args.optimization_profile,
                             het_encoder_architecture=args.het_encoder_architecture,
                             consensus_parameterization=args.consensus_parameterization,
                             render_chunk_size=args.render_chunk_size,
                             candidate_chunk_size=args.candidate_chunk_size,
-                            coarse_topk=args.coarse_topk,
-                            coarse_scale=args.coarse_scale,
                             heterogeneity_profile=args.heterogeneity_profile,
                             het_encoder_size=args.het_encoder_size,
-                            het_residual_to_consensus=args.het_residual_to_consensus,
-                            het_center_decoder=args.het_center_decoder,
-                            het_coordinate_scale=args.het_coordinate_scale,
-                            het_amplitude_scale=args.het_amplitude_scale,
                             het_loss_scales=args.het_loss_scales,
                             het_loss_weights=args.het_loss_weights,
-                            het_mask_radius=args.het_mask_radius,
-                            het_normalize_target=args.het_normalize_target,
-                            het_variance_weight=args.het_variance_weight,
-                            het_covariance_weight=args.het_covariance_weight,
                             het_min_std=args.het_min_std,
                             het_start_epoch=args.het_start_epoch,
-                            het_freeze_consensus=args.het_freeze_consensus,
                             het_latent_bank_size=args.het_latent_bank_size,
-                            fused_envelope=not args.no_fused_envelope,
                             per_candidate_shifts=not args.no_per_candidate_shifts,
                             rngs=nnx.Rngs(model_key))
 
@@ -2468,8 +2245,7 @@ def main():
         # Jitted functions for volume prediction
         @nnx.jit
         def decode_volume(model):
-            return model.delta_volume_decoder.decode_volume(sigma=model.get_std(),
-                                                            analytic=model.fused_envelope)
+            return model.delta_volume_decoder.decode_volume(sigma=model.get_std())
 
         # Consensus point cloud (voxel-centered coords, amplitudes) for the
         # host-side kNN graph and shrink-wrap support updates.
@@ -2486,7 +2262,7 @@ def main():
             coords, _ = model.delta_volume_decoder()
             return model.delta_volume_decoder.decode_volume(
                 coords_values=(coords, values_pair),
-                sigma=model.get_std(), analytic=model.fused_envelope)
+                sigma=model.get_std())
 
         # Decode volume
         @nnx.jit
@@ -2583,9 +2359,7 @@ def main():
                                        amplitude_lr=amplitude_lr),
             wrt=params_volume)
         optimizer_het = nnx.Optimizer(reconsiren, optax.chain(optax.clip_by_global_norm(1.0),optax.adamw(learning_rate=args.het_learning_rate, eps=1e-6)), wrt=params_het)
-        heterogeneity_profile = reconsiren.heterogeneity_profile
         het_start_epoch = reconsiren.het_start_epoch
-        het_freeze_consensus = reconsiren.het_freeze_consensus
         # Geometry feature state (host side): the kNN graph and shrink-wrap
         # support are refreshed from the live cloud at every epoch boundary.
         geometry_priors_enabled = ((args.spacing_prior_weight > 0.0
@@ -2814,9 +2588,6 @@ def main():
                     args.candidate_coverage_weight
                     if apply_candidate_coverage else 0.0)
                 train_heterogeneity = epoch_index >= het_start_epoch
-                train_pose_volume = not (
-                    heterogeneity_profile == "anti_collapse"
-                    and train_heterogeneity and het_freeze_consensus)
                 loss, metrics, state, rng = train_step_reconsiren(
                     graphdef, state, x, labels, md_columns, rng,
                     lambda_uniform=uniform_weight, tau=tau, use_tau=use_tau,
@@ -2838,7 +2609,6 @@ def main():
                     support_center=support_center_value if apply_support_step else None,
                     support_radius=support_radius_value if apply_support_step else 0.0,
                     support_weight=args.support_weight,
-                    train_pose_volume=train_pose_volume,
                     train_heterogeneity=train_heterogeneity,
                     return_metrics=True)
                 recon_loss, recon_het_loss = metrics
@@ -2862,8 +2632,7 @@ def main():
                                        i * steps_per_epoch + step)
 
                     # Progress bar update  (TQDM)
-                    stage = "joint" if train_pose_volume and train_heterogeneity else (
-                        "heterogeneity" if train_heterogeneity else "consensus")
+                    stage = "joint" if train_heterogeneity else "consensus"
                     pbar.set_postfix_str(
                         f"stage={stage} | loss={mean_loss:.5f} | "
                         f"cons={mean_recon_loss:.5f} | het={mean_recon_het_loss:.5f}")
@@ -2914,7 +2683,7 @@ def main():
         # Jitted functions for volume prediction. The exported map must use the
         # learned splat width, not the decode_volume default of 1.0.
         decode_volume = jax.jit(lambda: reconsiren.delta_volume_decoder.decode_volume(
-            sigma=reconsiren.get_std(), analytic=reconsiren.fused_envelope))
+            sigma=reconsiren.get_std()))
         decode_het_volume = jax.jit(reconsiren.decode_het_volume)
         decode_het_cloud = jax.jit(reconsiren.decode_het_cloud)
 
@@ -2981,7 +2750,7 @@ def main():
             if equalized_masses is not None:
                 equalized = reconsiren.delta_volume_decoder.decode_volume(
                     coords_values=(cloud_coords, jnp.asarray(equalized_masses)[None, ...]),
-                    sigma=reconsiren.get_std(), analytic=reconsiren.fused_envelope)
+                    sigma=reconsiren.get_std())
                 ImageHandler().write(np.array(equalized[0]),
                                      os.path.join(args.output_path, "reconsiren_map_equalized.mrc"),
                                      overwrite=True)
@@ -3015,8 +2784,7 @@ def main():
                         het_coords + reconsiren.delta_het_decoder.factor,
                         jnp.asarray(equalized_masses)[None, ...],
                         reconsiren.delta_het_decoder.volume_size,
-                        sigma=reconsiren.get_std(),
-                        analytic=reconsiren.fused_envelope)
+                        sigma=reconsiren.get_std())
                     ImageHandler().write(np.array(equalized[0]),
                                          os.path.join(args.output_path,
                                                       f"reconsiren_hetmap_{idx:02d}_equalized.mrc"),
