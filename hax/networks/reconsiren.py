@@ -22,15 +22,14 @@ from hax.layers import *
 # heterogeneous volumes
 LATENTS_FOR_CLUSTERING = 2048
 
-# Bank-aware candidate sphere-coverage loss (only its weight is exposed on the CLI)
+# Parameters for sphere-coverage loss
 CANDIDATE_COVERAGE_EPOCHS = 10.0
 CANDIDATE_COVERAGE_BINS = 256
 CANDIDATE_COVERAGE_KAPPA = 32.0
 CANDIDATE_BANK_SAMPLES = 1024
 CANDIDATE_BANK_MIX = 0.5
 
-# Learning rates of the consensus volume ('direct' Gaussian deltas) and of the
-# heterogeneity encoder/decoder. The pose encoder uses --learning_rate.
+# Learning rates of the consensus volume and heterogeneity encoder/decoder
 VOLUME_LEARNING_RATE = 3e-3
 AMPLITUDE_LEARNING_RATE = 1e-3
 HET_LEARNING_RATE = 1e-4
@@ -207,7 +206,7 @@ def repulsion_loss(
     return jnp.mean(energy)
 
 
-def _splat_cloud_volumes(coords, values, volume_size, filter=True, sigma=1.0):
+def splat_cloud_volumes(coords, values, volume_size, filter=True, sigma=1.0):
     grids = jnp.zeros((values.shape[0], volume_size, volume_size, volume_size))
 
     bposf = jnp.floor(coords)
@@ -405,40 +404,12 @@ class EncoderPose(nnx.Module):
 
 
 class EncoderHet(nnx.Module):
-    def __init__(self, input_dim, lat_dim=8, architecture="legacy", encoder_size=64,
-                 *, rngs: nnx.Rngs):
+    def __init__(self, input_dim, lat_dim=8, *, rngs: nnx.Rngs):
         self.input_dim = input_dim
-        self.input_conv_dim = int(encoder_size) if architecture == "resize" else 64
-        self.out_conv_dim = -(-self.input_conv_dim // (2 ** 4))
-        self.architecture = architecture
+        self.out_conv_dim = -(-self.input_dim // (2 ** 4))
 
-        if architecture == "convstem":
-            # Use standard image resizing to achieve the 64px box size
-            n_stem = max(0, int(np.floor(np.log2(max(self.input_dim, 1) / self.input_conv_dim))))
-            stem = []
-            channels = 1
-            for i in range(n_stem):
-                out_channels = min(16, 4 * (2 ** i))
-                stem.append(Conv(channels, out_channels, kernel_size=(5, 5), strides=(2, 2),
-                                 padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-                channels = out_channels
-            stem.append(Conv(channels, 1, kernel_size=(1, 1), strides=(1, 1),
-                             padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
-            self.stem = nnx.List(stem)
-            hidden_layers_conv = []
-        elif architecture == "legacy":
-            # Learnable resizing to 64px
-            hidden_layers_conv = [
-                Linear(self.input_dim * self.input_dim, self.input_conv_dim * self.input_conv_dim, rngs=rngs,
-                       dtype=jnp.bfloat16)]
-        elif architecture == "resize":
-            # Heterogeneity is inferred from the full resolution image
-            hidden_layers_conv = []
-        else:
-            raise ValueError(f"Unknown ReconSIREN heterogeneity encoder architecture: {architecture}")
-
-        hidden_layers_conv.append(
-            Conv(1, 4, kernel_size=(5, 5), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
+        hidden_layers_conv = [
+            Conv(1, 4, kernel_size=(5, 5), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16)]
         hidden_layers_conv.append(
             Conv(4, 8, kernel_size=(5, 5), strides=(2, 2), padding="SAME", rngs=rngs, dtype=jnp.bfloat16))
         hidden_layers_conv.append(
@@ -471,24 +442,7 @@ class EncoderHet(nnx.Module):
         return logstd * jnr.normal(rngs, shape=mean.shape) + mean
 
     def __call__(self, x, *, rngs=None):
-        if self.architecture == "legacy":
-            x = rearrange(x, 'b h w c -> b (h w c)')
-            x = nnx.leaky_relu(self.hidden_layers_conv[0](x))
-            x = rearrange(x, 'b (h w c) -> b h w c', h=self.input_conv_dim,
-                          w=self.input_conv_dim, c=1)
-            conv_layers = self.hidden_layers_conv[1:]
-        elif self.architecture == "convstem":
-            for layer in self.stem:
-                x = nnx.leaky_relu(layer(x))
-            if x.shape[1] != self.input_conv_dim or x.shape[2] != self.input_conv_dim:
-                x = jax.image.resize(x, (x.shape[0], self.input_conv_dim, self.input_conv_dim, 1), method="bilinear")
-            conv_layers = self.hidden_layers_conv
-        else:
-            if x.shape[1] != self.input_conv_dim or x.shape[2] != self.input_conv_dim:
-                x = jax.image.resize(x, (x.shape[0], self.input_conv_dim, self.input_conv_dim, 1), method="lanczos3", antialias=True)
-            conv_layers = self.hidden_layers_conv
-
-        for layer in conv_layers:
+        for layer in self.hidden_layers_conv:
             if layer.in_features != layer.out_features:
                 x = nnx.leaky_relu(layer(x))  # or nnx.relu
             else:
@@ -514,8 +468,7 @@ class EncoderHet(nnx.Module):
 
 
 class DeltaVolumeDecoder(nnx.Module):
-    def __init__(self, coords, values, volume_size, learn_delta_volume=True,
-                 parameterization="network", *, rngs: nnx.Rngs):
+    def __init__(self, coords, values, volume_size, learn_delta_volume=True, parameterization="network", *, rngs: nnx.Rngs):
         self.volume_size = volume_size
         self.learn_delta_volume = learn_delta_volume
         self.parameterization = parameterization
@@ -659,7 +612,7 @@ class HetVolumeDecoder(nnx.Module):
         hidden.append(Linear(in_features=8, out_features=4 * n_gaussians, rngs=rngs, kernel_init=final_init, bias_init=nnx.initializers.zeros_init()))
         self.hidden = nnx.List(hidden)
 
-    def _decode_deltas(self, x):
+    def decode_deltas(self, x):
         x = self.hidden[0](x)
         for layer in self.hidden[1:-1]:
             x = layer(x)
@@ -667,11 +620,11 @@ class HetVolumeDecoder(nnx.Module):
         return jnp.reshape(x, (x.shape[0], self.n_gaussians, 4))
 
     def __call__(self, x, base_coords=None, base_values=None):
-        deltas = self._decode_deltas(x)
+        deltas = self.decode_deltas(x)
         if self.center_decoder:
             # Let z=0 be the consensus map, so any latent vector represents the deviation to be
             # considered to get a given heterogeneous state
-            deltas = deltas - self._decode_deltas(jnp.zeros_like(x))
+            deltas = deltas - self.decode_deltas(jnp.zeros_like(x))
         delta_coords, delta_values = deltas[..., :3], deltas[..., 3]
 
         if self.residual_to_consensus:
@@ -687,7 +640,7 @@ class HetVolumeDecoder(nnx.Module):
 
     def decode_volume(self, x, filter=True, sigma=1.0, base_coords=None, base_values=None):
         coords, values = self.__call__(x, base_coords=base_coords, base_values=base_values)
-        return _splat_cloud_volumes(coords + self.factor, values, self.volume_size,
+        return splat_cloud_volumes(coords + self.factor, values, self.volume_size,
                                     filter=filter, sigma=sigma)
 
 
@@ -751,21 +704,13 @@ class ReconSIREN(nnx.Module):
     @save_config
     def __init__(self, coords, values, xsize, sr, bank_size=1024, ctf_type="apply", lat_dim=8, sigma=1.0,
                  symmetry_group="c1", refine_current_assignment=False, learn_delta_volume=True, num_components=18,
-                 use_anchor_rotations=True,
-                 het_encoder_architecture=None,
-                 consensus_parameterization=None,
-                 heterogeneity_profile="legacy",
-                 het_start_epoch=None,
-                 sigma_min=0.0,
-                 *, rngs: nnx.Rngs, **kwargs):
+                 use_anchor_rotations=True, consensus_parameterization=None, heterogeneity_profile="legacy",
+                 het_start_epoch=None, sigma_min=0.0, *, rngs: nnx.Rngs, **kwargs):
         super(ReconSIREN, self).__init__()
         anti_collapse = heterogeneity_profile == "anti_collapse"
         if heterogeneity_profile not in ("legacy", "anti_collapse"):
             raise ValueError("heterogeneity_profile must be 'legacy' or 'anti_collapse'")
-        if het_encoder_architecture is None:
-            het_encoder_architecture = "resize" if anti_collapse else "legacy"
         consensus_parameterization = "direct" if consensus_parameterization is None else consensus_parameterization
-        het_encoder_size = min(128, max(16, (int(xsize) // 16) * 16)) if anti_collapse else 64
         het_residual_to_consensus = anti_collapse
         het_center_decoder = anti_collapse
         het_mask_radius = 0.45 if anti_collapse else 0.0
@@ -774,8 +719,7 @@ class ReconSIREN(nnx.Module):
         het_covariance_weight = 1e-3 if anti_collapse else 0.0
         het_start_epoch = (5 if anti_collapse else 0) if het_start_epoch is None else int(het_start_epoch)
 
-        # Multiresolution heterogeneity reconstruction loss: coarse levels first so the
-        # latent space organizes before the full-resolution detail is fitted
+        # Multiresolution heterogeneity reconstruction loss
         het_loss_scales = tuple(dict.fromkeys(
             [size for size in (64, 128) if size < xsize] + [int(xsize)]))
         if anti_collapse and len(het_loss_scales) == 3:
@@ -802,17 +746,13 @@ class ReconSIREN(nnx.Module):
         self.learn_delta_volume = learn_delta_volume
         self.encoder_pose = EncoderPose(self.xsize, num_components=num_components, refine_current_assignment=refine_current_assignment,
                                         use_anchor_rotations=use_anchor_rotations, rngs=rngs)
-        self.encoder_het = EncoderHet(self.xsize, lat_dim=lat_dim,
-                                      architecture=het_encoder_architecture,
-                                      encoder_size=het_encoder_size, rngs=rngs)
+        self.encoder_het = EncoderHet(self.xsize, lat_dim=lat_dim, rngs=rngs)
         self.delta_volume_decoder = DeltaVolumeDecoder(coords=coords, values=values, volume_size=self.xsize,
                                                        learn_delta_volume=learn_delta_volume,
                                                        parameterization=consensus_parameterization, rngs=rngs)
-        self.delta_het_decoder = HetVolumeDecoder(
-            coords=coords, values=values, n_gaussians=coords.shape[0], lat_dim=lat_dim,
-            volume_size=self.xsize, residual_to_consensus=het_residual_to_consensus,
-            center_decoder=het_center_decoder,
-            small_final_init=anti_collapse, rngs=rngs)
+        self.delta_het_decoder = HetVolumeDecoder(coords=coords, values=values, n_gaussians=coords.shape[0],
+                                                  lat_dim=lat_dim, volume_size=self.xsize, residual_to_consensus=het_residual_to_consensus,
+                                                  center_decoder=het_center_decoder, small_final_init=anti_collapse, rngs=rngs)
         self.phys_decoder = PhysDecoder(self.xsize)
 
         # Gaussian std, floored so splats can't collapse below sigma_min
@@ -822,18 +762,17 @@ class ReconSIREN(nnx.Module):
 
         #### Memory bank for latent spaces ####
         self.bank_size = bank_size
-        self.memory_bank = MemoryBank(
-            array_init=jnp.zeros((bank_size, 3), dtype=jnp.float32))
+        self.memory_bank = MemoryBank(array_init=jnp.zeros((bank_size, 3), dtype=jnp.float32))
+
         winner_init = jax.random.normal(rngs.params(), (bank_size, 3))
-        winner_init = winner_init / jnp.linalg.norm(
-            winner_init, axis=-1, keepdims=True)
-        self.winner_memory_bank = MemoryBank(
-            array_init=winner_init)
+        winner_init = winner_init / jnp.linalg.norm(winner_init, axis=-1, keepdims=True)
+        self.winner_memory_bank = MemoryBank(array_init=winner_init)
+
         self.candidate_bank_count = nnx.Variable(jnp.array(0, dtype=jnp.int32))
         self.winner_bank_count = nnx.Variable(jnp.array(0, dtype=jnp.int32))
+
         if anti_collapse:
-            self.latent_memory_bank = MemoryBank(
-                array_init=jnp.zeros((HET_LATENT_BANK_SIZE, lat_dim), dtype=jnp.float32))
+            self.latent_memory_bank = MemoryBank(array_init=jnp.zeros((HET_LATENT_BANK_SIZE, lat_dim), dtype=jnp.float32))
             self.latent_bank_count = nnx.Variable(jnp.array(0, dtype=jnp.int32))
 
     def __call__(self, x, rngs: nnx.Rngs = None, **kwargs):
@@ -1109,23 +1048,11 @@ def score_candidates(model, x, values, coords, rotations, shifts, ctf, std=None)
                                    "apply_geometry_priors", "apply_support",
                                    "train_heterogeneity", "return_metrics"),
          donate_argnums=(1,))
-def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
-                          use_tau=False, lambda_uniform=0.1,
-                          apply_candidate_coverage=False,
-                          candidate_coverage_weight=0.0,
-                          apply_loss_whitening=False,
-                          whiten_weight=0.0,
-                          whiten_filter=None,
-                          apply_geometry_priors=False,
-                          spacing_weight=0.0,
-                          smoothness_weight=0.0,
-                          neighbor_indices=None,
-                          apply_support=False,
-                          support_center=None,
-                          support_radius=0.0,
-                          support_weight=0.0,
-                          train_heterogeneity=True,
-                          return_metrics=False,
+def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001, use_tau=False, lambda_uniform=0.1,
+                          apply_candidate_coverage=False, candidate_coverage_weight=0.0, apply_loss_whitening=False,
+                          whiten_weight=0.0, whiten_filter=None, apply_geometry_priors=False, spacing_weight=0.0,
+                          smoothness_weight=0.0, neighbor_indices=None, apply_support=False, support_center=None,
+                          support_radius=0.0, support_weight=0.0, train_heterogeneity=True, return_metrics=False,
                           extra_blur=0.0):
     model, optimizer_pose, optimizer_volume, optimizer_het = nnx.merge(graphdef, state)
 
@@ -1352,14 +1279,17 @@ def train_step_reconsiren(graphdef, state, x, labels, md, key, tau=0.0001,
 
     model.memory_bank.enqueue(jax.lax.stop_gradient(candidate_directions))
     model.winner_memory_bank.enqueue(jax.lax.stop_gradient(winner_directions))
+
     model.candidate_bank_count.value = jnp.minimum(
         model.memory_bank.buffer_size,
         model.candidate_bank_count.get_value() + candidate_directions.shape[0])
     model.winner_bank_count.value = jnp.minimum(
         model.winner_memory_bank.buffer_size,
         model.winner_bank_count.get_value() + winner_directions.shape[0])
+
     if train_heterogeneity and model.heterogeneity_profile == "anti_collapse":
         model.latent_memory_bank.enqueue(jax.lax.stop_gradient(latent))
+
         model.latent_bank_count.value = jnp.minimum(
             model.latent_memory_bank.buffer_size,
             model.latent_bank_count.get_value() + latent.shape[0])
@@ -1608,9 +1538,6 @@ def main():
                         help="Heterogeneity training profile. anti_collapse enables staged residual "
                              "training, resized encoding, multiscale masked loss and latent statistics; "
                              "legacy preserves the historical objective and decoder.")
-    parser.add_argument("--het_encoder_architecture", choices=("legacy", "convstem", "resize"), default=None,
-                        help="Heterogeneity encoder input projection. Default: "
-                             "anti_collapse=resize; legacy=legacy.")
     parser.add_argument("--lat_dim", type=int, default=8,
                         help="Dimension of the heterogeneity latent space.")
     parser.add_argument("--het_start_epoch", type=int, default=None,
@@ -1619,11 +1546,10 @@ def main():
     parser.add_argument("--consensus_parameterization", choices=("network", "direct"), default=None,
                         help="Consensus Gaussian delta parameterization. Default: direct.")
     parser.add_argument("--whiten_loss_weight", type=float, default=0.5,
-                        help="Blend weight in [0,1] for the noise-whitened consensus reconstruction loss. The "
+                        help="Weight in [0,1] for the noise-whitened consensus reconstruction loss. The "
                              "dataset noise spectrum is estimated once from the particle solvent corners; "
                              "whitening equalises the per-frequency-shell SNR so high-resolution shells receive "
-                             "real gradient instead of being drowned by the low-frequency power. Only active at "
-                             "the final (full-resolution) pose-curriculum stage. 0 disables.")
+                             "real gradient instead of being drowned by the low-frequency power. 0 disables.")
     parser.add_argument("--no_extent_estimation", action="store_true",
                         help=f"Disable the {bcolors.ITALIC}ab initio{bcolors.ENDC} particle-extent estimation from the raw images "
                              f"(per-pixel variance excess over the noise floor) and fall back to the fixed "
@@ -1641,11 +1567,9 @@ def main():
                              "so one iso-surface threshold traces the whole chain instead of beading. Active only "
                              "at the final full-resolution curriculum stage. 0 disables.")
     parser.add_argument("--no_point_recycling", action="store_true",
-                        help="Disable periodic recycling of amplitude-dead Gaussians next to mass-carrying ones "
-                             "(fixed-N densify/prune). Recycling requires the 'direct' consensus parameterization.")
+                        help="Disable periodic recycling of amplitude-dead Gaussians next to mass-carrying ones.")
     parser.add_argument("--recycle_every", type=int, default=5,
-                        help="Epoch cadence for point recycling after the warm-up (also triggered when the pose "
-                             "curriculum advances a stage).")
+                        help="Epoch cadence for point recycling after the warm-up")
     ca.add_ctf_type(parser)
     ca.add_mode(parser)
     ca.add_epochs(parser)
@@ -1778,7 +1702,7 @@ def main():
             ball_radius = 0.25
         coords = ball_radius * jnp.array(generate_sphere_points(num_gaussians) + np.random.normal(0, 0.1, (num_gaussians, 3)))
         values = jnp.full((num_gaussians,), 0.01)
-        sigma = 1.0
+        sigma = 1.1
 
 
     # # If exists, clean MMAP
@@ -1808,7 +1732,6 @@ def main():
                             bank_size=10000, learn_delta_volume=not args.do_not_learn_volume,
                             num_components=args.num_components,
                             use_anchor_rotations=not args.do_not_use_anchor_rotations,
-                            het_encoder_architecture=args.het_encoder_architecture,
                             consensus_parameterization=args.consensus_parameterization,
                             heterogeneity_profile=args.heterogeneity_profile,
                             het_start_epoch=args.het_start_epoch,
@@ -2296,7 +2219,7 @@ def main():
             het_coords, het_values = decode_het_cloud(center[None, ...])
             equalized_masses = equalize_masses(het_values[0], EQUALIZED_MAP_GAMMA)
             if equalized_masses is not None:
-                equalized = _splat_cloud_volumes(
+                equalized = splat_cloud_volumes(
                     het_coords + reconsiren.delta_het_decoder.factor,
                     jnp.asarray(equalized_masses)[None, ...],
                     reconsiren.delta_het_decoder.volume_size,
