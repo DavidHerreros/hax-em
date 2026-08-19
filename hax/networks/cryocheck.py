@@ -161,7 +161,7 @@ def compute_min_rotation_angle(mask, pixel_threshold=2.0):
     Minimum rotation angle (degrees) such that the mask voxel farthest from
     its center of mass travels at least `pixel_threshold` pixels of arc.
 
-    arc = R * theta  ->  theta_min = pixel_threshold / R_max
+    arc = R * alpha  ->  alpha_min = pixel_threshold / R_max
 
     Call once, right after computing `mask`.
     """
@@ -169,21 +169,21 @@ def compute_min_rotation_angle(mask, pixel_threshold=2.0):
     com = inds.mean(axis=0)                              # geometric centroid
     R_max = np.linalg.norm(inds - com, axis=1).max()
 
-    theta_min_deg = np.degrees(pixel_threshold / R_max)
-    return float(theta_min_deg), float(R_max)
+    alpha_min_deg = np.degrees(pixel_threshold / R_max)
+    return float(alpha_min_deg), float(R_max)
 
 
-def generate_misalignment(rngs, euler_angles, shifts, box_size, theta_min_deg,
-                           theta_max_deg=180.0, shift_min_px=2.0, shift_max_frac=0.10):
+def generate_misalignment(rngs, euler_angles, shifts, box_size, alpha_min_deg,
+                           alpha_max_deg=180.0, shift_min_px=2.0, shift_max_frac=0.10):
     """
     Perturb ground-truth angles and shifts for a "misaligned" example.
-    Angle magnitude ~ Uniform[theta_min_deg, theta_max_deg], random sign per
+    Angle magnitude ~ Uniform[alpha_min_deg, alpha_max_deg], random sign per
     angle (rotation can go either direction).
     Shift magnitude/direction sampled in polar form so every direction is
     equally likely.
 
     Call identically in training and validation, passing the same
-    `theta_min_deg` (from compute_min_rotation_angle) and `box_size`.
+    `alpha_min_deg` (from compute_min_rotation_angle) and `box_size`.
 
     Returns: rngs (updated key), euler_angles_noisy, shifts_noisy
     """
@@ -191,7 +191,7 @@ def generate_misalignment(rngs, euler_angles, shifts, box_size, theta_min_deg,
 
     rngs, k1, k2, k3, k4 = jax.random.split(rngs, 5)
 
-    angle_mag = jax.random.uniform(k1, euler_angles.shape, minval=theta_min_deg, maxval=theta_max_deg)
+    angle_mag = jax.random.uniform(k1, euler_angles.shape, minval=alpha_min_deg, maxval=alpha_max_deg)
     angle_sign = jax.random.choice(k2, jnp.array([-1.0, 1.0]), shape=euler_angles.shape)
     euler_angles_noisy = euler_angles + angle_mag * angle_sign
 
@@ -283,7 +283,7 @@ def main():
   # Volume and Mask handling
   vol = ImageHandler(args.vol).getData()
   mask = ImageHandler().generateMask(inputFn=vol, boxsize=vol.shape[0])
-  theta_min_deg, R_max = compute_min_rotation_angle(mask, pixel_threshold=2.0) # it will be further used to compute misalignment; it can be computed once
+  alpha_min_deg, R_max = compute_min_rotation_angle(mask, pixel_threshold=2.0) # it will be further used to compute misalignment; it can be computed once
 
   # Prepare network
   x_size = vol.shape[0]
@@ -324,12 +324,12 @@ def main():
         
         # Adjust to images 
         model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
-                                            num_epochs=500, is_global=True, ctf_type="apply")
+                                            num_epochs=5, is_global=True, ctf_type="apply")
 
         # Save model
         NeuralNetworkCheckpointer.save(model, fit_path)
 
-        # Save adjusted volume and deltas for visualization
+        # Save adjusted volume and deltas for visualizationl
         vol_deltas = np.array(model(place_deltas=True))
         vol = np.array(model())
         ImageHandler().write(vol_deltas, os.path.join(args.output_path, "consensus_volume_deltas.mrc"), overwrite=True)
@@ -392,33 +392,33 @@ def main():
                                  shifts=shifts,
                                  ctf=ctf)
         result_al = compute_fourier_residual(projection_al, x, n_shells=n_shells)
-        aligned_frc, freqs_ref = standardize_frc_curve(result_al.frc_curve, result_al.freqs, ts=args.sr, n_shells_ref=n_shells)
+        aligned_frc = standardize_frc_curve(result_al.frc_curve, result_al.freqs, ts=args.sr, n_shells_ref=n_shells)[0]
         aligned_frc = jnp.array(aligned_frc)
         #aligned_res = result.residual_map
-        aligned_labels = jnp.ones((batch_size,1)) #label for aligned res is 1
+        aligned_labels = jnp.ones((batch_size,1)) #label for aligned is 1
 
         # Misaligned images - Data Augmentation
-        rngs, euler_angles_noisy, shifts_noisy = generate_misalignment(rngs, euler_angles, shifts, box_size=x_size, theta_min_deg=theta_min_deg)
+        rngs, euler_angles_noisy, shifts_noisy = generate_misalignment(rngs, euler_angles, shifts, box_size=x_size, alpha_min_deg=alpha_min_deg)
         projection_misal = volumeProjection(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles_noisy,
                                  shifts=shifts_noisy,
                                  ctf=ctf)
         result_mis = compute_fourier_residual(projection_misal, x, n_shells=n_shells)
-        misaligned_frc, _ = standardize_frc_curve(result_mis.frc_curve, result_mis.freqs, ts=args.sr, n_shells_ref=n_shells)
+        misaligned_frc = standardize_frc_curve(result_mis.frc_curve, result_mis.freqs, ts=args.sr, n_shells_ref=n_shells)[0]
         misaligned_frc = jnp.array(misaligned_frc)
         #misaligned_res = result.residual_map
-        misaligned_labels = jnp.zeros((batch_size,1)) #label for misaligned res is 0
+        misaligned_labels = jnp.zeros((batch_size,1)) #label for misaligned is 0
       
        
-        res = jnp.concatenate([aligned_frc, misaligned_frc], axis=0)
+        frc_curves = jnp.concatenate([aligned_frc, misaligned_frc], axis=0)
         labels = jnp.concatenate([aligned_labels, misaligned_labels], axis=0)
         
-        loss, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=res, labels=labels, train=True)
+        loss, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=frc_curves, labels=labels, train=True)
         total_loss += loss
         
         ######## roc and confusion matrix #######
-        t_score.append(cryoCheck(res, eval=True)) 
+        t_score.append(cryoCheck(frc_curves, eval=True)) 
         t_labels.append(labels)
 
 
@@ -480,19 +480,19 @@ def main():
         
     
             # Misaligned images
-            rngs, euler_angles_noisy, shifts_noisy = generate_misalignment(rngs, euler_angles, shifts, box_size=x_size, theta_min_deg=theta_min_deg)
+            rngs, euler_angles_noisy, shifts_noisy = generate_misalignment(rngs, euler_angles, shifts, box_size=x_size, alpha_min_deg=alpha_min_deg)
             projection_misal_v = volumeProjection(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles_noisy,
                                  shifts=shifts_noisy,
                                  ctf=ctf)
             result_mis_v = compute_fourier_residual(projection_misal_v, x_validation, n_shells=n_shells)
-            misaligned_frc_v, _ = standardize_frc_curve(result_mis_v.frc_curve, result_mis_v.freqs, ts=args.sr, n_shells_ref=n_shells)
+            misaligned_frc_v = standardize_frc_curve(result_mis_v.frc_curve, result_mis_v.freqs, ts=args.sr, n_shells_ref=n_shells)[0]
             misaligned_frc_v = jnp.array(misaligned_frc_v)
             misaligned_res_v = result_mis_v.residual_map
             misaligned_labels_v = jnp.zeros((batch_size_v,1))
           
-            res_validation = jnp.concatenate([aligned_frc_v, misaligned_frc_v],axis=0)
+            frc_curves_validation = jnp.concatenate([aligned_frc_v, misaligned_frc_v],axis=0)
             labels_validation = jnp.concatenate([aligned_labels_v, misaligned_labels_v], axis=0)
 
 
@@ -528,7 +528,6 @@ def main():
               fig, ax = plt.subplots()
               ax.plot(freqs_ref, np.array(aligned_frc_v[0]), label="Aligned")
               ax.plot(freqs_ref, np.array(misaligned_frc_v[0]), label="Misaligned")
-              ax.axhline(0.143, color="gray", linestyle="--", label="FRC=0.143")
               ax.set_xlabel("Spatial frequency (cycles/Angstrom)")
               ax.set_ylabel("FRC")
               ax.set_title("FRC curve - Aligned vs Misaligned sample")
@@ -543,10 +542,10 @@ def main():
             ######################################################################
 
 
-            loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=res_validation, labels=labels_validation, train=False)
+            loss_validation, cryoCheck = cryoCheck_step(cryoCheck, optimizer, x=frc_curves_validation, labels=labels_validation, train=False)
             total_validation_loss += loss_validation
             
-            val_score.append(cryoCheck(res_validation, eval=True)) #predictions for the validation step
+            val_score.append(cryoCheck(frc_curves_validation, eval=True)) #predictions for the validation step
             val_labels.append(labels_validation)
             
 
