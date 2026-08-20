@@ -138,6 +138,78 @@ def scenarios(workdir, data):
         expect_files=[hs("train_none_short")],
         timeout=600))
 
+    # 2c) the large-box memory path: a strided sample lattice plus a blocked,
+    #     rematerialized render. Both are what make a big box fit on a small GPU, and
+    #     both change the shapes flowing through the decoder and the projector, so they
+    #     get their own train + predict pair. The block size is deliberately smaller than
+    #     the phantom's point count so the blocking loop actually runs more than once.
+    scn.append(Scenario(
+        name="train_none_chunked",
+        description="train | ctf=None | --lattice_stride 2 --render_chunk_size 4096 (large-box memory path)",
+        program="hetsiren",
+        args=["--md", noctf["md"], "--ctf_type", "None", "--mode", "train",
+              "--lat_dim", "4", "--batch_size", "8",
+              "--lattice_stride", "2", "--render_chunk_size", "4096",
+              "--output_path", out("train_none_chunked")] + base,
+        expect_files=[hs("train_none_chunked")],
+        timeout=900))
+
+    # 2d) reloading it also checks that the two new settings round-trip through the
+    #     checkpointed model config -- a predict that silently dropped them would
+    #     rebuild the decoder on a different lattice than the one it was trained on.
+    scn.append(Scenario(
+        name="predict_none_chunked",
+        description="predict | ctf=None | --reload from train_none_chunked (stride/chunk round-trip)",
+        program="hetsiren",
+        args=["--md", noctf["md"], "--ctf_type", "None", "--mode", "predict",
+              "--lat_dim", "4", "--batch_size", "8",
+              "--reload", out("train_none_chunked"),
+              "--output_path", out("predict_none_chunked"),
+              "--sr", str(SR), "--load_images_to_ram"],
+        expect_files=[os.path.join(out("predict_none_chunked"), "predicted_latents.xmd")],
+        timeout=600))
+
+    # 2c-bis) MANY blocks at a real batch. ``train_none_chunked`` above uses stride 2 and a
+    #     4096-point chunk, which on a 48 px box is only ~2 blocks -- so it exercises the
+    #     flag but not the structure, and it passed while the chunked render segfaulted at
+    #     7+ blocks. Stride 1 with a 512-point chunk is ~115 blocks, and the fused fixed-grid
+    #     decode (which replaces the whole (B, N) density with a scan) only runs when
+    #     chunking is on, so this is the scenario that covers it.
+    scn.append(Scenario(
+        name="train_none_chunked_deep",
+        description="train | ctf=None | --render_chunk_size 512 (~115 blocks: fused decode + scan render)",
+        program="hetsiren",
+        args=["--md", noctf["md"], "--ctf_type", "None", "--mode", "train",
+              "--lat_dim", "4", "--batch_size", "16", "--render_chunk_size", "512",
+              "--output_path", out("train_none_chunked_deep")] + base,
+        expect_files=[hs("train_none_chunked_deep")],
+        timeout=1200))
+
+    # 2e) the box-independent encoder. convstem swaps the flatten->dense stem for a
+    #     strided-conv one, so its output shapes and checkpoint layout differ from convnn;
+    #     train + predict cover the forward path and the config round-trip.
+    scn.append(Scenario(
+        name="train_none_convstem",
+        description="train | ctf=None | --encoder_arch convstem (box-independent encoder)",
+        program="hetsiren",
+        args=["--md", noctf["md"], "--ctf_type", "None", "--mode", "train",
+              "--lat_dim", "4", "--batch_size", "8", "--encoder_arch", "convstem",
+              "--output_path", out("train_none_convstem")] + base,
+        expect_files=[hs("train_none_convstem")],
+        timeout=900))
+
+    scn.append(Scenario(
+        name="predict_none_convstem",
+        description="predict | ctf=None | --reload from train_none_convstem (convstem round-trip)",
+        program="hetsiren",
+        args=["--md", noctf["md"], "--ctf_type", "None", "--mode", "predict",
+              "--lat_dim", "4", "--batch_size", "8",
+              "--reload", out("train_none_convstem"),
+              "--output_path", out("predict_none_convstem"),
+              "--sr", str(SR), "--load_images_to_ram"],
+        expect_files=[os.path.join(out("predict_none_convstem"), "predicted_latents.xmd")],
+        timeout=600))
+
     # 3) train, ctf=apply, memory-mapped (no RAM) + ssd scratch + custom hyperparams
     scn.append(Scenario(
         name="train_apply_mmap",
@@ -192,6 +264,88 @@ def scenarios(workdir, data):
                                    "consensus_volume.mrc")],
         timeout=1800))
 
+    # 6b) train with reference volume: point-transformer decoder. Needs more Gaussians
+    # than the other transport scenarios because build_geometry asserts that the finest
+    # hierarchy level (512) is coarser than the point cloud.
+    scn.append(Scenario(
+        name="train_vol_transport_pt",
+        description="train | ctf=apply | --vol --mask --transport_mass --point_transformer",
+        program="hetsiren",
+        args=["--md", ctf["md"], "--ctf_type", "apply", "--mode", "train",
+              "--lat_dim", "6", "--batch_size", "8",
+              "--vol", ctf["vol"], "--mask", ctf["mask"],
+              "--transport_mass", "--point_transformer", "--num_gaussians", "2000",
+              "--output_path", out("train_vol_transport_pt")] + base,
+        expect_files=[hs("train_vol_transport_pt"),
+                      os.path.join(out("train_vol_transport_pt"),
+                                   "consensus_volume.mrc")],
+        timeout=1800))
+
+    # 6c) train as a VAE. This is the only scenario that exercises --kl_lambda, i.e. the
+    # logstd heads, the reparametrised sample and the KL/free-bits term -- everything else
+    # runs with a deterministic latent and leaves that whole branch untouched. It stayed
+    # uncovered long enough for a plain NameError to survive in it, so it is worth a case
+    # even though the reconstruction quality after 4 phantom epochs means nothing.
+    # Paired with --point_transformer because the VAE-only distance-preservation branch
+    # decodes a second time, and that is the decoder it is most expensive on.
+    scn.append(Scenario(
+        name="train_vol_transport_vae",
+        description="train | ctf=apply | --vol --transport_mass --point_transformer --kl_lambda (VAE path)",
+        program="hetsiren",
+        args=["--md", ctf["md"], "--ctf_type", "apply", "--mode", "train",
+              "--lat_dim", "6", "--batch_size", "8",
+              "--vol", ctf["vol"], "--mask", ctf["mask"],
+              "--transport_mass", "--point_transformer", "--num_gaussians", "2000",
+              "--kl_lambda", "1e-3", "--kl_free_bits", "1.0",
+              "--distance_preservation_lambda", "1e-4",
+              "--output_path", out("train_vol_transport_vae")] + base,
+        expect_files=[hs("train_vol_transport_vae"),
+                      os.path.join(out("train_vol_transport_vae"),
+                                   "consensus_volume.mrc")],
+        timeout=1800))
+
+    # 6b) per-image contrast: the branch adds masked sums and a stop-gradient rescale
+    # inside the reconstruction loss, on both the amplitude and the mass-transport
+    # pathway. "relative" is the recommended mode and the one worth guarding; a flat or
+    # empty projection takes the a=1 fallback, which is the path that would produce a
+    # NaN loss if the guard were wrong.
+    scn.append(Scenario(
+        name="train_vol_per_image_contrast",
+        description="train | ctf=apply | --vol --transport_mass --per_image_contrast relative",
+        program="hetsiren",
+        args=["--md", ctf["md"], "--ctf_type", "apply", "--mode", "train",
+              "--lat_dim", "6", "--batch_size", "8",
+              "--vol", ctf["vol"], "--mask", ctf["mask"],
+              "--transport_mass", "--num_gaussians", "2000",
+              "--per_image_contrast", "relative",
+              "--output_path", out("train_vol_per_image_contrast")] + base,
+        expect_files=[hs("train_vol_per_image_contrast"),
+                      os.path.join(out("train_vol_per_image_contrast"),
+                                   "consensus_volume.mrc")],
+        timeout=1800))
+
+    # 6d) automatic Gaussian count. This is the DEFAULT path -- every other --vol scenario
+    # pins --num_gaussians and so never touches it -- and it is the one that decides the
+    # point cloud, the render width and the density scale the network starts from. It is
+    # also the only scenario that exercises the FSC/shell-error gate and the bracketing
+    # search, whose failure mode is silent: a fit that "succeeds" with a collapsed width
+    # still exits 0 and still trains, it just cannot express motion afterwards.
+    scn.append(Scenario(
+        name="train_vol_transport_auto_gaussians",
+        description="train | ctf=apply | --vol --mask --transport_mass (automatic Gaussian count)",
+        program="hetsiren",
+        args=["--md", ctf["md"], "--ctf_type", "apply", "--mode", "train",
+              "--lat_dim", "6", "--batch_size", "8",
+              "--vol", ctf["vol"], "--mask", ctf["mask"],
+              "--transport_mass", "--fit_resolution", "12",
+              "--output_path", out("train_vol_transport_auto_gaussians")] + base,
+        expect_files=[hs("train_vol_transport_auto_gaussians"),
+                      os.path.join(out("train_vol_transport_auto_gaussians"),
+                                   "Gaussian_volume_fitting"),
+                      os.path.join(out("train_vol_transport_auto_gaussians"),
+                                   "consensus_volume.mrc")],
+        timeout=1800))
+
     # 7) train with reference volume: local_reconstruction (+mask, vol mandatory)
     scn.append(Scenario(
         name="train_vol_local_recon",
@@ -209,4 +363,5 @@ def scenarios(workdir, data):
 
 
 # Scenarios that need fit_volume (slow); skipped by --quick.
-SLOW = {"train_vol_transport_implicit", "train_vol_local_recon"}
+SLOW = {"train_vol_transport_implicit", "train_vol_transport_pt", "train_vol_local_recon",
+        "train_vol_transport_auto_gaussians"}

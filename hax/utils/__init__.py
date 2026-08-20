@@ -14,10 +14,16 @@ from .miscellaneous import (estimate_noise_stddev, filter_latent_space, batched_
                             splat_cloud_volumes,
                             sparse_finite_3D_differences, build_graph_from_coordinates, sample_mask_points, safe_norm,
                             positional_encoding)
+from .rigid_gauge import RigidGauge, build_density_rigid_basis, build_displacement_rigid_basis, gauge_displacement_field, gauge_density_field, gauge_displacement_transform, apply_gauge_to_points
+from .rigid_gauge import (density_gauge_magnitude, density_gauge_scale, density_gauge_block_weights,
+                          density_gauge_block_normals, density_gauge_solve, density_gauge_apply,
+                          rigid_fraction_from_norms)
 from .whiten_filter import estimate_noise_psd, create_whitening_fn, whitening_filter_2d
 from .loggers import bcolors
 from .symmetry_groups import symmetry_matrices
-from .reconstruction import reconstruct_consensus_volume, consensus_mask
+from .reconstruction import (reconstruct_consensus_volume, consensus_mask,
+                             volume_fsc, shell_relative_error, shell_resolution,
+                             live_shell_limit)
 from .optimal_transport_functions import compute_swd_matrix
 from .plots import plot_angular_distribution
 from .hyperparameter_tuning import estimate_batch_size, estimate_batch_size_from_peak_fn

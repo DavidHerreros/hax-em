@@ -50,7 +50,7 @@ class PointTransformerLayer(nnx.Module):
         self.value_proj = nnx.Linear(nk, nk, dtype=jnp.bfloat16, rngs=rngs)
         self.dropout = nnx.Dropout(dropout_rate, rngs=rngs)
 
-    def __call__(self, x, neighbour_idx, rel_pos, *, deterministic=False):
+    def __call__(self, x, neighbour_idx, rel_pos):
         q = self.phi(x)
         k = self.psi(x)
         k_nb = k[:, neighbour_idx, :]
@@ -64,7 +64,7 @@ class PointTransformerLayer(nnx.Module):
         w = jax.nn.softmax(w, axis=2)
         v = self.value_proj(k_nb) + delta
         out = jnp.sum(w * v, axis=2)
-        return self.dropout(out, deterministic=deterministic)
+        return self.dropout(out)
 
 
 class PTBlock(nnx.Module):
@@ -78,12 +78,11 @@ class PTBlock(nnx.Module):
         self.mid_dropout = nnx.Dropout(mid_dropout, rngs=rngs)
         self.lin_out = nnx.Linear(nk, dim, dtype=jnp.bfloat16, rngs=rngs)
 
-    def __call__(self, y0, neighbour_idx, rel_pos, *, deterministic=False):
-        y1 = self.attn(y0, neighbour_idx, rel_pos,
-                       deterministic=deterministic)
+    def __call__(self, y0, neighbour_idx, rel_pos):
+        y1 = self.attn(y0, neighbour_idx, rel_pos)
         y1 = jnp.concatenate([y0, y1], axis=-1)
         yk = self.lin_mid(y1)
-        yk = self.mid_dropout(yk, deterministic=deterministic)
+        yk = self.mid_dropout(yk)
         yk = self.lin_out(yk)
         return y0 + yk
 
@@ -258,33 +257,29 @@ class PointTransformerDecoder(nnx.Module):
         self,
         z: jax.Array,
         geom: Geometry,
-        *,
-        deterministic: bool = False,
     ) -> Union[jax.Array, Sequence[jax.Array]]:
+        """Dropout follows the module's own train/eval state"""
         B = z.shape[0]
 
         # Input MLP
         x = self.in_lin1(z)
         x = nnx.relu(x)
-        x = self.in_dropout(x, deterministic=deterministic)
+        x = self.in_dropout(x)
         x = self.in_lin2(x)
         x = x.reshape(B, self.n0, self.feat_dim)
 
         # PT block 1 + residual store
-        y0 = self.pt1(x, geom.neighbours[0], geom.rel_pos[0],
-                      deterministic=deterministic)
+        y0 = self.pt1(x, geom.neighbours[0], geom.rel_pos[0])
         y0k_1 = y0
         y0 = self.tu1(y0, geom.up_idx[0], geom.up_w[0])
 
         # PT block 2 + residual store
-        y0 = self.pt2(y0, geom.neighbours[1], geom.rel_pos[1],
-                      deterministic=deterministic)
+        y0 = self.pt2(y0, geom.neighbours[1], geom.rel_pos[1])
         y0k_2 = y0
         y0 = self.tu2(y0, geom.up_idx[1], geom.up_w[1])
 
         # PT block 3 (operates on n2 points)
-        y0_n2 = self.pt3(y0, geom.neighbours[2], geom.rel_pos[2],
-                         deterministic=deterministic)        # (B, n2, feat)
+        y0_n2 = self.pt3(y0, geom.neighbours[2], geom.rel_pos[2])   # (B, n2, feat)
 
         if self.predict_at_coarse_level:
             x1_up = self.res_up1(y0k_1, geom.res_idx[0], geom.res_w[0])
