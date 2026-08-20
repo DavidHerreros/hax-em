@@ -229,6 +229,132 @@ def _half_map_fsc(vol_a, vol_b, shells, n_shells):
     return np.clip(fsc, 0.0, 1.0)
 
 
+def _radial_shells(box):
+    """Radial shell index of every voxel of the centred 3D transform, built by broadcasting.
+
+    ``_shell_index`` does the same with ``np.meshgrid``, which materialises three float64
+    ``box**3`` arrays (1.5 GB at box 512) for a quantity used once.
+    """
+    g = (np.fft.fftshift(np.fft.fftfreq(box)) * box).astype(np.float32)
+    r2 = g[:, None, None] ** 2 + g[None, :, None] ** 2 + g[None, None, :] ** 2
+    return np.clip(np.rint(np.sqrt(r2)).astype(np.int32), 0, box // 2)
+
+
+def volume_fsc(vol_a, vol_b, mask=None):
+    """Shell-by-shell Fourier correlation between two maps of the same box.
+
+    Reported as a familiar diagnostic alongside :func:`shell_relative_error`, which is what
+    should actually gate an approximation -- see the note there on why FSC barely responds
+    to a pure amplitude (resolution) loss.
+
+    ``mask`` (if given) is applied to both maps first, so the correlation is measured on
+    the protein region rather than being dominated by matching solvent.
+
+    Returns ``(fsc, power_a)`` with one entry per shell, ``power_a`` being the reference's
+    own power in that shell so the caller can ignore shells the reference does not
+    populate.
+    """
+    a = np.asarray(vol_a, np.float64)
+    b = np.asarray(vol_b, np.float64)
+    if mask is not None:
+        m = np.asarray(mask, np.float64)
+        a = a * m
+        b = b * m
+
+    box = a.shape[0]
+    n_shells = box // 2 + 1
+    shells = _radial_shells(box).ravel()
+
+    fa = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(a))).ravel()
+    fb = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(b))).ravel()
+
+    cross = np.bincount(shells, weights=(fa * np.conj(fb)).real, minlength=n_shells)
+    power_a = np.bincount(shells, weights=np.abs(fa) ** 2, minlength=n_shells)
+    power_b = np.bincount(shells, weights=np.abs(fb) ** 2, minlength=n_shells)
+
+    norm = np.sqrt(power_a[:n_shells] * power_b[:n_shells])
+    fsc = np.where(norm > 0, cross[:n_shells] / np.where(norm > 0, norm, 1.0), 0.0)
+    return np.clip(fsc, -1.0, 1.0), power_a[:n_shells]
+
+
+def shell_relative_error(vol_fit, vol_ref, mask=None):
+    """Per-shell relative error of an approximation against a reference.
+
+        e(k) = sqrt( sum_shell |FIT - REF|^2 / sum_shell |REF|^2 )
+
+    Use this, not the FSC, to ask whether an approximation *lost resolution*. FSC measures
+    correlation, and it normalises each map by its own power, so a real positive radial
+    envelope -- exactly what a Gaussian render's ``exp(-2 pi^2 sigma^2 k^2)`` is -- largely
+    cancels out of it. Blurring a map with ``sigma = 1`` voxel removes 99.8% of its
+    amplitude at Nyquist and still scores FSC ~0.7 there, because every coefficient in the
+    shell was scaled by the same factor and the phases are untouched. ``e(k)`` sees it
+    immediately: for ``FIT = c * REF`` it is exactly ``|1 - c|``, so the threshold reads
+    directly as "each shell's amplitude is right to within this fraction".
+
+    ``mask`` (if given) is applied to both maps first, so the comparison is made on the
+    protein region rather than on matching solvent.
+
+    Returns ``(error, power_ref)``, one entry per shell.
+    """
+    a = np.asarray(vol_ref, np.float64)
+    b = np.asarray(vol_fit, np.float64)
+    if mask is not None:
+        m = np.asarray(mask, np.float64)
+        a = a * m
+        b = b * m
+
+    box = a.shape[0]
+    n_shells = box // 2 + 1
+    shells = _radial_shells(box).ravel()
+
+    fa = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(a))).ravel()
+    fb = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(b))).ravel()
+
+    resid = np.bincount(shells, weights=np.abs(fa - fb) ** 2, minlength=n_shells)[:n_shells]
+    power_a = np.bincount(shells, weights=np.abs(fa) ** 2, minlength=n_shells)[:n_shells]
+    error = np.sqrt(np.where(power_a > 0, resid / np.where(power_a > 0, power_a, 1.0), 0.0))
+    return error, power_a
+
+
+def shell_resolution(curve, power_ref, box, sr, threshold, ascending_is_bad=True,
+                     power_floor=1e-4):
+    """Resolution (A) out to which a per-shell quality curve stays acceptable.
+
+    Works on either sense of curve: an error curve (``ascending_is_bad=True``, pass while
+    ``curve <= threshold``) or a correlation curve (``False``, pass while
+    ``curve >= threshold``).
+
+    Shells carrying less than ``power_floor`` of the reference's peak shell power are
+    skipped rather than failed: past its own resolution an FSC-denoised reference is
+    identically zero, and a shell with no reference signal says nothing about the fit.
+
+    Returns ``(resolution_A, last_passing_shell)``; shell 0 means it failed immediately.
+    """
+    curve = np.asarray(curve, np.float64)
+    power_ref = np.asarray(power_ref, np.float64)
+    live = (power_ref > power_floor * power_ref[1:].max()) if power_ref[1:].size else power_ref > 0
+
+    last = 0
+    for i in range(1, len(curve)):
+        if not live[i]:
+            continue
+        failed = curve[i] > threshold if ascending_is_bad else curve[i] < threshold
+        if failed:
+            break
+        last = i
+    return ((box * sr) / last if last > 0 else float("inf")), last
+
+
+def live_shell_limit(power_ref, box, sr, power_floor=1e-4):
+    """Resolution (A) of the outermost shell the reference actually populates."""
+    power_ref = np.asarray(power_ref, np.float64)
+    if power_ref[1:].size == 0:
+        return 2.0 * sr, 0
+    live = np.flatnonzero(power_ref > power_floor * power_ref[1:].max())
+    last = int(live[-1]) if live.size else 0
+    return ((box * sr) / last if last > 0 else 2.0 * sr), last
+
+
 def _fsc_filter(fsc):
     """MMSE filter for the combined map given the half-map FSC.
 
@@ -276,7 +402,8 @@ def _project(volume_ft, rotations, shifts, ctf, k_rot, box, f0, f1):
 
 
 def _gray_scale(volume, reader, columns, sr, box, has_ctf, k_rot, f0, f1, s, a, n_probe=2000,
-                batch_size=256, premultiplied=False, dose=None, scalefactor=None, inv2nc=None):
+                batch_size="auto", quiet=False, premultiplied=False, dose=None,
+                scalefactor=None, inv2nc=None):
     """Global scale putting the map's projections on the gray scale of the input images.
 
     Measured, not derived: forward-project the finished map at a subset of the real poses,
@@ -298,6 +425,29 @@ def _gray_scale(volume, reader, columns, sr, box, has_ctf, k_rot, f0, f1, s, a, 
     angles = np.asarray(columns["euler_angles"], np.float32)
     shifts = np.asarray(columns["shifts"], np.float32)
     kv = float(np.asarray(columns["ctfVoltage"]).ravel()[0]) if has_ctf else 0.0
+
+    def _project_peak(chunk):
+        """Peak device bytes of one calibration iteration at this chunk size.
+
+        Sized against ``_project`` rather than inherited from the insertion batch: this is a
+        gather out of a resident ``box**3`` Fourier volume, not a scatter into two
+        accumulators, so its fixed and per-particle costs are genuinely different ones. The
+        observed images are added on top -- they are read per chunk and compared against the
+        prediction.
+        """
+        chunk = max(1, int(chunk))
+        sds = jax.ShapeDtypeStruct
+        analysis = _project.lower(
+            sds((box,) * 3, jnp.complex64), sds((chunk, 3, 3), jnp.float32),
+            sds((chunk, 2), jnp.float32), sds((chunk, box, box), jnp.float32),
+            k_rot, box, f0, f1).compile().memory_analysis()
+        if analysis is None:
+            return None
+        return int(analysis.argument_size_in_bytes + analysis.temp_size_in_bytes
+                   + analysis.output_size_in_bytes + chunk * box * box * 4)
+
+    batch_size = _resolve_batch_size(batch_size, _project_peak, 0, box,
+                                     "Gray-scale calibration", quiet, max_batch=256)
 
     cross = 0.0
     energy = 0.0
@@ -419,7 +569,63 @@ def _stream_chunks(reader, n, batch_size, threads):
             del labels, images     # drop the chunk before waiting on the next one
 
 
-def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, threads=8,
+# Bytes of device working set per particle per pixel in the insertion kernel, measured with
+# ``memory_analysis`` at boxes 128 and 320 (152 and 168 B/px/particle respectively). Only used
+# for the fallback below, when the analytic probe cannot run at all -- the probe measures the
+# real number for the actual box whenever it is available.
+_INSERT_BYTES_PER_PIXEL_PER_PARTICLE = 168
+
+# Device budget the fallback assumes for the batch-scaling part of the working set. Deliberately
+# modest: it is the "we could not measure anything" path, where being slow beats being dead.
+_FALLBACK_BUDGET_BYTES = 2 * 1024 ** 3
+
+
+def _resolve_batch_size(requested, peak_fn, reserved_bytes, box, what, quiet,
+                        max_batch=1024, min_batch=8):
+    """Turn ``batch_size="auto"`` into the largest batch that fits on this device.
+
+    The streaming kernels here cost a fixed amount (the 3D accumulators, which scale with
+    ``box**3``) plus a per-particle amount (the slices and their intermediates, which scale
+    with ``box**2``). That is affine in the batch size, which is exactly the model
+    :func:`hax.utils.estimate_batch_size_from_peak_fn` fits -- and it fits it from
+    ``memory_analysis``, which only compiles and therefore allocates nothing, so sizing the
+    batch can never itself provoke the OOM it is trying to avoid.
+
+    Why this cannot be a constant: the per-particle cost grows with the square of the box and
+    the fixed cost with its cube, so a batch that is comfortable at 128 px is ~7x too large at
+    320 px and the fixed part alone has grown 15x. A single hardcoded default is either
+    wasteful on a small box or fatal on a large one.
+
+    An explicit integer is honoured untouched. Returns an int.
+    """
+    if requested != "auto":
+        return int(requested)
+
+    from hax.utils.hyperparameter_tuning import estimate_batch_size_from_peak_fn
+
+    try:
+        resolved = estimate_batch_size_from_peak_fn(
+            peak_fn, probe_sizes=(64, 256), safety=0.7, reserved_bytes=reserved_bytes,
+            multiple_of=8, min_batch=min_batch, max_batch=max_batch, verbose=False)
+    except Exception:
+        resolved = None
+
+    if resolved is None:
+        # No usable analysis (unsupported backend, tracing failure, ...). Fall back to the
+        # measured scaling rather than to a constant, so the box size is still respected.
+        per_particle = _INSERT_BYTES_PER_PIXEL_PER_PARTICLE * box * box
+        resolved = int(_FALLBACK_BUDGET_BYTES / max(per_particle, 1))
+        resolved = max(min_batch, min(max_batch, (resolved // 8) * 8))
+        if not quiet:
+            print(f"{bcolors.WARNING}Could not analyze {what} memory; falling back to "
+                  f"batch_size={resolved} for box {box}.{bcolors.ENDC}")
+    elif not quiet:
+        print(f"{bcolors.OKCYAN}{what}: batch_size={resolved} (auto, box {box}).{bcolors.ENDC}")
+
+    return int(resolved)
+
+
+def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size="auto", threads=8,
                                  use_ctf=True, denoise=True, calibrate_gray_scale=True,
                                  scratch_dir=None, quiet=False, premultiplied=False,
                                  dose_weighting=True):
@@ -454,6 +660,12 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
     ``scratch_dir`` is an ``images_mmap_grain`` folder (see ``_StackReader``): when it holds a
     cached copy of the stack the images are streamed from there instead of from ``md``, which is
     what makes this bearable when the particles live on a spinning disk.
+
+    ``batch_size`` is how many images are read and inserted at once. It defaults to ``"auto"``,
+    which measures the insertion kernel's peak for the actual box and picks the largest batch
+    that fits (see :func:`_resolve_batch_size`); pass an integer to override. A fixed default
+    cannot work across boxes -- the per-particle cost grows as ``box**2`` -- so ``auto`` is what
+    keeps a large box from OOMing on a modest GPU.
 
     Returns the volume; when ``denoise`` it also prints the measured resolution.
     Images are read in chunks on a thread pool while the GPU accumulates, so peak RAM
@@ -501,6 +713,32 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
             print(f"{bcolors.WARNING}No preExposure / ctfScaleFactor column: dose weighting "
                   f"is off. For tilt-series data that leaves a large B-factor in the "
                   f"map.{bcolors.ENDC}")
+
+    def _insert_peak(chunk):
+        """Peak device bytes one streaming iteration would need at this chunk size.
+
+        The chunk is split into two interleaved halves and each is inserted separately, so
+        the kernel only ever sees ~half of it -- but the whole chunk is resident as
+        ``images_dev`` while that happens, which is why it is added back on top.
+        ``ShapeDtypeStruct`` keeps this to a lowering: nothing is allocated.
+        """
+        chunk = int(chunk)
+        half = max(1, (chunk + 1) // 2)
+        sds = jax.ShapeDtypeStruct
+        analysis = _insert_slices.lower(
+            sds((box,) * 3, jnp.complex64), sds((box,) * 3, jnp.float32),
+            sds((half, box, box), jnp.float32), sds((half, 3, 3), jnp.float32),
+            sds((half, 2), jnp.float32), sds((half, box, box), jnp.float32),
+            k_rot, box, f0, f1).compile().memory_analysis()
+        if analysis is None:
+            return None
+        return int(analysis.argument_size_in_bytes + analysis.temp_size_in_bytes
+                   + analysis.output_size_in_bytes + chunk * box * box * 4)
+
+    # The probe is handed one half's accumulators as arguments, so only that pair lands in the
+    # fitted fixed cost; the other half's pair is resident throughout and has to be declared.
+    batch_size = _resolve_batch_size(batch_size, _insert_peak, 12 * box ** 3, box,
+                                     "Slice insertion", quiet)
 
     n_chunks = (n + batch_size - 1) // batch_size
     for labels, images in tqdm(_stream_chunks(reader, n, batch_size, threads), total=n_chunks,
@@ -568,8 +806,14 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
                   f"(Nyquist {2.0 * sr:.1f} A); the map is filtered to that limit.{bcolors.ENDC}")
 
     if calibrate_gray_scale:
+        # Everything the accumulators were needed for is done (the map, the FSC, the filter).
+        # They are 36 * box**3 bytes between them -- 1.1 GiB at box 320 -- and would otherwise
+        # stay alive through the calibration below purely because the names are still in
+        # scope, squeezing the very step that has to re-project the map.
+        del num, den, total_num, total_den
+
         scale = _gray_scale(volume, reader, columns, sr, box, has_ctf, k_rot, f0, f1, s, a,
-                            premultiplied=premultiplied, dose=dose,
+                            quiet=quiet, premultiplied=premultiplied, dose=dose,
                             scalefactor=scalefactor, inv2nc=inv2nc)
         volume = volume * scale
         if not quiet:

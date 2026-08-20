@@ -70,10 +70,14 @@ def main():
     parser.add_argument("--mask_dilate", required=False, type=int, default=2,
                         help=f"Only used with {bcolors.ITALIC}--write_mask{bcolors.ENDC}: how many voxels to grow the mask by (set by "
                              f"default to 2), so that a deformation estimated later has somewhere to move the mass into.")
-    parser.add_argument("--batch_size", required=False, type=int, default=1024,
-                        help=f"How many images are read and inserted at once (set by default to 1024). The images are read on a thread "
-                             f"pool while the GPU accumulates, so peak RAM tracks this value rather than the number of particles - lower "
-                             f"it if you run out of memory, raise it to read fewer, larger chunks.")
+    parser.add_argument("--batch_size", required=False, type=ca.batch_size_or_auto, default="auto",
+                        help=f"How many images are read and inserted at once. The images are read on a thread pool while the GPU "
+                             f"accumulates, so peak RAM tracks this value rather than the number of particles.\n"
+                             f"Left at {bcolors.ITALIC}auto{bcolors.ENDC} (the default) the largest memory-safe batch is measured for "
+                             f"your box and GPU before the pass starts - the measurement only compiles the kernel, so it allocates "
+                             f"nothing and cannot itself run you out of memory. This matters because the cost per particle grows with "
+                             f"the {bcolors.ITALIC}square{bcolors.ENDC} of the box: a batch that is comfortable at 128 px needs ~7x the "
+                             f"memory at 320 px. Pass an integer to pin it instead.")
     parser.add_argument("--threads", required=False, type=int, default=8,
                         help=f"Number of reader threads feeding the GPU with image chunks (set by default to 8). "
                              f"{bcolors.WARNING}NOTE{bcolors.ENDC}: on a spinning disk (HDD) several threads read different "
