@@ -1005,7 +1005,7 @@ def main():
     from hax.generators import MetaDataGenerator, extract_columns, NumpyGenerator
     from hax.networks import train_step_zernike3deep, train_step_volume_adjustment, VolumeAdjustment
     from hax.metrics import JaxSummaryWriter, TrainingLogger
-    from hax.programs import fit_volume, adjust_weights_to_images
+    from hax.programs import fit_volume, fit_volume_adaptive, adjust_weights_to_images
     # from hax.schedulers import CosineAnnealingScheduler
 
     from hax.cli import common_args as ca
@@ -1024,11 +1024,18 @@ def main():
                         help="Degree of Zernike3D angular component (increasing this value might help finding more localized motions at the expense of higher memory consumption)")
     ca.add_mode(parser)
     parser.add_argument("--num_gaussians", required=False, type=int,
-                        help="Before training the network, Zernike3Deep will try to fit a set of Gaussians in the reference volume to recreate it. "
-                             "The default criterium is to automatically determine the number of Gaussians neede to reproduce the reference volume "
-                             "with high-fidelity. However, if you prefer to fix the number of Gaussians in advance based on your own criterium (e.g., "
-                             "the number of residues in your protein), you can set this parameter. When set, the Zernike3Deep will fit this fixed number of Gaussians "
-                             "so that the reproduce the reference volume as well as possible.")
+                        help=f"Before training the network, Zernike3Deep fits a set of Gaussians to the reference volume to recreate it. "
+                             f"By default the count is determined automatically: the fit searches for the FEWEST Gaussians whose render still "
+                             f"reproduces your reference shell by shell (see {bcolors.ITALIC}--fit_resolution{bcolors.ENDC}).\n"
+                             f"Set this parameter to pin the count in advance from your own criterium instead (e.g. the number of residues in "
+                             f"your protein). When set, Zernike3Deep fits exactly this many Gaussians and reproduces the reference as well as "
+                             f"that count allows.")
+    parser.add_argument("--fit_resolution", required=False, type=float, default=None,
+                        help=f"Resolution (in {bcolors.UNDERLINE}Angstrom{bcolors.ENDC}) the automatic Gaussian fit has to reproduce, and no more. "
+                             f"Left unset (the default) the fit matches the reference out to the reference's own limit. Set a coarser value to "
+                             f"trade resolution for a smaller point cloud -- measured, the count scales as about the SQUARE of the resolution "
+                             f"asked for (N ~ d^-1.9), so relaxing the target from 4 to 8 A is roughly a 3.7x smaller cloud. Ignored when "
+                             f"{bcolors.ITALIC}--num_gaussians{bcolors.ENDC} is given.")
     ca.add_epochs(parser)
     ca.add_batch_size(parser)
     ca.add_learning_rate(parser)
@@ -1119,12 +1126,12 @@ def main():
                     model, _, _ = fit_volume(vol * mask, mask=mask, iterations=20000, learning_rate=0.001,
                                              n_init=args.num_gaussians, fixed_gaussians=True)
                 else:
-                    model, _, _ = fit_volume(vol * mask, mask=mask, iterations=20000, learning_rate=0.01, grad_threshold=1e-5,
-                                             densify_interval=2000, n_init=2500)
+                    model, _ = fit_volume_adaptive(vol * mask, mask, args.sr,
+                                                   resolution=args.fit_resolution)
 
                 # Adjust to images
-                model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
-                                                    num_epochs=5, is_global=True, ctf_type=args.ctf_type)
+                model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr,
+                                                    ctf_type=args.ctf_type)
 
                 # Save model
                 NeuralNetworkCheckpointer.save(model, fit_path)
