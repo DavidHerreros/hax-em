@@ -552,7 +552,7 @@ def main():
               with open(os.path.join(args.output_path, "pose_misaligned.json"), "w") as f:
                   json.dump(pose_misal, f, indent=2)
 
-              # FRC curve: nome fisso, id nel titolo del plot
+              # FRC curve
               fig, ax = plt.subplots()
               ax.plot(freqs_ref, np.array(aligned_frc_v[0]), label="Aligned")
               ax.plot(freqs_ref, np.array(misaligned_frc_v[0]), label="Misaligned")
