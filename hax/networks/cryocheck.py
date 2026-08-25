@@ -99,6 +99,26 @@ def md_extraction(md_columns, index, vol, args):
 
 # Projecting the batch volume 
 def volumeProjection(vol, mask, euler_angles, shifts, ctf):
+    """
+    Project a 3D volume into a batch of CTF-corrected 2D images, via
+    forward voxel scattering (not ray-casting): each masked voxel is
+    rotated/shifted according to the given pose and splatted bilinearly
+    into the output image, then blurred (to smooth the splatting) and
+    CTF-filtered.
+
+    Args:
+        vol: (N, N, N) volume, voxel intensities.
+        mask: (N, N, N) particle mask, same shape as `vol`.
+        euler_angles: (B, 3) rotation angles in degrees.
+        shifts: (B, 2) in-plane shifts in pixels.
+        ctf: CTF parameters for the batch (from `computeCTF`).
+
+    Returns:
+        (B, N, N, 1) projected images, N = vol.shape[0].
+
+    Note: `mask` must match `vol`'s shape exactly, or it will silently
+    read the wrong voxels. Rotation center is vol's geometric center.
+    """
 
     inds = np.asarray(np.where(mask > 0.0)).T #z,y,x voxel
 
@@ -499,43 +519,51 @@ def main():
             ###########################################################
             # Debugging: save pure projection aligned and misaligned
             if _ == 0:
-              # Projections 
-              proj_al_2d = jnp.squeeze(projection_al_v[0])      
+              particle_id = int(index_validation[0])
+
+              proj_al_2d = jnp.squeeze(projection_al_v[0])
               proj_misal_2d = jnp.squeeze(projection_misal_v[0])
 
               writer.add_image("Pure_Projection/Aligned", proj_al_2d, global_step=i, dataformats='HW')
               writer.add_image("Pure_Projection/Misaligned", proj_misal_2d, global_step=i, dataformats='HW')
 
-              ImageHandler().write(np.array(proj_al_2d), os.path.join(args.output_path, "pure_projection_aligned.mrcs"), overwrite=True)
-              ImageHandler().write(np.array(proj_misal_2d), os.path.join(args.output_path, "pure_projection_misaligned.mrcs"), overwrite=True)
+              ImageHandler().write(np.array(proj_al_2d),
+                                    os.path.join(args.output_path, "pure_projection_aligned.mrcs"), overwrite=True)
+              ImageHandler().write(np.array(proj_misal_2d),
+                                    os.path.join(args.output_path, "pure_projection_misaligned.mrcs"), overwrite=True)
 
-              # Residuals
-              res_aligned = jnp.squeeze(aligned_res_v[0])
-              res_misaligned = jnp.squeeze(misaligned_res_v[0])
+              # Metadata aligned and misaligned
+              pose_al = {
+                  "particle_id": particle_id,
+                  "euler_angles_deg": np.array(euler_angles[0]).tolist(),
+                  "shifts_px": np.array(shifts[0]).tolist(),
+              }
+              pose_misal = {
+                  "particle_id": particle_id,
+                  "euler_angles_deg": np.array(euler_angles_noisy[0]).tolist(),
+                  "shifts_px": np.array(shifts_noisy[0]).tolist(),
+                  "euler_angles_delta_deg": np.array(euler_angles_noisy[0] - euler_angles[0]).tolist(),
+                  "shifts_delta_px": np.array(shifts_noisy[0] - shifts[0]).tolist(),
+              }
 
-              writer.add_image("Residual_Visual/Aligned_Sample", res_aligned, global_step=i, dataformats='HW')
-              writer.add_image("Residual_Visual/Misaligned_Sample", res_misaligned, global_step=i, dataformats='HW')
+              import json
+              with open(os.path.join(args.output_path, "pose_aligned.json"), "w") as f:
+                  json.dump(pose_al, f, indent=2)
+              with open(os.path.join(args.output_path, "pose_misaligned.json"), "w") as f:
+                  json.dump(pose_misal, f, indent=2)
 
-              ImageHandler().write(np.array(res_aligned), os.path.join(args.output_path, "aligned_residual_sample.mrcs"), overwrite=True)
-              ImageHandler().write(np.array(res_misaligned), os.path.join(args.output_path, "misaligned_residual_sample.mrcs"), overwrite=True)
-
-              # Save in bwr colormap
-              max_val = max(np.max(np.abs(res_aligned)), np.max(np.abs(res_misaligned)))
-              plt.imsave(os.path.join(args.output_path, "aligned_bwr.png"), res_aligned, cmap='bwr', vmin=-max_val, vmax=max_val)
-              plt.imsave(os.path.join(args.output_path, "misaligned_bwr.png"), res_misaligned, cmap='bwr', vmin=-max_val, vmax=max_val)
-
-              # --- FRC curve ---
+              # FRC curve: nome fisso, id nel titolo del plot
               fig, ax = plt.subplots()
               ax.plot(freqs_ref, np.array(aligned_frc_v[0]), label="Aligned")
               ax.plot(freqs_ref, np.array(misaligned_frc_v[0]), label="Misaligned")
               ax.set_xlabel("Spatial frequency (cycles/Angstrom)")
               ax.set_ylabel("FRC")
-              ax.set_title("FRC curve - Aligned vs Misaligned sample")
+              ax.set_title(f"FRC curve - Aligned vs Misaligned (particle id {particle_id})")
               ax.legend()
               ax.set_ylim(-0.2, 1.05)
               writer.add_figure("FRC_Curve/Aligned_vs_Misaligned", fig, global_step=i)
               plt.close(fig)
-  
+
               np.save(os.path.join(args.output_path, "aligned_frc_curve.npy"), np.array(aligned_frc_v[0]))
               np.save(os.path.join(args.output_path, "misaligned_frc_curve.npy"), np.array(misaligned_frc_v[0]))
 
