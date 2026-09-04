@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 
 
+from operator import index
+
 import jax
 import jax.numpy as jnp
 from flax import nnx
@@ -20,6 +22,7 @@ from hax.utils.euler import euler_matrix_batch
 from hax.utils.decorators import save_config
 
 from hax.programs.gaussian_volume_fitting import fit_volume, adjust_weights_to_images
+from hax.utils.frc_debug import compare_frc_small_perturbation
 
 
 
@@ -226,6 +229,7 @@ def generate_misalignment(rngs, euler_angles, shifts, box_size, alpha_min_deg,
 
 
 
+
 def main():
 
   import os
@@ -383,6 +387,22 @@ def main():
       resume_epoch = 0
 
 
+    ########################## frc debug - check frc curves for aligned and misaligned projections ##########################
+    with closing(iter(data_loader_val)) as it:
+      rngs, fig = compare_frc_small_perturbation(
+          vol, mask, md_columns, x_size, n_shells, args,
+          data_loader_iter=it, rngs=rngs, n_particles=8,
+          md_extraction=md_extraction, volumeProjection=volumeProjection,
+          compute_fourier_residual=compute_fourier_residual,
+          standardize_frc_curve=standardize_frc_curve,
+          generate_misalignment=generate_misalignment,
+          output_path=args.output_path,
+    )
+      plt.close(fig)
+
+    print(f"{bcolors.OKCYAN}Check FRC ")
+    ###########################################################################################################################
+
     #TRAINING LOOP
     print(f"{bcolors.OKCYAN}\n###### Training CryoCheck... ######") 
 
@@ -418,7 +438,7 @@ def main():
         aligned_labels = jnp.ones((batch_size,1)) #label for aligned is 1
 
         # Misaligned images - Data Augmentation
-        rngs, euler_angles_noisy, shifts_noisy = generate_misalignment(rngs, euler_angles, shifts, box_size=x_size, alpha_min_deg=alpha_min_deg)
+        rngs, euler_angles_noisy, shifts_noisy = generate_misalignment(rngs, euler_angles, shifts, box_size=x_size, alpha_min_deg=alpha_min, alpha_max_deg=180, shift_min_px=2, shift_max_frac=0.1)
         projection_misal = volumeProjection(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles_noisy,
@@ -500,7 +520,7 @@ def main():
         
     
             # Misaligned images
-            rngs, euler_angles_noisy, shifts_noisy = generate_misalignment(rngs, euler_angles, shifts, box_size=x_size, alpha_min_deg=alpha_min_deg)
+            rngs, euler_angles_noisy, shifts_noisy = generate_misalignment(rngs, euler_angles, shifts, box_size=x_size, alpha_min_deg=alpha_min, alpha_max_deg=180, shift_min_px=2, shift_max_frac=0.1)
             projection_misal_v = volumeProjection(vol=vol,
                                  mask=mask,
                                  euler_angles=euler_angles_noisy,
@@ -580,11 +600,16 @@ def main():
           val_score_epoch = jnp.concatenate(val_score, axis=0)
           val_labels_epoch = jnp.concatenate(val_labels, axis=0)
 
+          # save to compare ROCs
+          np.save(os.path.join(args.output_path, "val_score_final.npy"), np.array(val_score_epoch))
+          np.save(os.path.join(args.output_path, "val_labels_final.npy"), np.array(val_labels_epoch))
+
           cryoCheck.train()
 
           # Roc Curve and Confusion Matrix - Validation
           optimal_threshold = writer.add_roc_curve(val_labels_epoch, val_score_epoch, global_step=i, tag="ROC Curve - Validation step")
-          
+
+
           # Save optimal threshold value 
           threshold_path = os.path.join(args.output_path, "optimal_threshold_value.txt")
           with open(threshold_path, "w") as f:
@@ -627,6 +652,7 @@ def main():
   elif args.mode=="predict":
 
     cryoCheck.eval()
+    writer = JaxSummaryWriter(os.path.join(args.output_path, "cryoCheck_metrics"))
 
     # Prepare grain dataset
     data_loader = generator.return_grain_dataset(batch_size=args.batch_size, shuffle=False, num_epochs=1,
@@ -644,12 +670,14 @@ def main():
                     bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
     
 
-    labels_prediction = []
-
+    prediction_list = []
+    labels_list = []
+    index_list = []
 
     for (x, index) in pbar:
 
       euler_angles, shifts, ctf = md_extraction (md_columns, index, vol, args)
+      batch_size = len(index)
       
       projection_pred = volumeProjection(vol=vol,
                                  mask=mask,
@@ -659,12 +687,33 @@ def main():
       result = compute_fourier_residual(projection_pred, x, n_shells=n_shells)
       prediction_frc, _ = standardize_frc_curve(result.frc_curve, result.freqs, ts=args.sr, n_shells_ref=n_shells)
       prediction_frc = jnp.array(prediction_frc)
-      #predictions = predict_fn(prediction_res,eval=True)
-      predictions = cryoCheck(prediction_frc, eval=True)
+      aligned_labels = jnp.ones((batch_size,1))
+    
 
-      labels_prediction.append(np.array(predictions))
+      # generate misaligned projectsions to test the model
+      rngs, euler_angles_noisy, shifts_noisy = generate_misalignment(rngs, euler_angles, shifts, box_size=x_size, alpha_min_deg=alpha_min_deg, alpha_max_deg=180, shift_min_px=2, shift_max_frac=0.1)
+      projection_pred_mis = volumeProjection(vol=vol,
+                                      mask=mask,
+                                      euler_angles=euler_angles_noisy,
+                                      shifts=shifts_noisy,
+                                      ctf=ctf)
+      result_mis= compute_fourier_residual(projection_pred_mis, x, n_shells=n_shells)
+      prediction_frc_mis, _ = standardize_frc_curve(result_mis.frc_curve, result_mis.freqs, ts=args.sr, n_shells_ref=n_shells)
+      prediction_frc_mis = jnp.array(prediction_frc_mis)
+      misaligned_labels = jnp.zeros((batch_size,1))
 
-    final_predictions = np.concatenate(labels_prediction, axis=0)
+      frc_curves = jnp.concatenate([prediction_frc, prediction_frc_mis],axis=0)
+      labels = jnp.concatenate([aligned_labels, misaligned_labels], axis=0)
+
+      predictions = cryoCheck(frc_curves, eval=True)
+
+      prediction_list.append(np.array(predictions))
+      labels_list.append(np.array(labels))
+      index_list.append(np.concatenate([np.array(index), np.array(index)], axis=0))      
+          
+    final_predictions = np.concatenate(prediction_list, axis=0).ravel()
+    final_labels = np.concatenate(labels_list, axis=0).ravel()
+    index_prediction = np.concatenate(index_list, axis=0).ravel()   
 
     # Retieve optimal threshold value from training step
     threshold_path = os.path.join(args.output_path, "optimal_threshold_value.txt")
@@ -675,11 +724,18 @@ def main():
         optimal_threshold = 0.5
 
     final_predictions_heavy = (final_predictions > optimal_threshold).astype(int)
-    
+
+
+    writer.add_roc_curve(final_labels, final_predictions, global_step=0, tag="ROC Curve - Predict Self-Test")
+    writer.add_confusion_matrix(final_labels, final_predictions_heavy, global_step=0, tag="Confusion Matrix - Predict Self-Test")
+
+    misaligned_ids = index_prediction[final_predictions_heavy == 0]
+    np.save(os.path.join(args.output_path, "misaligned_ids.npy"), misaligned_ids)
+    print(f"Misaligned: {len(misaligned_ids)}/{len(final_predictions)} — saved in misaligned_ids.npy")
   
     # Save results 
-    md=generator.md 
-    md[:, "misalignment_score"] = final_predictions
-    md[:, "misalignment_score_heavy"] = final_predictions_heavy
-    md.write(os.path.join(args.output_path, "md_final_predictions" +  os.path.splitext(args.md)[1]))
-
+    #md=generator.md 
+    #md[:, "misalignment_score"] = final_predictions
+    #md[:, "misalignment_score_heavy"] = final_predictions_heavy
+    #md.write(os.path.join(args.output_path, "md_final_predictions" +  os.path.splitext(args.md)[1]))
+ 
