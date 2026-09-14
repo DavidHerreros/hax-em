@@ -2,6 +2,9 @@ import numpy as np
 from jax import numpy as jnp
 
 
+_DOSE_A, _DOSE_B, _DOSE_C = 0.24499, 1.6649, 2.8141
+
+
 def ctf_freqs(shape, d=1.0, full=True):
     """
     :param shape: Shape tuple.
@@ -54,14 +57,31 @@ def eval_ctf(s, a, def1, def2, angast=0., phase=0., kv=300., ac=0.1, cs=2.0, bf=
         ctf *= jnp.exp(-k4 * s_2)
     return ctf
 
-def computeCTF(defocusU, defocusV, defocusAngle, cs, kv, sr, img_shape, batch_size, applyCTF):
+def computeCTF(defocusU, defocusV, defocusAngle, cs, kv, sr, img_shape, batch_size, applyCTF, preExposure=None, ctfScaleFactor=None):
     if applyCTF:
         s, a = ctf_freqs([img_shape[0], img_shape[0]], 1 / sr)
         # ``eval_ctf`` introduces the particle axis through defocus/angle.  Keep
         # the invariant frequency grids two-dimensional and let broadcasting do
         # the work instead of materialising two batch-sized copies every step.
         ctf = eval_ctf(s, a, defocusU, defocusV, angast=defocusAngle, cs=cs, kv=kv)
+
+        # Dose / tilt weight
+        w = computeDoseEnvelope(sr, img_shape, batch_size, preExposure=preExposure, ctfScaleFactor=ctfScaleFactor)
+        # ctf = ctf * jnp.sqrt(w)
+        ctf = ctf * w
+
         ctf = jnp.fft.fftshift(ctf[:, :, :img_shape[1]])
         return ctf
     else:
         return jnp.ones([batch_size, img_shape[0], img_shape[1]], dtype=jnp.float32)
+
+
+def computeDoseEnvelope(sr, img_shape, batch_size, preExposure=None, ctfScaleFactor=None):
+    s, a = ctf_freqs([img_shape[0], img_shape[0]], 1 / sr)
+
+    # Dose / tilt weight
+    k = jnp.maximum(s, 1e-6)  # Nc diverges at DC -> W(0) = 1
+    inv2nc = 1.0 / (2.0 * (_DOSE_A * k ** (-_DOSE_B) + _DOSE_C))
+    dose = preExposure if preExposure is not None else jnp.zeros((batch_size,), jnp.float32)
+    scale = ctfScaleFactor if ctfScaleFactor is not None else jnp.ones((batch_size,), jnp.float32)
+    return jnp.exp(-dose[:, None, None] * inv2nc[None]) * scale[:, None, None]

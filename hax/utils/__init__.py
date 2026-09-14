@@ -1,6 +1,6 @@
 from .losses import simae, correlation_coefficient_loss, ncc_loss, gradient_loss, diceLoss, contrastive_ce_loss, triplet_loss, sliced_wasserstein_loss, FRCLoss, dynamic_band_mask, recommended_band, chamfer_distance, soft_spherical_occupancy, candidate_coverage_loss, latent_variance_covariance_loss, geometry_prior_losses, support_loss, whitened_reconstruction_loss
 from .geometric_losses import calculate_deformation_regularity_loss, calculate_outlier_loss, calculate_neighbour_loss, calculate_repulsion_loss, calculate_deformation_coherence_loss, calculate_arap_loss, decoder_jacobian, geometric_correction_loss, composed_geometric_correction_loss
-from .ctf import computeCTF, ctf_freqs
+from .ctf import computeCTF, ctf_freqs, computeDoseEnvelope
 from .euler import euler_matrix_batch, euler_from_matrix
 from .grid_interpolation import interpolate
 from .fourier_filters import wiener2DFilter, ctfFilter, gaussianCTFFilter, gaussian_envelope, fourier_resize, fourier_resample, centered_crop_or_pad, low_pass_3d, low_pass_3d_analytic, FastVariableBlur2D, bspline_3d, rfft2_padded, irfft2_padded, fourier_slice_interpolator, bandpass_filter
