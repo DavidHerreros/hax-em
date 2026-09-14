@@ -23,3 +23,4 @@ from .hyperparameter_tuning import estimate_batch_size, estimate_batch_size_from
 from .image_transformations import apply_batch_translations, prepare_image_cryocrab, prepare_image_wiener
 from .jax_tsp import solve_tsp_simulated_annealing_jax, solve_tsp_local_search_jax
 from .decorators import save_config
+from .rigid_gauge import RigidGauge, build_density_rigid_basis, gauge_displacement_field, gauge_density_field
