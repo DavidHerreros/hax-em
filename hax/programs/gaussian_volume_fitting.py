@@ -15,6 +15,7 @@ import dm_pix
 import pynndescent
 from cuml.neighbors.nearest_neighbors import NearestNeighbors
 from xmipp_metadata.image_handler import ImageHandler
+from xmipp_metadata.metadata import XmippMetaData
 
 from hax.utils import *
 from hax.generators import MetaDataGenerator, extract_columns
@@ -297,9 +298,15 @@ class GaussianSplatModel(nnx.Module):
                 defocusAngle = projection_parameters["ctfDefocusAngle"]
                 cs = projection_parameters["ctfSphericalAberration"]
                 kv = projection_parameters["ctfVoltage"][0]
+                if "preExposure" in projection_parameters.keys():
+                    preExposure = projection_parameters["preExposure"]
+                    ctfScaleFactor = projection_parameters["ctfScaleFactor"]
+                else:
+                    preExposure = None
+                    ctfScaleFactor = None
                 ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
                                  projection_parameters["sr"], [pad_factor * self.grid_size, int(pad_factor * 0.5 * self.grid_size + 1)],
-                                 rotations.shape[0], True)
+                                 rotations.shape[0], True, preExposure, ctfScaleFactor)
             else:
                 ctf = jnp.ones([rotations.shape[0], pad_factor * self.grid_size, int(pad_factor * 0.5 * self.grid_size + 1)],
                                dtype=means.dtype)
@@ -484,10 +491,16 @@ def training_step_local_adjustment(graphdef, state, target, projection_parameter
         defocusAngle = projection_parameters.pop("ctfDefocusAngle")
         cs = projection_parameters.pop("ctfSphericalAberration")
         kv = projection_parameters.pop("ctfVoltage")[0]
+        if ctf_type == "premultiplied":
+            preExposure = projection_parameters["preExposure"]
+            ctfScaleFactor = projection_parameters["ctfScaleFactor"]
+        else:
+            preExposure = None
+            ctfScaleFactor = None
         ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
                          projection_parameters["sr"],
                          [pad_factor * model.grid_size, int(pad_factor * 0.5 * model.grid_size  + 1)],
-                         target.shape[0], True)
+                         target.shape[0], True, preExposure, ctfScaleFactor)
         target = wiener2DFilter(jnp.squeeze(target), ctf)
 
     loss_val, grads = nnx.value_and_grad(loss_fn)(model, target)
@@ -526,10 +539,16 @@ def training_step_global_adjustment(graphdef, state, target, projection_paramete
             defocusAngle = projection_parameters["ctfDefocusAngle"]
             cs = projection_parameters["ctfSphericalAberration"]
             kv = projection_parameters["ctfVoltage"][0]
+            if "preExposure" in projection_parameters.keys():
+                preExposure = projection_parameters["preExposure"]
+                ctfScaleFactor = projection_parameters["ctfScaleFactor"]
+            else:
+                preExposure = None
+                ctfScaleFactor = None
             ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
                              projection_parameters["sr"],
                              [pad_factor * grid_size, int(pad_factor * 0.5 * grid_size + 1)],
-                             rotations.shape[0], True)
+                             rotations.shape[0], True, preExposure, ctfScaleFactor)
         else:
             ctf = jnp.ones(
                 [rotations.shape[0], pad_factor * grid_size, int(pad_factor * 0.5 * grid_size + 1)],
@@ -590,10 +609,16 @@ def image_affine_stats(graphdef, state, target, projection_parameters, grid_size
         defocusAngle = projection_parameters["ctfDefocusAngle"]
         cs = projection_parameters["ctfSphericalAberration"]
         kv = projection_parameters["ctfVoltage"][0]
+        if "preExposure" in projection_parameters.keys():
+            preExposure = projection_parameters["preExposure"]
+            ctfScaleFactor = projection_parameters["ctfScaleFactor"]
+        else:
+            preExposure = None
+            ctfScaleFactor = None
         ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
                          projection_parameters["sr"],
                          [pad_factor * grid_size, int(pad_factor * 0.5 * grid_size + 1)],
-                         rotations.shape[0], True)
+                         rotations.shape[0], True, preExposure, ctfScaleFactor)
     else:
         ctf = jnp.ones(
             [rotations.shape[0], pad_factor * grid_size, int(pad_factor * 0.5 * grid_size + 1)],
@@ -602,6 +627,8 @@ def image_affine_stats(graphdef, state, target, projection_parameters, grid_size
     if ctf_type in ["wiener", "precorrect"]:
         target = wiener2DFilter(jnp.squeeze(target), ctf)
         ctf = jnp.ones_like(ctf)
+    elif ctf_type in ["squared", "premultiplied"]:
+        ctf = ctf * ctf
 
     proj = splat_weights_bilinear(grid_size, means, weights, sigma, rotations, shifts, ctf)
 
@@ -849,13 +876,16 @@ def fit_images(md_path, mmap_output_dir, sr, vol=None, mask=None, batch_size=256
 def _build_projection_parameters(md_columns, labels, sr, ctf_type):
     projection_parameters = {"euler_angles": md_columns["euler_angles"][labels],
                              "shifts": md_columns["shifts"][labels]}
-    if ctf_type in ["apply", "wiener", "squared", "precorrect"]:
+    if ctf_type in ["apply", "wiener", "squared", "precorrect", "premultiplied"]:
         ctf_parameters = {"ctfDefocusU": md_columns["ctfDefocusU"][labels],
                           "ctfDefocusV": md_columns["ctfDefocusV"][labels],
                           "ctfDefocusAngle": md_columns["ctfDefocusAngle"][labels],
                           "ctfSphericalAberration": md_columns["ctfSphericalAberration"][labels],
                           "ctfVoltage": md_columns["ctfVoltage"][labels],
                           "sr": sr}
+        if ctf_type == "premultiplied":
+            ctf_parameters["preExposure"] = md_columns["preExposure"][labels]
+            ctf_parameters["ctfScaleFactor"] = md_columns["ctfScaleFactor"][labels]
         projection_parameters = dict(projection_parameters, **ctf_parameters)
     return projection_parameters
 
@@ -884,7 +914,8 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
     history for the local path.
     """
     # Prepare metadata
-    generator = MetaDataGenerator(md_path)
+    isTomo = XmippMetaData(md_path).isTomo
+    generator = MetaDataGenerator(md_path, mode="tomo" if isTomo else None)
     md_columns = extract_columns(generator.md)
 
     # Grain dataset
