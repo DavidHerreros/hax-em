@@ -8,16 +8,18 @@ def min_max_scale(image):
     return (image - min_val) / (max_val - min_val + 1e-6)
 
 
-def standard_normalization(images):
-    if len(images.shape) == 3:
-        axis = (1, 2)
-    elif len(images.shape) == 4:
-        axis = (1, 2, 3)
-    else:
-        raise ValueError('Images must have 3 channels or 4 channels.')
+def standard_normalization(images, mask=None):
+    axis = (1, 2) if images.ndim == 3 else (1, 2, 3)
 
-    images = images - jnp.mean(images, axis=axis, keepdims=True)
-    return images / jnp.std(images, axis=axis, keepdims=True)
+    if mask is None:
+        images = images - jnp.mean(images, axis=axis, keepdims=True)
+        return images / (jnp.std(images, axis=axis, keepdims=True) + 1e-8)
+
+    m = jnp.broadcast_to(mask.reshape((1,) + mask.shape + (1,) * (images.ndim - 3)), images.shape)
+    n = jnp.maximum(jnp.sum(m, axis=axis, keepdims=True), 1.0)
+    mean = jnp.sum(images * m, axis=axis, keepdims=True) / n
+    var = jnp.sum(jnp.square(images - mean) * m, axis=axis, keepdims=True) / n
+    return (images - mean) / (jnp.sqrt(var) + 1e-8) * m
 
 
 def logistic_transform_std_shift(self, errors, mu=None, sigma=None):
