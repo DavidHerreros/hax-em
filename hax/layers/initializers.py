@@ -24,8 +24,10 @@ def uniform(minval=-1, maxval=1):
   return init
 
 
-def rot6d_perturbation_init(N: int, sigma: float = 0.01, mode: str = ""):
+def rot6d_perturbation_init(N: int, sigma: float = 0.01, mode: str = "", exact: bool = False):
   sigma = sigma * jnp.pi / 180.
+  # exact=True uses Rodrigues' sin(a)/a; the default keeps the legacy pi * sin(a)/a term (about 3x larger perturbations)
+  sin_term = (lambda a: jnp.sin(a) / (a + 1e-8)) if exact else (lambda a: jnp.sinc(a / jnp.pi) * jnp.pi)
 
   if mode == "bias":
     """For the BIAS of the final linear layer, shape (N * 6,)."""
@@ -41,7 +43,7 @@ def rot6d_perturbation_init(N: int, sigma: float = 0.01, mode: str = ""):
                        [wz, 0, -wx],
                        [-wy, wx, 0]])
         delta_R = (jnp.eye(3)
-                   + jnp.sinc(angle / jnp.pi) * jnp.pi * W
+                   + sin_term(angle) * W
                    + (1 - jnp.cos(angle)) / (angle ** 2 + 1e-8) * (W @ W))
         return delta_R[:, :2].T.ravel()
 
@@ -63,7 +65,7 @@ def rot6d_perturbation_init(N: int, sigma: float = 0.01, mode: str = ""):
                        [wz, 0, -wx],
                        [-wy, wx, 0]])
         delta_R = (jnp.eye(3)
-                   + jnp.sinc(angle / jnp.pi) * jnp.pi * W
+                   + sin_term(angle) * W
                    + (1 - jnp.cos(angle)) / (angle ** 2 + 1e-8) * (W @ W))
         return delta_R[:, :2].T.ravel()
 
