@@ -208,6 +208,15 @@ def repulsion_loss(
     return jnp.mean(energy)
 
 
+def rot6d_to_matrix(rotations_6d):
+    a1, a2 = jnp.split(rotations_6d, 2, axis=-1)
+    b1 = a1 / jnp.clip(jnp.linalg.norm(a1, axis=-1, keepdims=True), a_min=1e-6)
+    a2_ortho = a2 - jnp.sum(a2 * b1, axis=-1, keepdims=True) * b1
+    b2 = a2_ortho / jnp.clip(jnp.linalg.norm(a2_ortho, axis=-1, keepdims=True), a_min=1e-6)
+    b3 = jnp.cross(b1, b2, axis=-1)
+    return jnp.stack([b1, b2, b3], axis=-1)
+
+
 class PoseHead(nnx.Module):
     def __init__(self, is_refine=False, *, rngs: nnx.Rngs):
         if is_refine:
@@ -350,12 +359,7 @@ class EncoderPose(nnx.Module):
             identity_6d = jnp.array([1., 0., 0., 0., 1., 0.])[None, ...].repeat(rotations_6d.shape[0], axis=0)
             rotations_6d = identity_6d + rotations_6d
 
-        a1, a2 = jnp.split(rotations_6d, 2, axis=-1)
-        b1 = a1 / jnp.clip(jnp.linalg.norm(a1, axis=-1, keepdims=True), a_min=1e-6)
-        a2_ortho = a2 - jnp.sum(a2 * b1, axis=-1, keepdims=True) * b1
-        b2 = a2_ortho / jnp.clip(jnp.linalg.norm(a2_ortho, axis=-1, keepdims=True), a_min=1e-6)
-        b3 = jnp.cross(b1, b2, axis=-1)
-        rotations = jnp.stack([b1, b2, b3], axis=-1)
+        rotations = rot6d_to_matrix(rotations_6d)
         rotations = rotations.reshape(x.shape[0], self.num_components, 3, 3)
         if self.use_anchor_rotations and not self.refine_current_assignment:
             rotations = jnp.einsum('bnhk,nkw->bnhw', rotations, self.anchor_rotations)
@@ -615,16 +619,6 @@ class HetVolumeDecoder(nnx.Module):
 
 
 class HetFieldDecoder(nnx.Module):
-    """Coordinate-conditioned delta field, FiLM-modulated by the latent.
-
-    The low-rank readout of :class:`HetVolumeDecoder` spans at most ``lat_dim``
-    global deformation modes: every Gaussian moves along a fixed direction, and
-    a motion confined to one region has to be paid for out of that same global
-    budget. Here the delta is a continuous SIREN field of the point position,
-    so locality costs latent capacity only where the conformation differs. The
-    price is B x N x width activations instead of B x width.
-    """
-
     def __init__(self, coords, values, n_gaussians, lat_dim, volume_size,
                  residual_to_consensus=False, center_decoder=False,
                  small_final_init=False, width=HET_FIELD_WIDTH, *, rngs: nnx.Rngs):
@@ -778,7 +772,7 @@ class ReconSIREN(nnx.Module):
         het_covariance_weight = 1e-3 if anti_collapse else 0.0
         het_start_epoch = (5 if anti_collapse else 0) if het_start_epoch is None else int(het_start_epoch)
 
-        # Multiresolution heterogeneity reconstruction loss, dominated by full resolution
+        # Multiresolution heterogeneity reconstruction loss
         if anti_collapse:
             het_loss_scales = tuple(dict.fromkeys(
                 [min(int(xsize), max(32, int(round(0.64 * xsize)))), int(xsize)]))
@@ -813,8 +807,6 @@ class ReconSIREN(nnx.Module):
         self.delta_volume_decoder = DeltaVolumeDecoder(coords=coords, values=values, volume_size=self.xsize,
                                                        learn_delta_volume=learn_delta_volume,
                                                        parameterization=consensus_parameterization, rngs=rngs)
-        # Both decoders live under the same attribute name: the optimizer parameter
-        # filters select by path, so the architecture must not move in the tree
         het_decoder_class = HetFieldDecoder if anti_collapse else HetVolumeDecoder
         self.delta_het_decoder = het_decoder_class(coords=coords, values=values, n_gaussians=coords.shape[0],
                                                   lat_dim=lat_dim, volume_size=self.xsize, residual_to_consensus=het_residual_to_consensus,
