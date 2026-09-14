@@ -112,7 +112,7 @@ def _dose_weight(inv2nc, dose, scale):
 
 @partial(jax.jit, static_argnums=(7, 10), donate_argnums=(0, 1))
 def _insert_slices(num, den, images, rotations, shifts, ctf, k_rot, box, f0, f1,
-                   premultiplied=False, dose_w=None):
+                   premultiplied=False, dose_w=None, valid=None):
     """Accumulate one batch of CTF-weighted central slices into the 3D transform.
 
     ``premultiplied`` says whether the stored images have already been multiplied by their
@@ -145,6 +145,9 @@ def _insert_slices(num, den, images, rotations, shifts, ctf, k_rot, box, f0, f1,
     w = ctf if dose_w is None else ctf * dose_w
     data = ft if premultiplied else ft * w
     weight = w ** 2
+    if valid is not None:
+        data = data * valid[:, None, None]
+        weight = weight * valid[:, None, None]
 
     k = jnp.einsum("bji,jhw->bihw", rotations, k_rot)             # R^T @ (f1, f0, 0), components
     k = jnp.stack([k[:, 2], k[:, 1], k[:, 0]], 1)                 # reversed -> volume array order
@@ -169,6 +172,32 @@ def _insert_slices(num, den, images, rotations, shifts, ctf, k_rot, box, f0, f1,
     # Only the slice itself is scattered here; its Friedel mate is added once at the end of
     # the pass by ``_hermitian_symmetrize``, which is the same thing for half the atomics.
     return scatter(num, den, k, data, weight)
+
+
+def _symmetrize_accumulators(num, den, matrices):
+    """Average the accumulators over a point group, in Fourier space"""
+    from jax.scipy.ndimage import map_coordinates
+
+    matrices = np.asarray(matrices, np.float64)
+    box = num.shape[0]
+    g = np.arange(box, dtype=np.float32) - box // 2
+    z, y, x = np.meshgrid(g, g, g, indexing="ij")
+    k = jnp.asarray(np.stack([x.ravel(), y.ravel(), z.ravel()], 0))       # (3, N), (x, y, z)
+
+    def resample(vol, coords):
+        vol_re = map_coordinates(jnp.real(vol), coords, order=1, mode="constant", cval=0.0)
+        if not jnp.iscomplexobj(vol):
+            return vol_re.reshape(vol.shape)
+        vol_im = map_coordinates(jnp.imag(vol), coords, order=1, mode="constant", cval=0.0)
+        return (vol_re + 1j * vol_im).reshape(vol.shape)
+
+    num_sym, den_sym = jnp.zeros_like(num), jnp.zeros_like(den)
+    for S in matrices:
+        ks = jnp.asarray(S, jnp.float32) @ k                                # rotated (x, y, z)
+        coords = jnp.stack([ks[2], ks[1], ks[0]], 0) + box // 2            # -> [z, y, x] index
+        num_sym = num_sym + resample(num, coords)
+        den_sym = den_sym + resample(den, coords)
+    return num_sym / len(matrices), den_sym / len(matrices)
 
 
 def _hermitian_symmetrize(num, den):
@@ -209,9 +238,33 @@ def _shell_index(box):
 
 def _invert(num, den, tau, box):
     """Wiener quotient -> real volume, with the gridding envelope removed."""
-    volume_ft = num / (den + tau * jnp.mean(den))
+    shells = _shell_index(box)
+    low = jnp.asarray((shells >= 1) & (shells <= max(2, box // 16)), jnp.float32)
+    floor = tau * jnp.sum(den * low) / jnp.sum(low)
+    volume_ft = num / (den + floor)
     volume = jnp.real(jnp.fft.fftshift(jnp.fft.ifftn(jnp.fft.ifftshift(volume_ft))))
     return np.asarray(volume) / _gridding_correction(box)
+
+
+def _soft_sphere(box, radius_px, edge_px=5.0):
+    """Spherical mask with a cosine edge ``edge_px`` wide, centred in the box."""
+    g = np.arange(box) - box // 2
+    z, y, x = np.meshgrid(g, g, g, indexing="ij")
+    r = np.sqrt(x ** 2 + y ** 2 + z ** 2)
+    t = np.clip((r - radius_px) / edge_px, 0.0, 1.0)
+    return (0.5 * (1.0 + np.cos(np.pi * t))).astype(np.float32)
+
+
+def _half_assignment(columns, n):
+    if "randomSubset" in columns:
+        subset = np.asarray(columns["randomSubset"]).ravel().astype(np.int64)
+        if subset.shape[0] == n and np.unique(subset).size == 2:
+            return (subset != subset.min()).astype(np.int64), "rlnRandomSubset"
+    if "subtomo_labels" in columns:
+        particle = np.asarray(columns["subtomo_labels"]).ravel().astype(np.int64)
+        if particle.shape[0] == n:
+            return particle % 2, "particle parity (tilt-series rows grouped by particle)"
+    return np.arange(n, dtype=np.int64) % 2, "row parity"
 
 
 def _half_map_fsc(vol_a, vol_b, shells, n_shells):
@@ -422,7 +475,9 @@ def _stream_chunks(reader, n, batch_size, threads):
 def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, threads=8,
                                  use_ctf=True, denoise=True, calibrate_gray_scale=True,
                                  scratch_dir=None, quiet=False, premultiplied=False,
-                                 dose_weighting=True):
+                                 dose_weighting=True, fsc_mask_diameter=None, symmetry="c1",
+                                 return_half_maps=False,
+                                 fsc_output=None):
     """Reconstruct a consensus volume from posed particles in a single streaming pass.
 
     ``md`` is an ``XmippMetaData``; ``columns`` the dict from ``extract_columns`` (it
@@ -435,6 +490,9 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
     series contain by default. The slices are then inserted as they are and only the
     denominator uses the CTF; multiplying again would leave the map modulated by one extra
     CTF. It has no effect unless ``use_ctf``, since without a CTF there is nothing to undo.
+
+    ``return_half_maps`` additionally returns the two unfiltered half maps as
+    ``(volume, (half1, half2))``.
 
     ``dose_weighting`` handles the other half of what those extractions fold in. A tilt image
     is premultiplied by ``CTF * W``, where ``W`` is the radiation-damage weight and the tilt
@@ -474,6 +532,7 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
     angles = np.asarray(columns["euler_angles"], np.float32)
     shifts = np.asarray(columns["shifts"], np.float32)
     has_ctf = use_ctf and "ctfDefocusU" in columns
+    half_of_row, split_rule = _half_assignment(columns, n)
 
     # The dose/tilt weight only exists for tilt-series data. Without a CTF there is no
     # premultiplier to correct at all, so the weight has nothing to attach to either.
@@ -502,6 +561,10 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
                   f"is off. For tilt-series data that leaves a large B-factor in the "
                   f"map.{bcolors.ENDC}")
 
+    if not quiet:
+        print(f"{bcolors.OKCYAN}Half maps split by {split_rule}: "
+              f"{int((half_of_row == 0).sum())} / {int((half_of_row == 1).sum())} rows.{bcolors.ENDC}")
+
     n_chunks = (n + batch_size - 1) // batch_size
     for labels, images in tqdm(_stream_chunks(reader, n, batch_size, threads), total=n_chunks,
                                file=sys.stdout, ascii=" >=", colour="green", disable=quiet):
@@ -512,12 +575,18 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
         images_dev = jnp.asarray(images)
 
         for half in (0, 1):
-            # Interleave the halves so both see the same pose and defocus distribution.
-            # Particle `i` belongs to half `i % 2` -- keyed off the metadata row, so the split
-            # is the same one no matter what order the images arrived in.
-            pos = np.flatnonzero(labels % 2 == half)
+            # The split is keyed off the metadata row (see ``_half_assignment``), so it is the
+            # same one no matter what order the images arrived in.
+            pos = np.flatnonzero(half_of_row[labels] == half)
             if pos.size == 0:
                 continue
+            # ``_insert_slices`` is compiled per batch shape. The halves of a chunk are not of a
+            # fixed size (a per-particle split puts whole tilt series on one side), so pad each
+            # to the next multiple of 64 rows with zero-weight copies of the first row: a few
+            # shapes compiled once, instead of one compile (seconds) per chunk.
+            n_pad = (-pos.size) % 64
+            valid = jnp.asarray(np.concatenate([np.ones(pos.size, np.float32), np.zeros(n_pad, np.float32)]))
+            pos = np.concatenate([pos, np.full(n_pad, pos[0], pos.dtype)])
             idx = labels[pos]
 
             ang = jnp.asarray(angles[idx])
@@ -542,21 +611,43 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
 
             num[half], den[half] = _insert_slices(
                 num[half], den[half], images_dev[jnp.asarray(pos)], rotations,
-                jnp.asarray(shifts[idx]), ctf, k_rot, box, f0, f1, premultiplied, dose_w)
+                jnp.asarray(shifts[idx]), ctf, k_rot, box, f0, f1, premultiplied, dose_w, valid)
 
     # The Friedel mates of every slice, added in one pass rather than during the streaming.
     num[0], den[0] = _hermitian_symmetrize(num[0], den[0])
     num[1], den[1] = _hermitian_symmetrize(num[1], den[1])
 
+    # Point-group symmetry, imposed on the accumulators of each half so that the half-map
+    # FSC measures the symmetrised maps
+    if symmetry is not None and symmetry.strip().lower() != "c1":
+        from .symmetry_groups import symmetry_matrices
+        matrices = symmetry_matrices(symmetry)
+        num[0], den[0] = _symmetrize_accumulators(num[0], den[0], matrices)
+        num[1], den[1] = _symmetrize_accumulators(num[1], den[1], matrices)
+        if not quiet:
+            print(f"{bcolors.OKCYAN}{symmetry.upper()} symmetry imposed ({len(matrices)} operators).{bcolors.ENDC}")
+
     total_num, total_den = num[0] + num[1], den[0] + den[1]
     volume = _invert(total_num, total_den, tau, box)
 
+    half_maps = None
+    if denoise or return_half_maps:
+        half_a, half_b = _invert(num[0], den[0], tau, box), _invert(num[1], den[1], tau, box)
+        if return_half_maps:
+            half_maps = (np.asarray(half_a, np.float32), np.asarray(half_b, np.float32))
     if denoise:
         shells = _shell_index(box)
         n_shells = box // 2 + 1
-        fsc = _half_map_fsc(_invert(num[0], den[0], tau, box),
-                            _invert(num[1], den[1], tau, box), shells, n_shells)
+        if fsc_mask_diameter is not None:
+            mask = _soft_sphere(box, 0.5 * fsc_mask_diameter / sr)
+            half_a, half_b = half_a * mask, half_b * mask
+        fsc = _half_map_fsc(half_a, half_b, shells, n_shells)
         resolution = _resolution(fsc, box, sr)
+        if fsc_output is not None:
+            freq = np.arange(n_shells) / (box * sr)
+            np.savetxt(fsc_output, np.c_[freq, np.where(freq > 0, 1.0 / np.maximum(freq, 1e-12), np.inf), fsc],
+                       header="1/A  A  FSC" + ("" if fsc_mask_diameter is None else
+                                               f"  (soft {fsc_mask_diameter:g} A spherical mask)"), fmt="%.6g")
 
         # Apply the MMSE filter shell by shell, in Fourier space.
         curve = _fsc_filter(fsc)
@@ -564,7 +655,9 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
         volume = np.real(np.fft.fftshift(np.fft.ifftn(np.fft.ifftshift(v_ft * curve[shells]))))
 
         if not quiet:
-            print(f"{bcolors.OKGREEN}Half-map FSC = 0.143 at {resolution:.1f} A "
+            what = ("Half-map FSC" if fsc_mask_diameter is None
+                    else f"Half-map FSC (soft {fsc_mask_diameter:g} A spherical mask)")
+            print(f"{bcolors.OKGREEN}{what} = 0.143 at {resolution:.1f} A "
                   f"(Nyquist {2.0 * sr:.1f} A); the map is filtered to that limit.{bcolors.ENDC}")
 
     if calibrate_gray_scale:
@@ -576,7 +669,8 @@ def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, thr
             print(f"{bcolors.OKGREEN}Gray-scale calibrated to the input images (x{scale:.3f}); "
                   f"projecting the map reproduces their contrast.{bcolors.ENDC}")
 
-    return np.asarray(volume, np.float32)
+    volume = np.asarray(volume, np.float32)
+    return (volume, half_maps) if return_half_maps else volume
 
 
 def consensus_mask(volume, threshold=0.02, dilate=2, keep_largest=True):

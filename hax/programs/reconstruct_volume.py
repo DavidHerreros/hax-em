@@ -41,8 +41,9 @@ def main():
                          f"CTF is not a harmless no-op, and multiplying pre-multiplied ones a second time leaves the map "
                          f"modulated by an extra CTF -- low frequencies suppressed and the CTF zeros squared.")
     parser.add_argument("--tau", required=False, type=float, default=0.05,
-                        help=f"Wiener floor of the reconstruction quotient (set by default to 0.05). This is only a numerical "
-                             f"regularizer to keep the shells with little CTF power from blowing up -- the resolution of the map "
+                        help=f"Wiener floor of the reconstruction quotient, as a fraction of the low-resolution denominator "
+                             f"(set by default to 0.05). This is only a numerical regularizer to keep the shells with little "
+                             f"CTF (or, for tilt series, little dose-weight) power from blowing up -- the resolution of the map "
                              f"is set by the data, not by this. Raise it if the map looks noisy at high frequency, lower it if it "
                              f"looks over-smoothed.")
     parser.add_argument("--no_denoise", action='store_true',
@@ -50,6 +51,13 @@ def main():
                              f"FSC between the resulting half maps measures the spectral signal-to-noise, and the combined map is "
                              f"filtered with it, so the shells carrying signal pass untouched and the shells that are only noise are "
                              f"removed (the measured resolution is printed). Pass this flag to get the raw, unfiltered map instead.")
+    ca.add_symmetry_group(parser,
+                          help=f"Point-group symmetry to impose on the map (set by default to {bcolors.ITALIC}c1{bcolors.ENDC}, "
+                               f"i.e. none; {bcolors.ITALIC}c*{bcolors.ENDC} and {bcolors.ITALIC}d*{bcolors.ENDC} are supported).")
+    parser.add_argument("--fsc_diameter", required=False, type=float, default=None,
+                        help=f"{bcolors.BOLD}(optional){bcolors.ENDC} Diameter, in Angstrom, of a soft spherical mask "
+                             f"applied to the half maps before their FSC is measured. Without it the FSC is taken over "
+                             f"the whole box.")
     parser.add_argument("--no_dose_weighting", action='store_true',
                         help=f"{bcolors.BOLD}(optional){bcolors.ENDC} Do not fold the "
                              f"tilt-series dose/tilt weighting into the Wiener denominator. "
@@ -60,6 +68,9 @@ def main():
                         help=f"Skip the global gray-scale calibration. By default the finished map is forward-projected at a subset "
                              f"of the real poses and least-squares scaled against the input images, so that re-projecting it "
                              f"reproduces their contrast and value range. Pass this flag to keep the raw amplitudes.")
+    parser.add_argument("--write_half_maps", action='store_true',
+                        help=f"Also write the two unfiltered half maps ({bcolors.UNDERLINE}consensus_half1.mrc{bcolors.ENDC}, "
+                             f"{bcolors.UNDERLINE}consensus_half2.mrc{bcolors.ENDC}")
     parser.add_argument("--write_mask", action='store_true',
                         help=f"Also write a binary mask of the protein region derived from the reconstructed map "
                              f"({bcolors.UNDERLINE}consensus_mask.mrc{bcolors.ENDC}). This is the mask HetSIREN/MoDART expect in "
@@ -112,7 +123,7 @@ def main():
     # the data), so that is what decides whether the slices are CTF weighted. `premultiplied`
     # additionally says the CTF is already *in* the pixels, so it belongs in the denominator
     # only.
-    volume = reconstruct_consensus_volume(generator.md, md_columns, args.sr,
+    volume, half_maps = reconstruct_consensus_volume(generator.md, md_columns, args.sr,
                                           tau=args.tau,
                                           batch_size=args.batch_size,
                                           threads=args.threads,
@@ -120,15 +131,27 @@ def main():
                                           premultiplied=args.ctf_type == "premultiplied",
                                           denoise=not args.no_denoise,
                                           dose_weighting=not args.no_dose_weighting,
+                                          fsc_mask_diameter=args.fsc_diameter,
+                                          symmetry=args.symmetry_group,
+                                          fsc_output=os.path.join(args.output_path, "half_map_fsc.txt"),
+                                          return_half_maps=True,
                                           calibrate_gray_scale=not args.no_gray_scale_calibration,
                                           scratch_dir=scratch_dir)
 
     volume_path = os.path.join(args.output_path, "consensus_reconstruction.mrc")
-    ImageHandler().write(np.asarray(volume), volume_path, overwrite=True)
+    ImageHandler().write(np.asarray(volume), volume_path, overwrite=True, sr=args.sr)
     print(f"{bcolors.OKGREEN}Consensus volume reconstructed from the input poses -> {volume_path}{bcolors.ENDC}")
+    if not args.no_denoise:
+        print(f"{bcolors.OKGREEN}Half-map FSC curve -> {os.path.join(args.output_path, 'half_map_fsc.txt')}{bcolors.ENDC}")
+
+    if args.write_half_maps:
+        for k, half in enumerate(half_maps, 1):
+            half_path = os.path.join(args.output_path, f"consensus_half{k}.mrc")
+            ImageHandler().write(half, half_path, overwrite=True, sr=args.sr)
+        print(f"{bcolors.OKGREEN}Unfiltered half maps -> {os.path.join(args.output_path, 'consensus_half[1,2].mrc')}{bcolors.ENDC}")
 
     if args.write_mask:
         mask = consensus_mask(volume, threshold=args.mask_threshold, dilate=args.mask_dilate)
         mask_path = os.path.join(args.output_path, "consensus_mask.mrc")
-        ImageHandler().write(np.asarray(mask), mask_path, overwrite=True)
+        ImageHandler().write(np.asarray(mask), mask_path, overwrite=True, sr=args.sr)
         print(f"{bcolors.OKGREEN}Mask derived from the reconstructed map -> {mask_path}{bcolors.ENDC}")
