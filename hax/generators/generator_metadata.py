@@ -12,7 +12,7 @@ from concurrent.futures import as_completed, ThreadPoolExecutor
 from tqdm import tqdm
 from jax import numpy as jnp
 from jax.tree_util import tree_map
-from xmipp_metadata.metadata import XmippMetaData
+from xmipp_metadata.metadata import XmippMetaData, tilt_rotation_matrices
 from hax.utils.loggers import bcolors
 
 
@@ -104,6 +104,68 @@ class _RecordRangeSource:
         return self._source[self._start + idx]
 
 
+class _TomoStackSource:
+    """One item per particle: the (T, H, W, 1) stack of its tilt images, zero-padded to T_max with label -1."""
+    def __init__(self, source, groups, decode=None, row_to_record=None):
+        self._source = source
+        self._groups = groups
+        self._t_max = max(len(g) for g in groups)
+        self._decode = decode
+        self._row_to_record = row_to_record  # None when records are stored in metadata-row order
+
+    def __len__(self):
+        return len(self._groups)
+
+    def _fetch(self, rows):
+        """One coalesced read when the backend offers it, instead of len(rows) seeks."""
+        if self._row_to_record is not None:
+            rows = [int(r) for r in self._row_to_record[rows]]
+        batched = getattr(self._source, "__getitems__", None)
+        if batched is not None:
+            return list(batched(rows))
+        return [self._source[r] for r in rows]
+
+    def _stack(self, rows, items):
+        images, labels = [], []
+        for r, item in zip(rows, items):
+            if self._decode is not None:
+                item = self._decode(item)
+            image, label = item[0], item[1]
+            if int(label) != r:
+                raise ValueError(f"record/row mismatch: requested row {r}, got label {label} (stale cache without order.npy?)")
+            images.append(image)
+            labels.append(label)
+        images, labels = np.stack(images, 0), np.asarray(labels)
+        pad = self._t_max - len(rows)
+        if pad:
+            images = np.concatenate([images, np.zeros((pad,) + images.shape[1:], images.dtype)])
+            labels = np.concatenate([labels, np.full(pad, -1, labels.dtype)])
+        return images, labels
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            start, stop, step = idx.indices(len(self))
+            return [self[i] for i in range(start, stop, step)]
+        if idx < 0:
+            idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+
+        rows = [int(r) for r in self._groups[idx]]
+        return self._stack(rows, self._fetch(rows))
+
+    def __getitems__(self, indices):
+        """Every tilt of every requested particle in a single backend read."""
+        groups = [[int(r) for r in self._groups[int(i)]] for i in indices]
+        items = self._fetch([r for group in groups for r in group])
+        out, pos = [], 0
+        for group in groups:
+            out.append(self._stack(group, items[pos:pos + len(group)]))
+            pos += len(group)
+        return out
+
+
+
 class _RecordParitySource:
     """Every other record: the even (``parity=0``) or odd (``parity=1``) half of a source.
 
@@ -153,7 +215,7 @@ def _write_one_shard_mmap(path, image_indices, getImage_fn, dtype=np.float16):
 class MetaDataGenerator:
     def __init__(self, file, mode=None):
         self.file = file
-        self.md = XmippMetaData(file)
+        self.md = XmippMetaData(file, tomo=True if mode == "tomo" else None)
         self.mode = mode
 
         # Generator mode
@@ -209,6 +271,7 @@ class MetaDataGenerator:
         existing = glob(os.path.join(mmap_output_dir, "dataset-*.arrayrecord"))
         if not existing:
             print(f"{bcolors.OKCYAN}\n###### Creating Array Record from images... ######")
+            np.save(os.path.join(mmap_output_dir, "order.npy"), images_order)  # record position -> metadata row
 
             if not multiple_files:
                 # Single file.
@@ -485,7 +548,7 @@ class MetaDataGenerator:
                                  shard_size=shard_size, precision=precision, multiple_files=multiple_files)
 
     def return_grain_dataset(self, shuffle="global", batch_size=8, num_epochs=1, num_threads=1, num_workers=16,
-                             split_fraction=None, load_to_ram=False, split_mode="contiguous"):
+                             split_fraction=None, load_to_ram=False, split_mode="contiguous", stack_tomo=False):
         """``split_mode`` selects how ``split_fraction`` cuts the dataset in two.
 
         ``"contiguous"`` (default, unchanged) takes a leading and a trailing record range --
@@ -494,11 +557,26 @@ class MetaDataGenerator:
         fractions, which is what half-map reconstruction needs: a contiguous cut of a stack
         written in micrograph order gives two halves with different defocus and ice, and their
         FSC reports that as resolution. See ``_RecordParitySource``.
+
+        ``stack_tomo`` (tomo mode only) yields one particle per item -- the full (T, H, W, 1)
+        stack of its tilt images -- instead of one tilt image per item. ``batch_size`` then
+        counts particles, not tilt images. Particles with fewer tilts are zero-padded to the
+        largest tilt count, with label ``-1`` marking the padded rows.
         """
         import grain
         from array_record.python.array_record_data_source import ArrayRecordDataSource
 
         self.grain_dataset_type = "RAM" if load_to_ram else self.grain_dataset_type
+        needs_parse = self.grain_dataset_type == "ArrayRecord" and not stack_tomo
+
+        groups = None
+        if stack_tomo:
+            if self.mode != "tomo":
+                raise ValueError("stack_tomo requires tomo mode (a subtomo_labels column)")
+            labels = np.asarray(self.md[:, "subtomo_labels"]).astype(int).ravel()
+            order = np.argsort(labels, kind="stable")
+            _, counts = np.unique(labels, return_counts=True)
+            groups = np.split(order, np.cumsum(counts)[:-1])  # ragged: tilt count may vary (excluded views)
 
         def _split_sources(sources):
             if split_mode == "parity":
@@ -513,6 +591,10 @@ class MetaDataGenerator:
             shard_files.sort()
 
             sources = ArrayRecordDataSource(shard_files, reader_options={"index_storage_option": "in_memory"})
+            if stack_tomo:
+                order_file = os.path.join(self.mmap_output_dir, "order.npy")
+                row_to_record = np.argsort(np.load(order_file)) if os.path.exists(order_file) else None
+                sources = _TomoStackSource(sources, groups, decode=parse_and_decompress, row_to_record=row_to_record)
             if split_fraction is not None:
                 sources_train, sources_val = _split_sources(sources)
                 dataset_train = grain.MapDataset.source(sources_train)
@@ -566,6 +648,8 @@ class MetaDataGenerator:
             shard_paths.sort()
 
             sources = LazyNinjaGrainSource(shard_paths)
+            if stack_tomo:
+                sources = _TomoStackSource(sources, groups)
             if split_fraction is not None:
                 sources_train, sources_val = _split_sources(sources)
                 dataset_train = grain.MapDataset.source(sources_train)
@@ -590,18 +674,15 @@ class MetaDataGenerator:
                 def __getitem__(self, idx):
                     return self._data[idx], self._labels[idx]
 
+            sources = NumpyDataSource(images, labels)
+            if stack_tomo:
+                sources = _TomoStackSource(sources, groups)
             if split_fraction is not None:
-                if split_mode == "parity":
-                    sources_train = NumpyDataSource(images[0::2], labels[0::2])
-                    sources_val = NumpyDataSource(images[1::2], labels[1::2])
-                else:
-                    split_point = int(split_fraction[0] * len(images))
-                    sources_train = NumpyDataSource(images[:split_point], labels[:split_point])
-                    sources_val = NumpyDataSource(images[split_point:], labels[split_point:])
+                sources_train, sources_val = _split_sources(sources)
                 dataset_train = grain.MapDataset.source(sources_train)
                 dataset_val = grain.MapDataset.source(sources_val)
             else:
-                sources_train = NumpyDataSource(images, labels)
+                sources_train = sources
                 dataset_train = grain.MapDataset.source(sources_train)
 
         else:
@@ -614,7 +695,7 @@ class MetaDataGenerator:
             if split_fraction is not None:
                 dataset_val = dataset_val.shuffle(seed=seed)
 
-            if self.grain_dataset_type == "ArrayRecord":
+            if needs_parse:
                 dataset_train = dataset_train.map(parse_and_decompress)
                 if split_fraction is not None:
                     dataset_val = dataset_val.map(parse_and_decompress)
@@ -650,7 +731,7 @@ class MetaDataGenerator:
         elif shuffle == "global_data_loader":
             # Operations
             operations = []
-            if self.grain_dataset_type == "ArrayRecord":
+            if needs_parse:
                 class ParseAndDecompress(grain.transforms.Map):
                     def map(self, x):
                         return parse_and_decompress(x)
@@ -709,7 +790,7 @@ class MetaDataGenerator:
             if split_fraction is not None:
                 dataset_val = grain.experimental.WindowShuffleMapDataset(dataset_val, window_size=2048, seed=seed) 
 
-            if self.grain_dataset_type == "ArrayRecord":
+            if needs_parse:
                 dataset_train = dataset_train.map(parse_and_decompress)
                 if split_fraction is not None:
                     dataset_val = dataset_val.map(parse_and_decompress)
@@ -736,7 +817,7 @@ class MetaDataGenerator:
         else:
             # Operations
             operations = []
-            if self.grain_dataset_type == "ArrayRecord":
+            if needs_parse:
                 class ParseAndDecompress(grain.transforms.Map):
                     def map(self, x):
                         return parse_and_decompress(x)
@@ -800,13 +881,16 @@ def extract_columns(md, hasCTF=None, isTomo=None):
         columns["ctfSphericalAberration"] = jnp.array(md.getMetaDataColumns("ctfSphericalAberration").astype(jnp.float32))
         columns["ctfVoltage"] = jnp.array(md.getMetaDataColumns("ctfVoltage").astype(jnp.float32))
     if isTomo:
-        columns["subtomo_labels"] = jnp.array(md.getMetaDataColumns("subtomo_labels").astype(jnp.float32))
+        columns["subtomo_labels"] = md.getMetaDataColumns("subtomo_labels").astype(jnp.int32)
+        columns["rotationsTilt"] = tilt_rotation_matrices(md.table)
     # Tilt-series weighting: the accumulated dose of each tilt image and the tilt amplitude
     # scale. Both are optional -- older tomo metadata may carry neither -- and absent from
     # every single-particle data set, so they are looked up rather than required.
     for label in ("preExposure", "ctfScaleFactor"):
         if md.isMetaDataLabel(label):
             columns[label] = jnp.array(md.getMetaDataColumns(label).astype(jnp.float32))
+    if md.isMetaDataLabel("randomSubset"):
+        columns["randomSubset"] = md.getMetaDataColumns("randomSubset").astype(jnp.int32)
     return columns
 
 
