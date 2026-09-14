@@ -15,6 +15,7 @@ from sklearn.cluster import KMeans
 from hax.utils import *
 from hax.layers import *
 from hax.programs import splat_weights_trilinear, splat_weights, FastVariableBlur3D
+from hax.cli.common_args import CTF_TYPE_CHOICES_PREMULTIPLIED
 try:  # CryoUni depends on optional torch / cryouni deps; only needed for the "cryouni" architecture
     from hax.pretrained_models import CryoUni, CryoUniHead, CryoUniNNX
 except ImportError:
@@ -207,8 +208,9 @@ class MultiEncoder(nnx.Module):
         return jnp.exp(logstd) * jnr.normal(rngs, shape=mean.shape) + mean
 
     def __call__(self, x, encoder_id="encoder_exp", return_last=False, return_alignment_refinement=False, *,
-                 rngs=None, warmup_alpha=1.0):
-        x = self.encoders[encoder_id](x, return_last=True)
+                 rngs=None, warmup_alpha=1.0, mask=None):
+        # Tomo stacks are embedded tilt by tilt and mean-pooled before the heads
+        x = tilt_mean(lambda x: self.encoders[encoder_id](x, return_last=True), x, mask=mask)
 
         if return_alignment_refinement:
             x_ref = nnx.leaky_relu(x + self.hidden_layers_refinement[0](x))  # or nnx.relu
@@ -643,8 +645,12 @@ class PhysDecoder:
         # Define weighted mask for losses
         images_mask = jnp.where(images > 1e-6, 1.0, 0.0)
 
+        # Tomo case
+        if ctf_type == "premultiplied":
+            ctf = ctf * ctf
+
         # Apply CTF
-        if ctf_type in ["apply" or "wiener" or "squared"]:
+        if ctf_type in ["apply" or "wiener" or "squared", "premultiplied"]:
             images = ctfFilter(images, ctf, pad_factor=self.pad_factor)
 
             # Weighted mask (CTF case)
@@ -721,21 +727,21 @@ class HetSIREN(nnx.Module):
         else:
             self.representation_loss_fn = lambda x, y, freq_alpha=1.0: mse(x[..., None], y[..., None])
 
-    def __call__(self, x, rngs=None, **kwargs):
+    def __call__(self, x, rngs=None, mask=None, **kwargs):
         if self.isVae:
             if self.decoupling:
-                (sample, mean, _), (rotations, shifts, _) = self.encoder(x, "encoder_exp", return_last=False, return_alignment_refinement=True, rngs=rngs)
+                (sample, mean, _), (rotations, shifts, _) = self.encoder(x, "encoder_exp", return_last=False, return_alignment_refinement=True, rngs=rngs, mask=mask)
             else:
-                (sample, mean, _), (rotations, shifts, _) = self.encoder(x, return_last=False, return_alignment_refinement=True, rngs=rngs)
+                (sample, mean, _), (rotations, shifts, _) = self.encoder(x, return_last=False, return_alignment_refinement=True, rngs=rngs, mask=mask)
             if kwargs.pop("gaussian_sample", False):
                 latent = sample
             else:
                 latent = mean
         else:
             if self.decoupling:
-                latent, (rotations, shifts, _)  = self.encoder(x, "encoder_exp", return_last=False, return_alignment_refinement=True, rngs=rngs)
+                latent, (rotations, shifts, _)  = self.encoder(x, "encoder_exp", return_last=False, return_alignment_refinement=True, rngs=rngs, mask=mask)
             else:
-                latent, (rotations, shifts, _) = self.encoder(x, return_last=False, return_alignment_refinement=True, rngs=rngs)
+                latent, (rotations, shifts, _) = self.encoder(x, return_last=False, return_alignment_refinement=True, rngs=rngs, mask=mask)
         if kwargs.pop("return_alignment_refinement", True):
             return latent, (rotations, shifts)
         else:
@@ -755,9 +761,15 @@ class HetSIREN(nnx.Module):
             defocusAngle = md["ctfDefocusAngle"][labels]
             cs = md["ctfSphericalAberration"][labels]
             kv = md["ctfVoltage"][labels][0]
+            if ctf_type == "premultiplied":
+                preExposure = md["preExposure"][labels]
+                ctfScaleFactor = md["ctfScaleFactor"][labels]
+            else:
+                preExposure = None
+                ctfScaleFactor = None
             ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
                              self.sr, [2 * self.xsize, int(2 * 0.5 * self.xsize + 1)],
-                             x.shape[0], True)
+                             x.shape[0], True, preExposure, ctfScaleFactor)
         else:
             ctf = jnp.ones([x.shape[0], 2 * self.xsize, int(2.0 * 0.5 * self.xsize + 1)], dtype=x.dtype)
 
@@ -861,10 +873,6 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
                                          in_axes=(0, None, None, None, None))
 
     def loss_fn(model, x):
-        # Check if Tomo mode
-        if model.isTomoSIREN:
-            (x, subtomogram_label) = x
-
         # Prepare input images for encoder
         # if model.ctf_type in ["apply", "squared"]:
         #     x_in = prepare_image_cryocrab(x, ctf)
@@ -878,7 +886,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
                 (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key, warmup_alpha=warmup_alpha)
             elif model.isTomoSIREN:
                 (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
-                (_, latent_1, _), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out_random = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key, warmup_alpha=warmup_alpha)
+                (_, latent_1, _), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out_random = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key, warmup_alpha=warmup_alpha, mask=mask)
             else:
                 (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key, warmup_alpha=warmup_alpha)
         else:
@@ -886,7 +894,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
                 latent, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key, warmup_alpha=warmup_alpha)
             elif model.isTomoSIREN:
                 latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True)
-                latent_1, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out_random = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key, warmup_alpha=warmup_alpha)
+                latent_1, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out_random = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key, warmup_alpha=warmup_alpha, mask=mask)
             else:
                 latent, (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key, warmup_alpha=warmup_alpha)
 
@@ -901,6 +909,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
             rotations = euler_matrix_batch(euler_angles[:, 0], euler_angles[:, 1], euler_angles[:, 2])
         else:
             rotations = euler_angles
+        rotations = rotations.reshape(batch_shape + (3, 3))
 
         # Rotation posterior scheduling
         # min_log_scale = jnp.log(0.03) * max(0.0, 1.0 - steps_accum/30000)
@@ -910,14 +919,14 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         if M > 1:
             # Consider refinement and rigid registration alignments (for delta_volume_decoder_rigid output)
             # rotations_refined = jnp.matmul(rotations_rigid, rotations)
-            rotations_refined = jnp.matmul(rotations, rotations_rigid)
+            rotations_refined = jnp.matmul(rotations, per_particle(rotations_rigid, rotations))
 
             rotations_refined, omegas, log_q = sample_topM_R(rot_sample_key, rotations_refined, rotations_logscale, M=M)
         else:
             # Consider refinement and rigid registration alignments (for delta_volume_decoder_rigid output)
             # rotations_refined = jnp.matmul(rotations_rigid, rotations)
-            rotations_refined = jnp.matmul(rotations, rotations_rigid)
-        shifts_refined = shifts + shifts_rigid
+            rotations_refined = jnp.matmul(rotations, per_particle(rotations_rigid, rotations))
+        shifts_refined = shifts + per_particle(shifts_rigid, shifts)
 
         # Geodesic anchor: keep the rigid rotation close to the identity so it stays a refinement
         cos_theta_rigid = jnp.clip((jnp.trace(rotations_rigid, axis1=-2, axis2=-1) - 1.0) / 2.0, -1.0, 1.0)
@@ -934,73 +943,89 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         # it (render_sigma, coupled to the freq annealing).
         render_sigma_eff = model.sigma if render_sigma is None else render_sigma
 
-        # Generate projections
-        if model.has_reference_volume:
-            images_corrected, _ = phys_decoder(x, values, jax.lax.stop_gradient(coords), model.xsize, rotations_refined, shifts_refined,
-                                               centering, ctf, model.ctf_type, render_sigma_eff, 0.0)
-            images_corrected_field, _ = phys_decoder(x, reference_values, coords, model.xsize, rotations_refined, shifts_refined,
-                                                     centering, ctf, model.ctf_type, render_sigma_eff, 0.0)
-        else:
-            images_corrected, _ = phys_decoder(x, values, coords, model.xsize, rotations_refined, shifts_refined,
-                                               centering, ctf, model.ctf_type, render_sigma_eff, 0.0)
-            images_corrected_field = images_corrected
+        def render_loss(x, rotations_refined, shifts_refined, ctf):
+            # Generate projections
+            if model.has_reference_volume:
+                images_corrected, _ = phys_decoder(x, values, jax.lax.stop_gradient(coords), model.xsize, rotations_refined, shifts_refined,
+                                                   centering, ctf, model.ctf_type, render_sigma_eff, 0.0)
+                images_corrected_field, _ = phys_decoder(x, reference_values, coords, model.xsize, rotations_refined, shifts_refined,
+                                                         centering, ctf, model.ctf_type, render_sigma_eff, 0.0)
+            else:
+                images_corrected, _ = phys_decoder(x, values, coords, model.xsize, rotations_refined, shifts_refined,
+                                                   centering, ctf, model.ctf_type, render_sigma_eff, 0.0)
+                images_corrected_field = images_corrected
 
-        # if not model.delta_volume_decoder.transport_mass:
-        #     consensus_coords, consensus_values = model.delta_volume_decoder(jnp.zeros_like(latent))
-        #     images_consensus, _ = phys_decoder(x, consensus_values, consensus_coords, model.xsize, rotations_refined, shifts_refined,
-        #                                        centering, ctf, model.ctf_type, model.sigma, 0.0)
-
-        # Projection "mask" in case of no mass transport
-        if not model.delta_volume_decoder.transport_mass and model.local_reconstruction:
-            _, projected_mask = phys_decoder(x, jnp.ones_like(values), jax.lax.stop_gradient(coords), model.xsize,
-                                             rotations_refined, shifts_refined, centering, ctf, None, model.sigma, False, 0.0)
-        else:
-            projected_mask = jnp.ones_like(x)[..., 0]
-
-        if M > 1:
-            projected_mask = projected_mask[:, None, ...]
-
-        # Losses
-        images_corrected = jnp.squeeze(images_corrected)
-        images_corrected_field = jnp.squeeze(images_corrected_field)
-        x = jnp.squeeze(x)
-        # if not model.delta_volume_decoder.transport_mass:
-        #     images_consensus = jnp.squeeze(images_consensus)
-
-        # Consider CTF if Wiener mode (only for loss)
-        if model.ctf_type == "wiener":
-            x_loss = wiener2DFilter(x, ctf, pad_factor=pad_factor)
-            images_corrected_loss = wiener2DFilter_vmap(images_corrected, ctf, pad_factor)
-            images_corrected_field_loss = wiener2DFilter_vmap(images_corrected_field, ctf, pad_factor)
             # if not model.delta_volume_decoder.transport_mass:
-            #     images_consensus_loss = wiener2DFilter_vmap(images_consensus, ctf, pad_factor)
-        elif model.ctf_type == "squared":
-            x_loss = ctfFilter(x, ctf, pad_factor=pad_factor)
-            images_corrected_loss = ctfFilter_vmap(images_corrected, ctf, pad_factor)
-            images_corrected_field_loss = ctfFilter_vmap(images_corrected_field, ctf, pad_factor)
+            #     consensus_coords, consensus_values = model.delta_volume_decoder(jnp.zeros_like(latent))
+            #     images_consensus, _ = phys_decoder(x, consensus_values, consensus_coords, model.xsize, rotations_refined, shifts_refined,
+            #                                        centering, ctf, model.ctf_type, model.sigma, 0.0)
+
+            # Projection "mask" in case of no mass transport
+            if not model.delta_volume_decoder.transport_mass and model.local_reconstruction:
+                _, projected_mask = phys_decoder(x, jnp.ones_like(values), jax.lax.stop_gradient(coords), model.xsize,
+                                                 rotations_refined, shifts_refined, centering, ctf, None, model.sigma, False, 0.0)
+            else:
+                projected_mask = jnp.ones_like(x)[..., 0]
+
+            if M > 1:
+                projected_mask = projected_mask[:, None, ...]
+
+            # Losses
+            images_corrected = jnp.squeeze(images_corrected)
+            images_corrected_field = jnp.squeeze(images_corrected_field)
+            x = jnp.squeeze(x)
             # if not model.delta_volume_decoder.transport_mass:
-            #     images_consensus_loss = ctfFilter_vmap(images_consensus, ctf, pad_factor)
-        else:
-            x_loss = x
-            images_corrected_loss = images_corrected
-            images_corrected_field_loss = images_corrected_field
+            #     images_consensus = jnp.squeeze(images_consensus)
+
+            # Consider CTF if Wiener mode (only for loss)
+            if model.ctf_type == "wiener":
+                x_loss = wiener2DFilter(x, ctf, pad_factor=pad_factor)
+                images_corrected_loss = wiener2DFilter_vmap(images_corrected, ctf, pad_factor)
+                images_corrected_field_loss = wiener2DFilter_vmap(images_corrected_field, ctf, pad_factor)
+                # if not model.delta_volume_decoder.transport_mass:
+                #     images_consensus_loss = wiener2DFilter_vmap(images_consensus, ctf, pad_factor)
+            elif model.ctf_type == "squared":
+                x_loss = ctfFilter(x, ctf, pad_factor=pad_factor)
+                images_corrected_loss = ctfFilter_vmap(images_corrected, ctf, pad_factor)
+                images_corrected_field_loss = ctfFilter_vmap(images_corrected_field, ctf, pad_factor)
+                # if not model.delta_volume_decoder.transport_mass:
+                #     images_consensus_loss = ctfFilter_vmap(images_consensus, ctf, pad_factor)
+            else:
+                x_loss = x
+                images_corrected_loss = images_corrected
+                images_corrected_field_loss = images_corrected_field
+                # if not model.delta_volume_decoder.transport_mass:
+                #     images_consensus_loss = images_consensus
+
+            if M > 1:
+                x_loss = x_loss[:, None, ...]
+
+            # Projection mask
+            x_loss = x_loss * projected_mask
+            images_corrected_loss = images_corrected_loss * projected_mask
+            images_corrected_field_loss = images_corrected_field_loss * projected_mask
             # if not model.delta_volume_decoder.transport_mass:
-            #     images_consensus_loss = images_consensus
+            #     images_consensus_loss = images_consensus_loss * projected_mask
 
-        if M > 1:
-            x_loss = x_loss[:, None, ...]
+            # Tomo case: consider soft circular masks
+            if model.isTomoSIREN:
+                circular_mask = soft_circular_mask(x.shape[1], dtype=x.dtype)[None, ...]
 
-        # Projection mask
-        x_loss = x_loss * projected_mask
-        images_corrected_loss = images_corrected_loss * projected_mask
-        images_corrected_field_loss = images_corrected_field_loss * projected_mask
-        # if not model.delta_volume_decoder.transport_mass:
-        #     images_consensus_loss = images_consensus_loss * projected_mask
+                if M > 1:
+                    circular_mask = circular_mask[:, None, ...]
 
-        # Split the reconstruction between the amplitude pathway (learned values at
-        # frozen coords -> images_corrected) and the mass-transport pathway (fixed
-        # reference values at learned coords -> images_corrected_field)
-        recon_loss = amp_recon_weight * model.representation_loss_fn(images_corrected_loss, x_loss, freq_alpha) + (1.0 - amp_recon_weight) * model.representation_loss_fn(images_corrected_field_loss, x_loss, freq_alpha)
+                x_loss = x_loss * circular_mask
+                images_corrected_loss = images_corrected_loss * circular_mask
+                images_corrected_field_loss = images_corrected_field_loss * circular_mask
+
+            # Split the reconstruction between the amplitude pathway (learned values at
+            # frozen coords -> images_corrected) and the mass-transport pathway (fixed
+            # reference values at learned coords -> images_corrected_field)
+            recon_loss = amp_recon_weight * model.representation_loss_fn(images_corrected_loss, x_loss, freq_alpha) + (1.0 - amp_recon_weight) * model.representation_loss_fn(images_corrected_field_loss, x_loss, freq_alpha)
+            return recon_loss, images_corrected
+
+        # Scanned over the tilts of tomo stacks (one tilt materialized at a time); a plain call for SPA
+        recon_loss, images_corrected = tilt_mean(render_loss, x, rotations_refined, shifts_refined, ctf, mask=mask)
 
         # if model.delta_volume_decoder.transport_mass:
 
@@ -1184,15 +1209,18 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
                 + pose_refine_reg * pose_refine_loss + geometric_lambda * loss_geometric)
         return loss, (recon_loss.mean(), latent)
 
-    # Check if Tomo mode
+    # Tomo stacks carry a tilt axis: x is (B, T, H, W, 1) and labels (B, T)
+    mask, labels = tilt_mask(labels)
+    batch_shape, labels = x.shape[:-3], labels.reshape(-1)
+
     if model.isTomoSIREN:
-        (x, subtomogram_label) = x
+        subtomogram_label = md["sinusoidal_subtomo"][md["subtomo_labels"][labels] - 1].reshape(batch_shape + (-1,))[:, 0]
 
     # Precompute batch aligments
     euler_angles = md["euler_angles"][labels]
 
     # Precompute batch shifts
-    shifts = md["shifts"][labels]
+    shifts = md["shifts"][labels].reshape(batch_shape + (2,))
 
     # Precompute batch CTFs
     pad_factor = model.phys_decoder.pad_factor
@@ -1202,34 +1230,38 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         defocusAngle = md["ctfDefocusAngle"][labels]
         cs = md["ctfSphericalAberration"][labels]
         kv = md["ctfVoltage"][labels][0]
+        if model.ctf_type == "premultiplied":
+            preExposure = md["preExposure"][labels]
+            ctfScaleFactor = md["ctfScaleFactor"][labels]
+        else:
+            preExposure = None
+            ctfScaleFactor = None
         ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
                          model.sr, [pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)],
-                         x.shape[0], True)
+                         labels.shape[0], True, preExposure, ctfScaleFactor)
     else:
-        ctf = jnp.ones([x.shape[0], pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)], dtype=x.dtype)
+        ctf = jnp.ones([labels.shape[0], pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)], dtype=x.dtype)
+    ctf = ctf.reshape(batch_shape + ctf.shape[1:])
 
     if model.ctf_type == "precorrect":
         # Wiener filter
         x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
     # Prepare data for decoupling encoder
-    rotations_random = jnr.choice(distributions_key, euler_angles, axis=0, shape=(x.shape[0],), replace=False)
+    rotations_random = jnr.choice(distributions_key, euler_angles, axis=0, shape=(labels.shape[0],), replace=False)
     if model.ctf_type == "apply":
-        defocusU = jnr.choice(distributions_key, defocusU, axis=0, shape=(x.shape[0],), replace=False)
-        defocusV = jnr.choice(distributions_key, defocusV, axis=0, shape=(x.shape[0],), replace=False)
-        defocusAngle = jnr.choice(distributions_key, defocusAngle, axis=0, shape=(x.shape[0],), replace=False)
+        defocusU = jnr.choice(distributions_key, defocusU, axis=0, shape=(labels.shape[0],), replace=False)
+        defocusV = jnr.choice(distributions_key, defocusV, axis=0, shape=(labels.shape[0],), replace=False)
+        defocusAngle = jnr.choice(distributions_key, defocusAngle, axis=0, shape=(labels.shape[0],), replace=False)
         ctf_random = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
                                 model.sr, [pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)],
-                                x.shape[0], True)
+                                labels.shape[0], True)
     else:
-        ctf_random = jnp.ones([x.shape[0], pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)], dtype=x.dtype)
+        ctf_random = jnp.ones([labels.shape[0], pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)], dtype=x.dtype)
 
     params = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('delta_volume_decoder')))
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True, argnums=nnx.DiffState(0, params))
-    if model.isTomoSIREN:
-        (loss, (recon_loss, latent)), grads = grad_fn(model, (x, subtomogram_label))
-    else:
-        (loss, (recon_loss, latent)), grads = grad_fn(model, x)
+    (loss, (recon_loss, latent)), grads = grad_fn(model, x)
 
     if do_update:
         grads, _ = grads.split(params, ...)
@@ -1252,10 +1284,6 @@ def train_step_inverse_hetsiren(graphdef, state, x, labels, md, key, do_update=T
     distributions_key, key = jnr.split(key, 2)
 
     def loss_fn(model, x):
-        # Check if Tomo mode
-        if model.isTomoSIREN:
-            (x, subtomogram_label) = x
-
         # Prepare input images for encoder
         # if model.ctf_type in ["apply", "squared"]:
         #     x_in = prepare_image_cryocrab(x, ctf)
@@ -1304,9 +1332,13 @@ def train_step_inverse_hetsiren(graphdef, state, x, labels, md, key, do_update=T
 
         return loss
 
+    # Tomo stacks carry a tilt axis: x is (B, T, H, W, 1) and labels (B, T)
+    mask, labels = tilt_mask(labels)
+    batch_shape, labels = x.shape[:-3], labels.reshape(-1)
+
     # Check if Tomo mode
     if model.isTomoSIREN:
-        (x, subtomogram_label) = x
+        subtomogram_label = md["sinusoidal_subtomo"][md["subtomo_labels"][labels] - 1].reshape(batch_shape + (-1,))[:, 0]
 
     # Precompute batch CTFs
     pad_factor = model.phys_decoder.pad_factor
@@ -1316,11 +1348,18 @@ def train_step_inverse_hetsiren(graphdef, state, x, labels, md, key, do_update=T
         defocusAngle = md["ctfDefocusAngle"][labels]
         cs = md["ctfSphericalAberration"][labels]
         kv = md["ctfVoltage"][labels][0]
+        if model.ctf_type == "premultiplied":
+            preExposure = md["preExposure"][labels]
+            ctfScaleFactor = md["ctfScaleFactor"][labels]
+        else:
+            preExposure = None
+            ctfScaleFactor = None
         ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
                          model.sr, [pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)],
-                         x.shape[0], True)
+                         labels.shape[0], True, preExposure, ctfScaleFactor)
     else:
-        ctf = jnp.ones([x.shape[0], pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)], dtype=x.dtype)
+        ctf = jnp.ones([labels.shape[0], pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)], dtype=x.dtype)
+    ctf = ctf.reshape(batch_shape + ctf.shape[1:])
 
     if model.ctf_type == "precorrect":
         # Wiener filter
@@ -1328,10 +1367,7 @@ def train_step_inverse_hetsiren(graphdef, state, x, labels, md, key, do_update=T
 
     params_inv = nnx.All(nnx.Param, nnx.PathContains('inverse_volume_decoder'))
     grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, params_inv))
-    if model.isTomoSIREN:
-        loss, grads = grad_fn(model, (x, subtomogram_label))
-    else:
-        loss, grads = grad_fn(model, x)
+    loss, grads = grad_fn(model, x)
 
     if do_update:
         grads, _ = grads.split(params_inv, ...)
@@ -1356,10 +1392,6 @@ def gradient_for_recon_graph_losses(graphdef, state, x, labels, md, key):
     calculate_repulsion_loss_batch = jax.vmap(calculate_repulsion_loss, in_axes=(0, None, None))
 
     def predict_latent_from_images(model, x):
-        # Check if Tomo mode
-        if model.isTomoSIREN:
-            (x, subtomogram_label) = x
-
         # Prepare input images for encoder
         # if model.ctf_type in ["apply", "squared"]:
         #     x_in = prepare_image_cryocrab(x, ctf)
@@ -1473,7 +1505,7 @@ def gradient_for_recon_graph_losses(graphdef, state, x, labels, md, key):
 
     # Check if Tomo mode
     if model.isTomoSIREN:
-        (x, subtomogram_label) = x
+        subtomogram_label = md["sinusoidal_subtomo"][md["subtomo_labels"][labels] - 1]
 
     # Precompute batch aligments
     euler_angles = md["euler_angles"][labels]
@@ -1489,9 +1521,15 @@ def gradient_for_recon_graph_losses(graphdef, state, x, labels, md, key):
         defocusAngle = md["ctfDefocusAngle"][labels]
         cs = md["ctfSphericalAberration"][labels]
         kv = md["ctfVoltage"][labels][0]
+        if model.ctf_type == "premultiplied":
+            preExposure = md["preExposure"][labels]
+            ctfScaleFactor = md["ctfScaleFactor"][labels]
+        else:
+            preExposure = None
+            ctfScaleFactor = None
         ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
                          model.sr, [pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)],
-                         x.shape[0], True)
+                         x.shape[0], True, preExposure, ctfScaleFactor)
     else:
         ctf = jnp.ones([x.shape[0], pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)], dtype=x.dtype)
 
@@ -1533,10 +1571,6 @@ def validation_step_hetsiren(graphdef, state, x, labels, md, key):
     distributions_key, key = jax.random.split(key, 2)
 
     def loss_fn(model, x):
-        # Check if Tomo mode
-        if model.isTomoSIREN:
-            (x, subtomogram_label) = x
-
         # Prepare input images for encoder
         # if model.ctf_type in ["apply", "squared"]:
         #     x_in = prepare_image_cryocrab(x, ctf)
@@ -1550,6 +1584,7 @@ def validation_step_hetsiren(graphdef, state, x, labels, md, key):
                 (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
             elif model.isTomoSIREN:
                 (sample, latent, logstd), prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True, rngs=distributions_key)
+                _, (rotations_rigid, shifts_rigid, rotations_logscale), _ = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key, mask=mask)
             else:
                 (sample, latent, logstd), (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key)
         else:
@@ -1557,6 +1592,7 @@ def validation_step_hetsiren(graphdef, state, x, labels, md, key):
                 latent, (rotations_rigid, shifts_rigid, rotations_logscale), prev_layer_out = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key)
             elif model.isTomoSIREN:
                 latent, prev_layer_out = model.encoder(subtomogram_label, "encoder_dec", return_last=True, rngs=distributions_key)
+                _, (rotations_rigid, shifts_rigid, rotations_logscale), _ = model.encoder(x_in, "encoder_exp", return_last=True, return_alignment_refinement=True, rngs=distributions_key, mask=mask)
             else:
                 latent, (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key)
 
@@ -1571,72 +1607,79 @@ def validation_step_hetsiren(graphdef, state, x, labels, md, key):
             rotations = euler_matrix_batch(euler_angles[:, 0], euler_angles[:, 1], euler_angles[:, 2])
         else:
             rotations = euler_angles
+        rotations = rotations.reshape(batch_shape + (3, 3))
 
         # Consider refinement and rigid registration alignments (for delta_volume_decoder_rigid output)
-        rotations_refined = jnp.matmul(rotations, rotations_rigid)
+        rotations_refined = jnp.matmul(rotations, per_particle(rotations_rigid, rotations))
         # rotations_refined = jnp.matmul(rotations_rigid, rotations)
-        shifts_refined = shifts + shifts_rigid
+        shifts_refined = shifts + per_particle(shifts_rigid, shifts)
 
         # Centering
         centering = model.delta_volume_decoder.centering
 
-        # Generate projections
-        if model.has_reference_volume:
-            reference_values = model.delta_volume_decoder.reference_values
-            images_corrected, _ = model.phys_decoder(x, values, coords, model.xsize, rotations_refined,
-                                                     shifts_refined, centering, ctf, model.ctf_type, model.sigma, 0.0)
-            images_corrected_field, _ = model.phys_decoder(x, reference_values, coords, model.xsize, rotations_refined,
-                                                           shifts_refined, centering, ctf, model.ctf_type, model.sigma, 0.0)
-        else:
-            images_corrected, _ = model.phys_decoder(x, values, coords, model.xsize, rotations_refined, shifts_refined,
-                                                     centering, ctf, model.ctf_type, model.sigma, 0.0)
-            images_corrected_field = images_corrected
+        def render_loss(x, rotations_refined, shifts_refined, ctf):
+            # Generate projections
+            if model.has_reference_volume:
+                reference_values = model.delta_volume_decoder.reference_values
+                images_corrected, _ = model.phys_decoder(x, values, coords, model.xsize, rotations_refined,
+                                                         shifts_refined, centering, ctf, model.ctf_type, model.sigma, 0.0)
+                images_corrected_field, _ = model.phys_decoder(x, reference_values, coords, model.xsize, rotations_refined,
+                                                               shifts_refined, centering, ctf, model.ctf_type, model.sigma, 0.0)
+            else:
+                images_corrected, _ = model.phys_decoder(x, values, coords, model.xsize, rotations_refined, shifts_refined,
+                                                         centering, ctf, model.ctf_type, model.sigma, 0.0)
+                images_corrected_field = images_corrected
 
-        # Projection "mask" in case of no mass transport
-        if not model.delta_volume_decoder.transport_mass and model.local_reconstruction:
-            _, projected_mask = model.phys_decoder(x, jnp.ones_like(values), coords, model.xsize,
-                                                   rotations_refined, shifts_refined, centering, ctf, None, model.sigma,
-                                                   False, 0.0)
-        else:
-            projected_mask = jnp.ones_like(x)[..., 0]
+            # Projection "mask" in case of no mass transport
+            if not model.delta_volume_decoder.transport_mass and model.local_reconstruction:
+                _, projected_mask = model.phys_decoder(x, jnp.ones_like(values), coords, model.xsize,
+                                                       rotations_refined, shifts_refined, centering, ctf, None, model.sigma,
+                                                       False, 0.0)
+            else:
+                projected_mask = jnp.ones_like(x)[..., 0]
 
-        # Losses
-        images_corrected = jnp.squeeze(images_corrected)
-        images_corrected_field = jnp.squeeze(images_corrected_field)
-        x = jnp.squeeze(x)
+            # Losses
+            images_corrected = jnp.squeeze(images_corrected)
+            images_corrected_field = jnp.squeeze(images_corrected_field)
+            x = jnp.squeeze(x)
 
-        # Consider CTF if Wiener mode (only for loss)
-        if model.ctf_type == "wiener":
-            x_loss = wiener2DFilter(x, ctf, pad_factor=pad_factor)
-            images_corrected_loss = wiener2DFilter(images_corrected, ctf, pad_factor)
-            images_corrected_field_loss = wiener2DFilter(images_corrected_field, ctf, pad_factor)
-        elif model.ctf_type == "squared":
-            x_loss = ctfFilter(x, ctf, pad_factor=pad_factor)
-            images_corrected_loss = ctfFilter(images_corrected, ctf, pad_factor)
-            images_corrected_field_loss = ctfFilter(images_corrected_field, ctf, pad_factor)
-        else:
-            x_loss = x
-            images_corrected_loss = images_corrected
-            images_corrected_field_loss = images_corrected_field
+            # Consider CTF if Wiener mode (only for loss)
+            if model.ctf_type == "wiener":
+                x_loss = wiener2DFilter(x, ctf, pad_factor=pad_factor)
+                images_corrected_loss = wiener2DFilter(images_corrected, ctf, pad_factor)
+                images_corrected_field_loss = wiener2DFilter(images_corrected_field, ctf, pad_factor)
+            elif model.ctf_type == "squared":
+                x_loss = ctfFilter(x, ctf, pad_factor=pad_factor)
+                images_corrected_loss = ctfFilter(images_corrected, ctf, pad_factor)
+                images_corrected_field_loss = ctfFilter(images_corrected_field, ctf, pad_factor)
+            else:
+                x_loss = x
+                images_corrected_loss = images_corrected
+                images_corrected_field_loss = images_corrected_field
 
-        # Projection mask
-        x_loss = x_loss * projected_mask
-        images_corrected_loss = images_corrected_loss * projected_mask
-        images_corrected_field_loss = images_corrected_field_loss * projected_mask
+            # Projection mask
+            x_loss = x_loss * projected_mask
+            images_corrected_loss = images_corrected_loss * projected_mask
+            images_corrected_field_loss = images_corrected_field_loss * projected_mask
 
-        recon_loss = 0.1 * model.representation_loss_fn(images_corrected_loss, x_loss) + 0.9 * model.representation_loss_fn(images_corrected_field_loss, x_loss)
+            return 0.1 * model.representation_loss_fn(images_corrected_loss, x_loss) + 0.9 * model.representation_loss_fn(images_corrected_field_loss, x_loss)
 
-        return recon_loss.mean()
+        # Scanned over the tilts of tomo stacks (one tilt materialized at a time); a plain call for SPA
+        return tilt_mean(render_loss, x, rotations_refined, shifts_refined, ctf, mask=mask).mean()
+
+    # Tomo stacks carry a tilt axis: x is (B, T, H, W, 1) and labels (B, T)
+    mask, labels = tilt_mask(labels)
+    batch_shape, labels = x.shape[:-3], labels.reshape(-1)
 
     # Check if Tomo mode
     if model.isTomoSIREN:
-        (x, subtomogram_label) = x
+        subtomogram_label = md["sinusoidal_subtomo"][md["subtomo_labels"][labels] - 1].reshape(batch_shape + (-1,))[:, 0]
 
     # Precompute batch aligments
     euler_angles = md["euler_angles"][labels]
 
     # Precompute batch shifts
-    shifts = md["shifts"][labels]
+    shifts = md["shifts"][labels].reshape(batch_shape + (2,))
 
     # Precompute batch CTFs
     pad_factor = model.phys_decoder.pad_factor
@@ -1646,20 +1689,24 @@ def validation_step_hetsiren(graphdef, state, x, labels, md, key):
         defocusAngle = md["ctfDefocusAngle"][labels]
         cs = md["ctfSphericalAberration"][labels]
         kv = md["ctfVoltage"][labels][0]
+        if model.ctf_type == "premultiplied":
+            preExposure = md["preExposure"][labels]
+            ctfScaleFactor = md["ctfScaleFactor"][labels]
+        else:
+            preExposure = None
+            ctfScaleFactor = None
         ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
                          model.sr, [pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)],
-                         x.shape[0], True)
+                         labels.shape[0], True, preExposure, ctfScaleFactor)
     else:
-        ctf = jnp.ones([x.shape[0], pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)], dtype=x.dtype)
+        ctf = jnp.ones([labels.shape[0], pad_factor * model.xsize, int(pad_factor * 0.5 * model.xsize + 1)], dtype=x.dtype)
+    ctf = ctf.reshape(batch_shape + ctf.shape[1:])
 
     if model.ctf_type == "precorrect":
         # Wiener filter
         x = wiener2DFilter(jnp.squeeze(x), ctf)[..., None]
 
-    if model.isTomoSIREN:
-        loss = loss_fn(model, (x, subtomogram_label))
-    else:
-        loss = loss_fn(model, x)
+    loss = loss_fn(model, x)
 
     return loss
 
@@ -1673,6 +1720,7 @@ def main():
     import argparse
     import shutil
     from xmipp_metadata.image_handler import ImageHandler
+    from xmipp_metadata.metadata import XmippMetaData
     import optax
     from hax.checkpointer import NeuralNetworkCheckpointer
     from hax.generators import MetaDataGenerator, extract_columns, NumpyGenerator
@@ -1715,7 +1763,7 @@ def main():
                         help=f'When set, HetSIREN will turn to local heterogeneous reconstruction/refinement mod, focusing the analysis of heterogeneity to a region of interest enclosed by the provided refernece mask. '
                              f'{bcolors.WARNING}WARNING{bcolors.ENDC}: IF PROVIDED, TRANSPORT MASS WILL BE OVERRIDDEN AND NOT CONSIDERED. '
                              f'{bcolors.WARNING}WARNING{bcolors.ENDC}: IF PROVIDED, HAVING A REFERENCE VOLUME IS MANDATORY. OTHERWISE, THIS PARAMETER WILL BE NEGLECTED. ')
-    ca.add_ctf_type(parser)
+    ca.add_ctf_type(parser, choices=CTF_TYPE_CHOICES_PREMULTIPLIED)
     ca.add_mode(parser)
     ca.add_epochs(parser)
     ca.add_batch_size(parser)
@@ -1870,11 +1918,14 @@ def main():
     ca.validate_dataset_split_fraction(args.dataset_split_fraction)
 
     # Prepare metadata
-    generator = MetaDataGenerator(args.md)
+    isTomoSIREN = XmippMetaData(args.md).isTomo
+    generator = MetaDataGenerator(args.md, mode="tomo" if isTomoSIREN else None)
     md_columns = extract_columns(generator.md)
 
-    # Check if TomoSIREN is needed
-    isTomoSIREN = generator.mode == "tomo"
+    # Add sinusoidal tomo labels
+    if isTomoSIREN:
+        md_columns["sinusoidal_subtomo"] = generator.sinusoid_table
+    n_items = len(np.unique(md_columns["subtomo_labels"])) if isTomoSIREN else len(generator.md)  # tomo stacks are one item per particle
 
     # Prepare grain dataset
     if not args.load_images_to_ram and args.mode in ["train", "predict"]:
@@ -1893,6 +1944,7 @@ def main():
         os.makedirs(args.output_path, exist_ok=True)
         consensus = reconstruct_consensus_volume(generator.md, md_columns, args.sr,
                                                  use_ctf=args.ctf_type not in (None, "None"),
+                                                 premultiplied=args.ctf_type == "premultiplied",
                                                  scratch_dir=scratch_dir)
         consensus_path = os.path.join(args.output_path, "consensus_reconstruction.mrc")
         ImageHandler().write(consensus, consensus_path, overwrite=True)
@@ -2103,14 +2155,13 @@ def main():
         # Training data loader and steps_per_epoch (batch size is now concrete).
         data_loader_train = generator.return_grain_dataset(batch_size=args.batch_size, shuffle="global_data_loader",
                                                            num_epochs=None, num_workers=-1, num_threads=1,
-                                                           load_to_ram=args.load_images_to_ram)
-        steps_per_epoch = int(len(generator.md) / args.batch_size)
+                                                           load_to_ram=args.load_images_to_ram, stack_tomo=isTomoSIREN)
+        steps_per_epoch = int(n_items / args.batch_size)
 
-        # Example of training data for Tensorboard
-        if hetsiren.isTomoSIREN:
-            (x_example, _), labels_example = next(iter(data_loader_train))
-        else:
-            x_example, labels_example = next(iter(data_loader_train))
+        # Example of training data for Tensorboard (tomo stacks -> first tilt of each particle)
+        x_example, labels_example = next(iter(data_loader_train))
+        if x_example.ndim == 5:
+            x_example, labels_example = x_example[:, 0], labels_example[:, 0]
         x_example = jax.vmap(min_max_scale)(x_example)
         writer.add_images("Training data batch", x_example, dataformats="NHWC")
 
@@ -2250,12 +2301,9 @@ def main():
                     # Log intermediate results at the begining of the epoch.
                     if logger.should("images", i):
                         with logger.section():
-                            # Get first 5 images from batch
-                            if hetsiren.isTomoSIREN:
-                                x_for_tb = x[0][:5]
-                            else:
-                                x_for_tb = x[:5]
-                            labels_for_tb = labels[:5]
+                            # Get first 5 images from batch (tomo stacks -> tilt images)
+                            x_for_tb = x[:5].reshape((-1,) + x.shape[-3:])
+                            labels_for_tb = labels[:5].reshape(-1)
 
                             # Decode some images and some states
                             x_pred_intermediate, latents_intermediate = hetsiren_decode_image(graphdef, state, x_for_tb,
@@ -2510,13 +2558,14 @@ def main():
 
         # Prepare data loader
         data_loader = generator.return_grain_dataset(batch_size=args.batch_size, shuffle=False, num_epochs=1,
-                                                     num_workers=-1, load_to_ram=args.load_images_to_ram)
-        steps_per_epoch = int(np.ceil(len(generator.md) / args.batch_size))
+                                                     num_workers=-1, load_to_ram=args.load_images_to_ram,
+                                                     stack_tomo=isTomoSIREN)
+        steps_per_epoch = int(np.ceil(n_items / args.batch_size))
 
         # Jitted prediction functions
         @nnx.jit
-        def predict_fn(model, x):
-            return model(x)
+        def predict_fn(model, x, mask=None):
+            return model(x, mask=mask)
 
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting HetSIREN latents... ######")
@@ -2542,7 +2591,12 @@ def main():
             #                      x.shape[0], True)
             #     x = prepare_image_cryocrab(x, ctf)
 
-            latents_batch, (rotations_rigid, shifts_rigid) = predict_fn(hetsiren, x)
+            # Tomo stacks: one prediction per particle, one metadata row per tilt image
+            mask, _ = tilt_mask(jnp.asarray(labels))
+            n_tilts, labels = labels.size // x.shape[0], labels.reshape(-1)
+            latents_batch, (rotations_rigid, shifts_rigid) = predict_fn(hetsiren, x, mask)
+            latents_batch, rotations_rigid, shifts_rigid = jax.tree.map(lambda a: jnp.repeat(a, n_tilts, axis=0)[labels >= 0], (latents_batch, rotations_rigid, shifts_rigid))
+            labels = labels[labels >= 0]  # drop the padded tilts of tomo stacks
 
             # Precompute batch aligments
             rotations_batch = md_columns["euler_angles"][labels]
