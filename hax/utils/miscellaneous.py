@@ -733,3 +733,47 @@ def positional_encoding(coords: jax.Array, enc_dim: int, DD: int) -> jax.Array:
     # Flatten the last two dimensions: shape (n, 3 * enc_dim * 2)
     new_shape = x.shape[:-2] + (-1,)
     return jnp.reshape(x, new_shape)
+
+
+def soft_circular_mask(size, radius=0.5, edge_px=3.0, dtype=jnp.float32):
+    """Inscribed circular mask with a raised-cosine edge"""
+    axis = jnp.arange(size, dtype=jnp.float32) - 0.5 * (size - 1)
+    yy, xx = jnp.meshgrid(axis, axis, indexing="ij")
+    r = jnp.sqrt(xx * xx + yy * yy)
+    r_out = radius * size
+    r_in = r_out - edge_px
+    edge = 0.5 * (1.0 + jnp.cos(jnp.pi * (r - r_in) / jnp.maximum(r_out - r_in, 1e-6)))
+    return jnp.where(r <= r_in, 1.0, jnp.where(r >= r_out, 0.0, edge)).astype(dtype)
+
+def _small_saveable(prim, *avals, **params):
+    """Checkpoint policy: keep tiny intermediates (free) instead of rematerializing them, which can leave XLA degenerate fusions."""
+    return prim.name not in ("broadcast_in_dim", "iota", "fft", "convert_element_type") and all(
+        getattr(a, "size", 0) <= 4096 and not jnp.issubdtype(getattr(a, "dtype", jnp.float32), jnp.complexfloating) for a in avals)
+
+
+def tilt_mask(labels):
+    """Tomo stacks pad missing tilts with label -1: returns (mask, labels) with padded rows remapped to the particle's first tilt."""
+    if labels.ndim < 2:
+        return None, labels
+    mask = labels >= 0
+    return mask, jnp.where(mask, labels, labels[:, :1])
+
+
+def tilt_mean(fn, x, *args, mask=None):
+    """Mean of fn over the tilt axis of tomo stacks (B, T, ...) via a checkpointed scan, so T is never materialized; SPA calls fn once."""
+    if x.ndim != 5:
+        return fn(x, *args)
+    args = (x,) + args
+    w = jnp.ones(x.shape[:2], jnp.float32) if mask is None else mask.astype(jnp.float32)  # (B, T) tilt weights
+    bcast = lambda v, o: v.mean() if o.ndim == 0 else v.reshape((-1,) + (1,) * (o.ndim - 1))
+    shapes = jax.eval_shape(fn, *[a[:, 0] for a in args])
+    zeros = jax.tree.map(lambda s: jnp.zeros(s.shape, jnp.result_type(s.dtype, jnp.float32)), shapes)  # fp32 accumulator
+    body = jax.checkpoint(lambda acc, t: (jax.tree.map(lambda a, o: a + o * bcast(w[:, t], o), acc, fn(*[a[:, t] for a in args])), None),
+                          policy=_small_saveable)
+    total, _ = jax.lax.scan(body, zeros, jnp.arange(x.shape[1]))
+    return jax.tree.map(lambda s, t: (t / bcast(w.sum(1), t)).astype(s.dtype), shapes, total)
+
+
+def per_particle(a, like):
+    """Insert singleton tilt axes so a per-particle ``(B, ...)`` array broadcasts against a per-tilt ``(B, T, ...)`` one."""
+    return jnp.expand_dims(a, tuple(range(1, 1 + like.ndim - a.ndim)))
