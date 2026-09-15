@@ -282,6 +282,88 @@ def _half_map_fsc(vol_a, vol_b, shells, n_shells):
     return np.clip(fsc, 0.0, 1.0)
 
 
+def _radial_shells(box):
+    """Radial shell index of every voxel of the centred 3D transform"""
+    g = (np.fft.fftshift(np.fft.fftfreq(box)) * box).astype(np.float32)
+    r2 = g[:, None, None] ** 2 + g[None, :, None] ** 2 + g[None, None, :] ** 2
+    return np.clip(np.rint(np.sqrt(r2)).astype(np.int32), 0, box // 2)
+
+
+def volume_fsc(vol_a, vol_b, mask=None):
+    """Shell-by-shell Fourier correlation between two maps of the same box"""
+    a = np.asarray(vol_a, np.float64)
+    b = np.asarray(vol_b, np.float64)
+    if mask is not None:
+        m = np.asarray(mask, np.float64)
+        a = a * m
+        b = b * m
+
+    box = a.shape[0]
+    n_shells = box // 2 + 1
+    shells = _radial_shells(box).ravel()
+
+    fa = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(a))).ravel()
+    fb = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(b))).ravel()
+
+    cross = np.bincount(shells, weights=(fa * np.conj(fb)).real, minlength=n_shells)
+    power_a = np.bincount(shells, weights=np.abs(fa) ** 2, minlength=n_shells)
+    power_b = np.bincount(shells, weights=np.abs(fb) ** 2, minlength=n_shells)
+
+    norm = np.sqrt(power_a[:n_shells] * power_b[:n_shells])
+    fsc = np.where(norm > 0, cross[:n_shells] / np.where(norm > 0, norm, 1.0), 0.0)
+    return np.clip(fsc, -1.0, 1.0), power_a[:n_shells]
+
+
+def shell_relative_error(vol_fit, vol_ref, mask=None):
+    """Per-shell relative error of an approximation against a reference"""
+    a = np.asarray(vol_ref, np.float64)
+    b = np.asarray(vol_fit, np.float64)
+    if mask is not None:
+        m = np.asarray(mask, np.float64)
+        a = a * m
+        b = b * m
+
+    box = a.shape[0]
+    n_shells = box // 2 + 1
+    shells = _radial_shells(box).ravel()
+
+    fa = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(a))).ravel()
+    fb = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(b))).ravel()
+
+    resid = np.bincount(shells, weights=np.abs(fa - fb) ** 2, minlength=n_shells)[:n_shells]
+    power_a = np.bincount(shells, weights=np.abs(fa) ** 2, minlength=n_shells)[:n_shells]
+    error = np.sqrt(np.where(power_a > 0, resid / np.where(power_a > 0, power_a, 1.0), 0.0))
+    return error, power_a
+
+
+def shell_resolution(curve, power_ref, box, sr, threshold, ascending_is_bad=True,
+                     power_floor=1e-4):
+    """Resolution (A) out to which a per-shell quality curve stays acceptable"""
+    curve = np.asarray(curve, np.float64)
+    power_ref = np.asarray(power_ref, np.float64)
+    live = (power_ref > power_floor * power_ref[1:].max()) if power_ref[1:].size else power_ref > 0
+
+    last = 0
+    for i in range(1, len(curve)):
+        if not live[i]:
+            continue
+        failed = curve[i] > threshold if ascending_is_bad else curve[i] < threshold
+        if failed:
+            break
+        last = i
+    return ((box * sr) / last if last > 0 else float("inf")), last
+
+
+def live_shell_limit(power_ref, box, sr, power_floor=1e-4):
+    """Resolution (A) of the outermost shell the reference actually populates."""
+    power_ref = np.asarray(power_ref, np.float64)
+    if power_ref[1:].size == 0:
+        return 2.0 * sr, 0
+    live = np.flatnonzero(power_ref > power_floor * power_ref[1:].max())
+    last = int(live[-1]) if live.size else 0
+    return ((box * sr) / last if last > 0 else 2.0 * sr), last
+
+
 def _fsc_filter(fsc):
     """MMSE filter for the combined map given the half-map FSC.
 
