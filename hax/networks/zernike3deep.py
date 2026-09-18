@@ -238,10 +238,14 @@ class MultiEncoder(nnx.Module):
 
 
 class FlowDecoder(nnx.Module):
-    def __init__(self, latent_dim, total_voxels, coords, factor, L1=7, L2=7, *, rngs: nnx.Rngs):
+    def __init__(self, latent_dim, total_voxels, coords, factor, L1=7, L2=7, values=None, rigid_gauge=False,
+                 rigid_gauge_irls=3, *, rngs: nnx.Rngs):
         self.coords = coords
         self.factor = factor
         self.total_voxels = total_voxels
+        self.rigid_gauge = rigid_gauge
+        self.rigid_gauge_irls = int(rigid_gauge_irls)
+        self.gauge_weights = jnp.ones(coords.shape[0]) if values is None else jnp.maximum(jnp.asarray(values, dtype=jnp.float32), 0.0)
 
         # Precompute Zernike3D basis
         self.zernike_degrees = basisDegreeVectors(L1, L2)
@@ -267,7 +271,7 @@ class FlowDecoder(nnx.Module):
             x = nnx.relu(x + layer(x))
         return self.latent_x(x), self.latent_y(x), self.latent_z(x)
 
-    def __call__(self, latent, coords, xsize):
+    def __call__(self, latent, coords, xsize, return_diagnostics=False):
         factor = 0.5 * xsize
 
         # Decode coefficients
@@ -279,10 +283,22 @@ class FlowDecoder(nnx.Module):
         d_x = jnp.matmul(latent_x, Z)
         d_y = jnp.matmul(latent_y, Z)
         d_z = jnp.matmul(latent_z, Z)
-        flow = factor * jnp.stack([d_x, d_y, d_z], axis=-1)
-        # flow = jnp.stack([d_x, d_y, d_z], axis=-1)
+        flow = jnp.stack([d_x, d_y, d_z], axis=-1)
 
-        return flow, 0.0001 * jnp.sqrt((jnp.square(latent_x) + jnp.square(latent_y) + jnp.square(latent_z)).sum())
+        # Pin the field to the rigid-gauge frame so a pose error goes to the pose head
+        rigid_fraction, rigid_drift = 0.0, 0.0
+        if self.rigid_gauge or return_diagnostics:
+            gauged, rigid_fraction = gauge_displacement_field(flow.astype(jnp.float32), coords, self.gauge_weights,
+                                                              irls_iters=self.rigid_gauge_irls)
+            rigid_drift = jnp.mean(jnp.sum(jnp.square(flow - gauged), axis=-1))
+            if self.rigid_gauge:
+                flow = gauged.astype(flow.dtype)
+        flow = factor * flow
+
+        coefficient_loss = 0.0001 * jnp.sqrt((jnp.square(latent_x) + jnp.square(latent_y) + jnp.square(latent_z)).sum())
+        if return_diagnostics:
+            return flow, coefficient_loss, rigid_fraction, rigid_drift
+        return flow, coefficient_loss
 
 
 class PhysDecoder(nnx.Module):
@@ -354,7 +370,8 @@ class Zernike3Deep(nnx.Module):
 
     @save_config
     def __init__(self, lat_dim, coords, values, xsize, sr, bank_size=1024, ctf_type="apply",
-                 sigma=1.0, decoupling=False, isVae=False, L1=7, L2=7, isTomo=False, *, rngs: nnx.Rngs):
+                 sigma=1.0, decoupling=False, isVae=False, L1=7, L2=7, isTomo=False, rigid_gauge=False,
+                 rigid_gauge_irls=3, *, rngs: nnx.Rngs):
         super(Zernike3Deep, self).__init__()
         factor = 0.5 * xsize
         self.xsize = xsize
@@ -367,7 +384,8 @@ class Zernike3Deep(nnx.Module):
         self.isVae = isVae
         self.sigma = nnx.Param(sigma)
         self.encoder = MultiEncoder(self.xsize, lat_dim, n_layers=3, isVae=isVae, rngs=rngs, isTomo=isTomo) if decoupling or isTomo else Encoder(self.xsize, lat_dim, isVae=isVae, rngs=rngs)
-        self.flow_decoder = FlowDecoder(lat_dim, coords.shape[0], self.coords, factor, L1=L1, L2=L2, rngs=rngs)
+        self.flow_decoder = FlowDecoder(lat_dim, coords.shape[0], self.coords, factor, L1=L1, L2=L2, values=values,
+                                        rigid_gauge=rigid_gauge, rigid_gauge_irls=rigid_gauge_irls, rngs=rngs)
         self.phys_decoder = PhysDecoder(self.xsize, lat_dim=lat_dim, rngs=rngs)
 
         #### Memory bank for latent spaces ####
@@ -533,12 +551,15 @@ class Zernike3Deep(nnx.Module):
         flow = self.flow_decoder(x, self.coords, self.xsize)[0] / self.flow_decoder.factor
         return flow, self.coords
 
-@jax.jit
-def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True):
+@partial(jax.jit, static_argnames=("do_update", "pose_refine_reg", "pose_refine_max_angle", "shift_refine_reg",
+                                   "shift_refine_max", "rigid_drift_lambda", "per_image_contrast"))
+def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True, graph_lambda=0.9,
+                            pose_refine_reg=0.1, pose_refine_max_angle=8.0, shift_refine_reg=0.1, shift_refine_max=4.0,
+                            rigid_drift_lambda=1.0, per_image_contrast="off"):
     model, optimizer, optimizer_grays = nnx.merge(graphdef, state)
     distributions_key, choice_key, key = jax.random.split(key, 3)
 
-    calculate_deformation_regularity_loss_batch = jax.vmap(calculate_deformation_regularity_loss, in_axes=(0, None, None, None))
+    calculate_strain_loss_batch = jax.vmap(calculate_strain_loss, in_axes=(0, None, None, None))
     calculate_repulsion_loss_batch = jax.vmap(calculate_repulsion_loss, in_axes=(0, None, None))
 
     def loss_fn(model, x):
@@ -565,10 +586,8 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
                 latent, (rotations_rigid, shifts_rigid) = model.encoder(x, return_alignment_refinement=True, rngs=distributions_key)
 
         # Decode flow field
-        if model.isVae:
-            flow, coefficient_loss = model.flow_decoder(sample, model.coords, model.xsize)
-        else:
-            flow, coefficient_loss = model.flow_decoder(latent, model.coords, model.xsize)
+        flow, coefficient_loss, rigid_fraction, rigid_drift = model.flow_decoder(sample if model.isVae else latent, model.coords,
+                                                                                 model.xsize, return_diagnostics=True)
 
         # Get rotation matrices
         if euler_angles.ndim == 2:
@@ -579,6 +598,15 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
         # Refine angular alignment
         rotations_refined = jnp.matmul(rotations, rotations_rigid)
         shifts_refined = shifts + shifts_rigid
+
+        # Priors on the pose refinement
+        cos_theta_rigid = jnp.clip((jnp.trace(rotations_rigid, axis1=-2, axis2=-1) - 1.0) / 2.0, -1.0, 1.0)
+        cos_deadzone = jnp.cos(jnp.deg2rad(pose_refine_max_angle))
+        pose_refine_loss = jnp.mean(nnx.relu((1.0 - cos_theta_rigid) - (1.0 - cos_deadzone)))
+
+        # Priors on the in-plane shifts
+        shifts_sq = jnp.sum(jnp.square(shifts_rigid), axis=-1)
+        shift_refine_loss = jnp.mean(nnx.relu(shifts_sq - shift_refine_max ** 2))
 
         # Generate projections
         images_corrected, (a, b) = model.phys_decoder(flow, x, model.coords, model.values, model.xsize, rotations_refined, shifts_refined, ctf, model.ctf_type, model.sigma.get_value())
@@ -598,8 +626,7 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
             x_loss = x
             images_corrected_loss = images_corrected
 
-        # Adjusted image
-        # images_corrected_loss = a * images_corrected_loss + b
+        images_corrected_loss = match_per_image_contrast(images_corrected_loss, x_loss, mode=per_image_contrast)
 
         recon_loss = mse(images_corrected_loss[..., None], x_loss[..., None]).mean()
         recons_loss_all = recon_loss
@@ -615,11 +642,12 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
         deformed_positions = model.coords + flow / (0.5 * model.xsize)
         radius_graph = model.flow_decoder.edge_index
         edge_weights = model.flow_decoder.edge_weights
-        tau = model.flow_decoder.tau
-        loss_def_regularity = calculate_deformation_regularity_loss_batch(deformed_positions, radius_graph,
-                                                                          consensus_distances, edge_weights)
-        loss_repulsion = calculate_repulsion_loss_batch(deformed_positions, radius_graph, tau)
-        loss_graph = (loss_def_regularity + 0.01 * loss_repulsion).mean()
+        loss_strain, strain = calculate_strain_loss_batch(deformed_positions, radius_graph,
+                                                          consensus_distances, edge_weights)
+        # Repulsion is per edge: it starts below half the consensus distance
+        loss_repulsion = calculate_repulsion_loss_batch(deformed_positions, radius_graph, consensus_distances)
+        loss_graph = (loss_strain + 0.01 * loss_repulsion).mean()
+        strain_p95 = jax.lax.stop_gradient(jnp.percentile(strain, 95.0))
 
         # Centering loss
         cm = jnp.average(deformed_positions, weights=jnp.broadcast_to(model.values[None, ..., None], deformed_positions.shape), axis=1)
@@ -671,8 +699,18 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
         else:
             decoupling_loss = 0.0
 
-        loss = recons_loss_all + 0.000001 * kl_loss + 0.0001 * decoupling_loss + 10. * loss_graph + 0.01 * loss_dp + 0.01 * loss_cm
-        return loss, (recon_loss, latent)
+        loss = (recons_loss_all + 0.000001 * kl_loss + 0.0001 * decoupling_loss + graph_lambda * loss_graph + 0.01 * loss_dp + 0.01 * loss_cm
+                + pose_refine_reg * pose_refine_loss + shift_refine_reg * shift_refine_loss + rigid_drift_lambda * rigid_drift)
+
+        theta_deg = jnp.rad2deg(jnp.arccos(jnp.clip(cos_theta_rigid, -1.0 + 1e-6, 1.0 - 1e-6)))
+        disp_A = jnp.linalg.norm(flow, axis=-1) * model.sr
+        metrics = {"pose_angle_deg": jnp.mean(theta_deg),
+                   "shift_norm_px": jnp.mean(jnp.sqrt(shifts_sq + 1e-8)),
+                   "rigid_fraction": rigid_fraction,
+                   "deformation_A": jnp.mean(disp_A),
+                   "deformation_p99_A": jnp.percentile(disp_A, 99.0),
+                   "strain_p95": strain_p95}
+        return loss, (recon_loss, latent, jax.lax.stop_gradient(metrics))
 
     # Check if Tomo mode
     if model.isTomo:
@@ -718,9 +756,9 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
 
     grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, (params, params_grays)), has_aux=True)
     if model.isTomo:
-        (loss, (recon_loss, latent)), grads_combined = grad_fn(model, (x, subtomogram_label))
+        (loss, (recon_loss, latent, metrics)), grads_combined = grad_fn(model, (x, subtomogram_label))
     else:
-        (loss, (recon_loss, latent)), grads_combined = grad_fn(model, x)
+        (loss, (recon_loss, latent, metrics)), grads_combined = grad_fn(model, x)
 
     grads, grads_gray = grads_combined.split(params, params_grays)
 
@@ -733,13 +771,13 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True)
 
         state = nnx.state((model, optimizer, optimizer_grays))
 
-        return loss, recon_loss, state, key
+        return loss, recon_loss, metrics, state, key
     else:
         return loss, recon_loss
 
 
-@jax.jit
-def validation_step_zernike3deep(graphdef, state, x, labels, md, key):
+@partial(jax.jit, static_argnames=("per_image_contrast",))
+def validation_step_zernike3deep(graphdef, state, x, labels, md, key, per_image_contrast="off"):
     model, optimizer, optimizer_grays = nnx.merge(graphdef, state)
 
     distributions_key, key = jax.random.split(key, 2)
@@ -798,6 +836,8 @@ def validation_step_zernike3deep(graphdef, state, x, labels, md, key):
         else:
             x_loss = x
             images_corrected_loss = images_corrected
+
+        images_corrected_loss = match_per_image_contrast(images_corrected_loss, x_loss, mode=per_image_contrast)
 
         recon_loss = dm_pix.mse(images_corrected_loss[..., None], x_loss[..., None]).mean()
 
@@ -1005,7 +1045,7 @@ def main():
     from hax.generators import MetaDataGenerator, extract_columns, NumpyGenerator
     from hax.networks import train_step_zernike3deep, train_step_volume_adjustment, VolumeAdjustment
     from hax.metrics import JaxSummaryWriter, TrainingLogger
-    from hax.programs import fit_volume, adjust_weights_to_images
+    from hax.programs import fit_volume, fit_volume_adaptive, adjust_weights_to_images
     # from hax.schedulers import CosineAnnealingScheduler
 
     from hax.cli import common_args as ca
@@ -1024,11 +1064,28 @@ def main():
                         help="Degree of Zernike3D angular component (increasing this value might help finding more localized motions at the expense of higher memory consumption)")
     ca.add_mode(parser)
     parser.add_argument("--num_gaussians", required=False, type=int,
-                        help="Before training the network, Zernike3Deep will try to fit a set of Gaussians in the reference volume to recreate it. "
-                             "The default criterium is to automatically determine the number of Gaussians neede to reproduce the reference volume "
-                             "with high-fidelity. However, if you prefer to fix the number of Gaussians in advance based on your own criterium (e.g., "
-                             "the number of residues in your protein), you can set this parameter. When set, the Zernike3Deep will fit this fixed number of Gaussians "
-                             "so that the reproduce the reference volume as well as possible.")
+                        help=f"Number of Gaussians fitted to the reference volume before training. By default it is grown until the fit reaches FSC >= 0.5 on every populated shell (see {bcolors.ITALIC}--fit_resolution{bcolors.ENDC}).")
+    parser.add_argument("--fit_resolution", required=False, type=float, default=None,
+                        help=f"Resolution (in {bcolors.UNDERLINE}Angstrom{bcolors.ENDC}) the automatic Gaussian fit has to reproduce.")
+    parser.add_argument("--rigid_gauge", required=False, type=str, default="core", choices=["core", "mass", "off"],
+                        help=f"Remove the global rigid motion from the deformation field so pose errors go to the pose head. {bcolors.ITALIC}core{bcolors.ENDC}: frame fitted on the least-moving points; "
+                             f"{bcolors.ITALIC}mass{bcolors.ENDC}: mass-weighted fit; {bcolors.ITALIC}off{bcolors.ENDC}: diagnostic only.")
+    parser.add_argument("--rigid_drift_lambda", required=False, type=float, default=1.0,
+                        help=f"Weight of the penalty on the rigid motion the gauge removes from the deformation field.")
+    parser.add_argument("--pose_refine_reg", required=False, type=float, default=0.1,
+                        help=f"Weight of the hinge penalising pose refinements beyond {bcolors.ITALIC}--pose_refine_max_angle{bcolors.ENDC}. Set to 0 to disable.")
+    parser.add_argument("--pose_refine_max_angle", required=False, type=float, default=8.0,
+                        help=f"Rotation (degrees) the pose refinement may apply freely; the excess is penalised with {bcolors.ITALIC}--pose_refine_reg{bcolors.ENDC}.")
+    parser.add_argument("--shift_refine_reg", required=False, type=float, default=0.1,
+                        help=f"Weight of the hinge penalising shift refinements beyond {bcolors.ITALIC}--shift_refine_max{bcolors.ENDC}. Set to 0 to disable.")
+    parser.add_argument("--shift_refine_max", required=False, type=float, default=4.0,
+                        help=f"Shift (pixels) the refinement may apply freely; the excess is penalised with {bcolors.ITALIC}--shift_refine_reg{bcolors.ENDC}.")
+    parser.add_argument("--per_image_contrast", required=False, type=str, default="off", choices=["off", "relative", "absolute"],
+                        help=f"Fit one contrast scale per image before the reconstruction loss. {bcolors.ITALIC}relative{bcolors.ENDC}: scales normalised to a unit batch mean; {bcolors.ITALIC}absolute{bcolors.ENDC}: raw least-squares scale.")
+    parser.add_argument("--deformation_lambda", required=False, type=float, default=0.9,
+                        help=f"Minimum weight of the graph deformation priors (relative edge strain + repulsion) on the moving Gaussians. Lower for larger motions, higher for stiffer ones.")
+    parser.add_argument("--target_strain", required=False, type=float, default=0.1,
+                        help=f"Accepted 95th percentile of the relative edge strain of the moving Gaussians. While it is exceeded, {bcolors.ITALIC}--deformation_lambda{bcolors.ENDC} is raised automatically (never below its value). 0 keeps the weight fixed.")
     ca.add_epochs(parser)
     ca.add_batch_size(parser)
     ca.add_learning_rate(parser)
@@ -1119,12 +1176,12 @@ def main():
                     model, _, _ = fit_volume(vol * mask, mask=mask, iterations=20000, learning_rate=0.001,
                                              n_init=args.num_gaussians, fixed_gaussians=True)
                 else:
-                    model, _, _ = fit_volume(vol * mask, mask=mask, iterations=20000, learning_rate=0.01, grad_threshold=1e-5,
-                                             densify_interval=2000, n_init=2500)
+                    model, _ = fit_volume_adaptive(vol * mask, mask, args.sr,
+                                                   resolution=args.fit_resolution)
 
                 # Adjust to images
-                model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
-                                                    num_epochs=5, is_global=True, ctf_type=args.ctf_type)
+                model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr,
+                                                    ctf_type=args.ctf_type)
 
                 # Save model
                 NeuralNetworkCheckpointer.save(model, fit_path)
@@ -1147,6 +1204,8 @@ def main():
             zernike3deep = Zernike3Deep(args.lat_dim, coords, values, vol.shape[0], args.sr,
                                         ctf_type=args.ctf_type, decoupling=True, isVae=True, sigma=sigma,
                                         L1=args.L1, L2=args.L2, bank_size=1024, isTomo=isTomo,
+                                        rigid_gauge=args.rigid_gauge != "off",
+                                        rigid_gauge_irls=3 if args.rigid_gauge == "core" else 0,
                                         rngs=nnx.Rngs(model_key))
 
         zernike3deep.train()
@@ -1206,6 +1265,7 @@ def main():
         print(f"{bcolors.OKCYAN}\n###### Training variability... ######")
 
         i = 0
+        graph_lambda = jnp.float32(args.deformation_lambda)
         pbar = tqdm(range(resume_epoch * steps_per_epoch, args.epochs * steps_per_epoch), file=sys.stdout, ascii=" >=",
                     colour="green",
                     bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
@@ -1218,22 +1278,6 @@ def main():
                 total_loss = 0
                 total_recon_loss = 0
                 total_validation_loss = 0
-
-                # Compute graph lambda
-                # graph_lambda = 0.9
-                num_warmup_epochs = 3
-                if i < num_warmup_epochs:
-                    graph_lambda = 1.0
-                else:
-                    pbar.set_description(f"{bcolors.WARNING}Computing graph loss lambda{bcolors.ENDC}")
-                    grad_norm_data, grad_norm_reg = 0.0, 0.0
-                    for _ in range(int(0.1 * steps_per_epoch)):
-                        (x_graph, labels_graph) = next(iter_data_loader_train)
-                        grad_norm_data_step, grad_norm_reg_step = gradient_for_recon_graph_losses(graphdef, state, x_graph, labels_graph, md_columns, rng)
-                        grad_norm_data += np.array(grad_norm_data_step)
-                        grad_norm_reg += np.array(grad_norm_reg_step)
-                        pbar.set_postfix_str(f"graph_lambda={0.9 * (grad_norm_data / grad_norm_reg):.5f}")
-                    graph_lambda = 0.9 * (grad_norm_data / grad_norm_reg)
 
                 # For progress bar (TQDM)
                 step = 1
@@ -1304,7 +1348,16 @@ def main():
 
                 i += 1
 
-            loss, recon_loss, state, rng = train_step_zernike3deep(graphdef, state, x, labels, md_columns, rng)
+            loss, recon_loss, metrics, state, rng = train_step_zernike3deep(graphdef, state, x, labels, md_columns, rng,
+                                                                            graph_lambda=graph_lambda,
+                                                                            pose_refine_reg=args.pose_refine_reg,
+                                                                            pose_refine_max_angle=args.pose_refine_max_angle,
+                                                                            shift_refine_reg=args.shift_refine_reg,
+                                                                            shift_refine_max=args.shift_refine_max,
+                                                                            rigid_drift_lambda=args.rigid_drift_lambda,
+                                                                            per_image_contrast=args.per_image_contrast)
+            if args.target_strain > 0:
+                graph_lambda = update_strain_lambda(graph_lambda, metrics["strain_p95"], args.target_strain, args.deformation_lambda)
             total_loss += loss
             total_recon_loss += recon_loss
 
@@ -1321,8 +1374,27 @@ def main():
                                    {"train": mean_recon_loss},
                                    i * steps_per_epoch + step)
 
+                strain_p95 = float(metrics["strain_p95"])
+                writer.add_scalars('Pose refinement (Zernike3Deep)',
+                                   {"rotation (deg)": float(metrics["pose_angle_deg"]),
+                                    "shift (px)": float(metrics["shift_norm_px"])},
+                                   i * steps_per_epoch + step)
+                writer.add_scalar('Decoder rigid fraction (Zernike3Deep)',
+                                  float(metrics["rigid_fraction"]),
+                                  i * steps_per_epoch + step)
+                writer.add_scalars('Decoder deformation (A) (Zernike3Deep)',
+                                   {"mean": float(metrics["deformation_A"]),
+                                    "p99 (local)": float(metrics["deformation_p99_A"])},
+                                   i * steps_per_epoch + step)
+                writer.add_scalar('Edge strain p95 (Zernike3Deep)',
+                                  strain_p95,
+                                  i * steps_per_epoch + step)
+                writer.add_scalar('Deformation prior weight (Zernike3Deep)',
+                                  float(graph_lambda),
+                                  i * steps_per_epoch + step)
+
                 # Progress bar update  (TQDM)
-                pbar.set_postfix_str(f"loss={mean_loss:.5f} | recon_loss={mean_recon_loss:.5f} | graph_lambda={graph_lambda:.5f}")
+                pbar.set_postfix_str(f"loss={mean_loss:.5f} | recon_loss={mean_recon_loss:.5f} | pose={float(metrics['pose_angle_deg']):.2f}deg/{float(metrics['shift_norm_px']):.2f}px | rigid={float(metrics['rigid_fraction']):.3f} | strain_p95={strain_p95:.3f} | graph_lambda={float(graph_lambda):.5f}")
 
             # Summary writer (validation loss)
             if step % int(np.ceil(0.9 * steps_per_epoch)) == 0:
@@ -1330,7 +1402,8 @@ def main():
                 pbar.set_postfix_str(f"{bcolors.WARNING}Running validation step...{bcolors.ENDC}")
                 for (x_validation, labels_validation) in data_loader_val:
                     loss_validation = validation_step_zernike3deep(graphdef, state, x_validation,
-                                                                   labels_validation, md_columns, rng)
+                                                                   labels_validation, md_columns, rng,
+                                                                   per_image_contrast=args.per_image_contrast)
                     total_validation_loss += loss_validation
                     step_validation += 1
 

@@ -25,32 +25,6 @@ def mse(a, b):
     return jnp.mean(jnp.square(a - b), axis=(-3, -2, -1))
 
 
-def match_per_image_contrast(pred, target, mask=None, mode="relative"):
-    if mode == "off":
-        return pred
-
-    p = jax.lax.stop_gradient(pred)
-    t = jax.lax.stop_gradient(target)
-    axes = (-2, -1)
-
-    if mask is None:
-        sum_pp = jnp.sum(p * p, axis=axes, keepdims=True)
-        sum_pt = jnp.sum(p * t, axis=axes, keepdims=True)
-    else:
-        w = jnp.broadcast_to(mask, p.shape)
-        sum_pp = jnp.sum(w * p * p, axis=axes, keepdims=True)
-        sum_pt = jnp.sum(w * p * t, axis=axes, keepdims=True)
-
-    # A flat or empty projection carries no scale information; leave those images alone.
-    ok = sum_pp > 1e-12 * jnp.mean(sum_pp)
-    a = jnp.where(ok, sum_pt / jnp.where(ok, sum_pp, 1.0), 1.0)
-
-    if mode == "relative":
-        a = a / jnp.maximum(jnp.mean(a), 1e-6)
-
-    return a * pred
-
-
 def decimate_lattice(mask, stride=1):
     mask = np.asarray(mask)
     stride = int(stride)
@@ -70,9 +44,6 @@ LOGSTD_MAX = 1.0
 # Displacement bound of the point transformer head, in units of the point cloud half-extent
 MAX_DISPLACEMENT = 0.5
 
-# Per-step log gain and range of the deformation prior weight controller
-STRAIN_GAIN = 0.01
-STRAIN_LAMBDA_RANGE = 1e4
 LATENT_SCALE = 0.05
 LATENT_SPREAD_EPS = 1e-12
 
@@ -2342,11 +2313,8 @@ def main():
                                                                    amp_recon_weight=amp_recon_weight,
                                                                    per_image_contrast=args.per_image_contrast)
 
-                # Stiffen the deformation prior while the p95 strain exceeds its target, relax back to the floor otherwise
                 if args.target_strain > 0:
-                    strain_error = jnp.nan_to_num(pose_metrics["strain_p95"] / args.target_strain - 1.0)
-                    graph_lambda = jnp.clip(graph_lambda * jnp.exp(STRAIN_GAIN * strain_error),
-                                            lambda_floor, STRAIN_LAMBDA_RANGE * lambda_floor)
+                    graph_lambda = update_strain_lambda(graph_lambda, pose_metrics["strain_p95"], args.target_strain, lambda_floor)
 
                 total_loss += loss
                 total_recon_loss += recon_loss

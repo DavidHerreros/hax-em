@@ -771,3 +771,29 @@ def whitened_reconstruction_loss(predicted, target, whitening_filter):
     target_white = jnp.real(jnp.fft.ifft2(jnp.fft.fft2(target) * whitening_filter))
     scale = jnp.sqrt(jnp.mean(jnp.square(target_white), axis=(-2, -1), keepdims=True)) + 1e-8
     return jnp.mean(jnp.square((predicted_white - target_white) / scale), axis=(-2, -1))
+
+
+def match_per_image_contrast(pred, target, mask=None, mode="relative"):
+    if mode == "off":
+        return pred
+
+    p = jax.lax.stop_gradient(pred)
+    t = jax.lax.stop_gradient(target)
+    axes = (-2, -1)
+
+    if mask is None:
+        sum_pp = jnp.sum(p * p, axis=axes, keepdims=True)
+        sum_pt = jnp.sum(p * t, axis=axes, keepdims=True)
+    else:
+        w = jnp.broadcast_to(mask, p.shape)
+        sum_pp = jnp.sum(w * p * p, axis=axes, keepdims=True)
+        sum_pt = jnp.sum(w * p * t, axis=axes, keepdims=True)
+
+    # A flat or empty projection carries no scale information; leave those images alone.
+    ok = sum_pp > 1e-12 * jnp.mean(sum_pp)
+    a = jnp.where(ok, sum_pt / jnp.where(ok, sum_pp, 1.0), 1.0)
+
+    if mode == "relative":
+        a = a / jnp.maximum(jnp.mean(a), 1e-6)
+
+    return a * pred

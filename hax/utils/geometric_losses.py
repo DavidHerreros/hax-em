@@ -43,6 +43,11 @@ def calculate_strain_loss(positions, radius_graph, consensus_distances, edge_wei
     penalty = jnp.where(strain < knee, 0.5 * strain ** 2., knee * (strain - 0.5 * knee))
     return jnp.sum(edge_weights * penalty) / (jnp.sum(edge_weights) + eps), strain
 
+def update_strain_lambda(graph_lambda, strain_p95, target_strain, floor, gain=0.01, max_factor=1e4):
+    """Raise the prior weight while the p95 strain exceeds its target, relax back to the floor otherwise."""
+    error = jnp.nan_to_num(strain_p95 / target_strain - 1.0)
+    return jnp.clip(graph_lambda * jnp.exp(gain * error), floor, max_factor * floor)
+
 def _closest_rotation_polar(S, iters=6):
     """Proper rotation closest to S (..., 3, 3) via Higham's scaled polar iteration, SVD-free."""
     Q = S
