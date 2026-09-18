@@ -2,7 +2,7 @@ from .latent_space_deconvolution import Deconvolver, train_deconv_step
 from .volume_gray_scale_adjustment import VolumeAdjustment, train_step_volume_adjustment
 from .image_gray_scale_adjustment import ImageAdjustment, train_step_image_adjustment
 from .zernike3deep import Zernike3Deep, train_step_zernike3deep
-from .hetsiren import HetSIREN, train_step_hetsiren, gradient_for_recon_graph_losses
+from .hetsiren import HetSIREN, train_step_hetsiren
 from .flexconsensus import FlexConsensus, train_step_flexconsensus
 from .reconsiren import ReconSIREN, train_step_reconsiren, predict_angular_assignment_step_reconsiren
 from .reconsiren_het_only import ReconSIRENHetOnly, step_reconsiren_het_only, predict_angular_assignment_step_reconsiren_het_only
