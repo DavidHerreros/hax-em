@@ -12,6 +12,7 @@ _EPS = 1e-8
 
 # Redescending cutoff (units of the mean residual): moving points drop out of the frame fit
 _TUKEY_CUTOFF = 1.0
+_WEIGHT_FLOOR = 1e-3
 
 
 class RigidGauge:
@@ -83,7 +84,7 @@ def _robust_weights(base_weights, residual):
     magnitude = jnp.sqrt(jnp.sum(residual ** 2, axis=-1) + _EPS)          # (B, N)
     scale = _TUKEY_CUTOFF * jnp.mean(magnitude, axis=-1, keepdims=True) + _EPS
     u = jnp.clip(magnitude / scale, 0.0, 1.0)
-    weights = base_weights * jnp.square(1.0 - jnp.square(u))
+    weights = base_weights * (_WEIGHT_FLOOR + (1.0 - _WEIGHT_FLOOR) * jnp.square(1.0 - jnp.square(u)))
     return jax.lax.stop_gradient(weights)
 
 
@@ -108,13 +109,10 @@ def gauge_displacement_field(delta_coords, rest_coords, base_weights, irls_iters
     """Exact gauge of a displacement field (B, N, 3): returns (gauged field, rigid_fraction)."""
     deformed = rest_coords[None] + delta_coords
 
-    # Seed the reweighting from the raw field: its magnitude says who moved
+    # Reweight from the residual of a plain fit, so a common rigid part never reads as motion
     weights = jnp.broadcast_to(base_weights[None, :], delta_coords.shape[:2])
-    if int(irls_iters) > 0:
-        weights = _robust_weights(base_weights[None, :], delta_coords)
-
     aligned = _superpose(deformed, rest_coords, weights)
-    for _ in range(int(irls_iters) - 1):
+    for _ in range(int(irls_iters)):
         weights = _robust_weights(base_weights[None, :], aligned - rest_coords[None])
         aligned = _superpose(deformed, rest_coords, weights)
 

@@ -35,6 +35,14 @@ def calculate_deformation_regularity_loss(positions, radius_graph, consensus_dis
         return jnp.sum(edge_weights * loss) / (jnp.sum(edge_weights) + eps)
     return jnp.mean(edge_weights * loss)
 
+def calculate_strain_loss(positions, radius_graph, consensus_distances, edge_weights, knee=0.05, eps=1e-8):
+    """Huber penalty on the relative edge strain (rigid domains free, hinges cheap): returns (loss, |strain| per edge)."""
+    i, j = radius_graph
+    distances = jnp.sqrt(jnp.sum((positions[i] - positions[j]) ** 2., axis=-1) + eps)
+    strain = jnp.abs(distances / consensus_distances - 1.0)
+    penalty = jnp.where(strain < knee, 0.5 * strain ** 2., knee * (strain - 0.5 * knee))
+    return jnp.sum(edge_weights * penalty) / (jnp.sum(edge_weights) + eps), strain
+
 def _closest_rotation_polar(S, iters=6):
     """Proper rotation closest to S (..., 3, 3) via Higham's scaled polar iteration, SVD-free."""
     Q = S
@@ -70,11 +78,10 @@ def calculate_repulsion_loss(positions, radius_graph, tau, edge_weights=None, ep
     diffs = positions[i] - positions[j]
     distances = jnp.sqrt(jnp.sum(diffs ** 2., axis=-1) + eps)
 
-    # Quadratic penalty if distance is less than tau (cutoff)
-    cutoff = jnp.maximum(0.5, tau)
-    # This acts like a 'soft' version of your multiplier trick
+    # Relative penalty once a pair gets closer than half of tau (scalar spacing or per-edge rest distance)
+    cutoff = 0.5 * tau
     penalty = jnp.clip(distances, a_max=cutoff)
-    penalty = jnp.abs(penalty - cutoff)
+    penalty = jnp.abs(penalty - cutoff) / cutoff
     if edge_weights is not None:
         return jnp.sum(edge_weights * penalty) / (jnp.sum(edge_weights) + eps)
     return penalty.mean()
