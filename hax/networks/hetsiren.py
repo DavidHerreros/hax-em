@@ -1577,8 +1577,8 @@ def main():
                                              max_gaussians=args.max_gaussians)
 
                     # Adjust to images
-                    model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.0001,
-                                                        num_epochs=5, is_global=True, ctf_type=args.ctf_type)
+                    model, _ = adjust_weights_to_images(model, args.md, mmap_output_dir, args.sr, learning_rate=0.01,
+                                                        num_epochs=5, is_global=True, ctf_type=args.ctf_type, is_xyz=True)
 
                     # Save model
                     NeuralNetworkCheckpointer.save(model, fit_path)
