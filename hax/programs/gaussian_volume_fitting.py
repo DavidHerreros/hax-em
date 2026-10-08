@@ -352,15 +352,29 @@ class FastVariableBlur3D(nnx.Module):
         # Broadcasting automatically expands this to (D, H, W/2+1)
         self.f_sq = fz ** 2 + fy ** 2 + fx ** 2
 
-    def __call__(self, x: jax.Array, sigma: float) -> jax.Array:
+    def __call__(self, x: jax.Array, sigma: float, no_ringing=False) -> jax.Array:
         """
         Args:
             x: Input volume batch (Batch, Depth, Height, Width, Channel) -> NDHWC
             sigma: The blur strength (pixels/voxels).
         """
-        # 3. Generate Gaussian Mask on-the-fly
-        # Formula: exp(-2 * pi^2 * sigma^2 * (u^2 + v^2 + w^2))
-        mask = jnp.exp(-2 * jnp.pi ** 2 * sigma ** 2 * self.f_sq)
+        if not no_ringing:
+            # 3. Generate Gaussian Mask on-the-fly
+            # Formula: exp(-2 * pi^2 * sigma^2 * (u^2 + v^2 + w^2))
+            mask = jnp.exp(-2 * jnp.pi ** 2 * sigma ** 2 * self.f_sq)
+        else:
+            # 3. Generate Gaussian Mask on-the-fly
+            # DFT of the Gaussian sampled on the voxel grid (separable). The continuous transfer
+            # exp(-2 * pi^2 * sigma^2 * f^2) cut at Nyquist gives sinc ripples (-2.6% at sigma 0.45)
+            def kernel_1d(n):
+                t = jnp.fft.fftfreq(n) * n
+                k = jnp.exp(-0.5 * t ** 2 / sigma ** 2)
+                return k / jnp.sum(k)
+
+            gz = jnp.fft.fft(kernel_1d(self.d)).real
+            gy = jnp.fft.fft(kernel_1d(self.h)).real
+            gx = jnp.fft.rfft(kernel_1d(self.w)).real
+            mask = gz[:, None, None] * gy[None, :, None] * gx[None, None, :]
 
         # 4. RFFTN (Real -> Complex, N-dimensional)
         # We perform FFT over axes 1 (D), 2 (H), 3 (W).
@@ -516,7 +530,8 @@ class GaussianSplatModel(nnx.Module):
                 return splat_weights(self.grid_size, means, weights)
             else:
                 final_vol = splat_weights_trilinear(self.grid_size, means, weights)
-                return self.gaussian_filter_3d(final_vol[None, ..., None], sigma)[0, ..., 0]
+                return self.gaussian_filter_3d(final_vol[None, ..., None], sigma,
+                                               no_ringing=True if "no_ringing" in kwargs.keys() else False)[0, ..., 0]
 
 
 class GlobalAdjustment(nnx.Module):

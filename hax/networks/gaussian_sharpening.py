@@ -42,6 +42,10 @@ def estimate_init_gauss(volume, mask, max_gaussians):
 
     return {"means": means_norm, "weights": weights}, float(optimal_sigma)
 
+def inside_mask(means, mask, grid_size):
+    idx = jnp.clip(jnp.round(means * 0.5 * grid_size + 0.5 * grid_size).astype(jnp.int32), 0, grid_size - 1)
+    return mask[idx[:, 2], idx[:, 1], idx[:, 0]] > 0
+
 def sharp_volume(target_vol, mask=None, fourier_weight=None, ratio_grad=None, ratio_lap=None, ratio_tv=None,
                ratio_spars=None, ratio_bound=None, ratio_sigma=None, l1_weight=0.2,
                n_iterations=1000, max_iterations=5000, learning_rate=0.01, max_gaussians=50000):
@@ -118,8 +122,8 @@ def sharp_volume(target_vol, mask=None, fourier_weight=None, ratio_grad=None, ra
                 current_lr = learning_rate * (0.05 ** progress)
 
                 model, optimizer = nnx.merge(graphdef, state)
-                optimizer = adapt_merge_gaussians(model, grads, subkey, target_max=target_max, max_gaussians=max_gaussians,
-                                            lr=current_lr)
+                optimizer = adapt_merge_gaussians(model, grads, subkey, target_max=target_max, mask=active_mask,
+                                                  max_gaussians=max_gaussians, lr=current_lr)
                 graphdef, state = nnx.split((model, optimizer))
 
             if i == 0 or is_densification_step:
@@ -177,13 +181,13 @@ def sharp_volume(target_vol, mask=None, fourier_weight=None, ratio_grad=None, ra
 
     return model, k_history
 
-def adapt_merge_gaussians(model, grads, key, target_max, max_gaussians=50000, lr=None, optimizer=None):
+def adapt_merge_gaussians(model, grads, key, target_max, mask, max_gaussians=50000, lr=None, optimizer=None):
     means = model.means.get_value()
     weights_param = model.weights.get_value()
     actual_weights = nnx.relu(weights_param)
 
     prune_threshold = jnp.max(actual_weights) * 0.005
-    keep_mask = actual_weights > prune_threshold
+    keep_mask = (actual_weights > prune_threshold) & inside_mask(means, mask, model.grid_size)
 
     means = means[keep_mask]
     actual_weights = actual_weights[keep_mask]
@@ -274,7 +278,7 @@ def sharpening_step_volume(graphdef, state, target_vol, mask, loss_weights, l1_w
     model, optimizer = nnx.merge(graphdef, state)
 
     def loss_fn(model, target_vol, mask):
-        recon = model()
+        recon = model(no_ringing=True)
         N_voxels = recon.size
         active_voxels = jnp.maximum(1.0, jnp.sum(mask))
 
@@ -290,7 +294,9 @@ def sharpening_step_volume(graphdef, state, target_vol, mask, loss_weights, l1_w
             fz = jnp.fft.fftfreq(d)[:, None, None]
             fy = jnp.fft.fftfreq(d)[None, :, None]
             fx = jnp.fft.rfftfreq(d)[None, None, :]
-            k_sq = (fz ** 2 + fy ** 2 + fx ** 2) * (2.0 * jnp.pi) ** 2
+            k_norm_sq = fz ** 2 + fy ** 2 + fx ** 2
+            k_sq = k_norm_sq * (2.0 * jnp.pi) ** 2
+            #damping = jnp.exp(-2.0 * k_norm_sq)
 
             mult = hermitian_multiplicity(d)
             power = mult * (diff_ft.real ** 2 + diff_ft.imag ** 2)
@@ -410,7 +416,7 @@ def main():
                           ratio_bound=args.ratio_bound, ratio_sigma=args.ratio_sigma, l1_weight=args.l1_weight,
                           max_iterations=args.max_iterations, learning_rate=0.01, max_gaussians=args.max_gaussians)
 
-    vol_splatted = np.array(model())
+    vol_splatted = np.array(model(no_ringing=True))
     ImageHandler().write(vol_splatted, os.path.join(args.output_path, "consensus_volume.mrc"), overwrite=True, sr=args.sr)
     vol_deltas = np.array(model(place_deltas=True))
     ImageHandler().write(vol_deltas, os.path.join(args.output_path, "consensus_volume_deltas.mrc"), overwrite=True, sr=args.sr)
