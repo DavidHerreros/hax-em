@@ -7,7 +7,7 @@ def _distance_activation(pairwise_distances, mean_neighbour_distance):
     cutoff = mean_neighbour_distance
     # Clamp distances between tau and 1.5 * tau
     x2 = jnp.clip(pairwise_distances, a_min=cutoff, a_max=1.5 * cutoff)
-    # Quadratic kernel logic from DynaMight
+    # Quadratic kernel logic
     activation = (1.0 - (4.0 / cutoff ** 2.) * (x2 - cutoff) ** 2.) ** 2.
     return activation
 
@@ -112,7 +112,7 @@ def calculate_neighbour_loss(positions, radius_graph, tau, num_points, eps=1e-8)
     # 2. Convert distances to a 'is_neighbor' score (0 to 1)
     dist_activation = _distance_activation(distances, tau)
 
-    # 3. Sum scores for each point i (DynaMight uses scatter)
+    # 3. Sum scores for each point i
     # segment_sum expects i to be sorted or we use num_segments
     n_neighbours = jax.ops.segment_sum(
         dist_activation,
