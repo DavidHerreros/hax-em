@@ -1159,7 +1159,7 @@ def _build_projection_parameters(md_columns, labels, sr, ctf_type):
 
 
 def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256, learning_rate=0.01, num_epochs=3,
-                             is_global=True, ctf_type="apply", max_samples=8192):
+                             is_global=True, ctf_type="apply", max_samples=8192, normalize=False):
     """Match the contrast of the model's projections to the experimental images.
 
     Estimates a single positive contrast scale ``a`` (and background ``b``) that best maps the current
@@ -1216,6 +1216,7 @@ def adjust_weights_to_images(model, md_path, mmap_output_dir, sr, batch_size=256
     with closing(iter(data_loader)) as iter_data_loader:
         for _ in pbar:
             (x, labels) = next(iter_data_loader)
+            x = standard_background_normalize(x) if normalize else x
             projection_parameters = _build_projection_parameters(md_columns, labels, sr, ctf_type)
             a, b, var_p = image_affine_stats(graphdef, state, x[..., 0], projection_parameters,
                                              grid_size=grid_size, ctf_type=ctf_type)

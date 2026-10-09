@@ -466,6 +466,28 @@ def build_fourier_rings(box_size: int) -> tuple[jax.Array, int]:
     return jnp.asarray(rings_np), n_rings
 
 
+def ring_correlation_sums(pred: jax.Array, obs: jax.Array, rings: jax.Array) -> jax.Array:
+    """Per-image ring sums (Re(pred·conj(obs)), |pred|^2, |obs|^2) as (B, 3, n_rings), to pool an FRC / residual spectrum over many images."""
+    pred_ft = jnp.fft.rfft2(pred, norm="ortho")
+    obs_ft = jnp.fft.rfft2(obs, norm="ortho")
+    stacked = jnp.stack([(pred_ft * jnp.conj(obs_ft)).real, jnp.abs(pred_ft) ** 2, jnp.abs(obs_ft) ** 2], axis=1)
+    return jnp.tensordot(stacked, rings, axes=[[2, 3], [0, 1]])
+
+
+def validated_ring_cutoff(sums_het, sums_consensus, n_images, rings, minpx, n_sigma=3.0, min_gain=0.05):
+    """Last ring where the heterogeneous prediction explains held-out images better than the consensus (never below ``minpx``)."""
+    residual = lambda s: s[2] - 2.0 * s[0] + s[1]
+    n_coeffs = n_images * np.asarray(rings.sum(axis=(0, 1)))
+    # Residual drop in units of its chance level (noise power / sqrt(coefficients))
+    gain = np.asarray(residual(sums_consensus) - residual(sums_het)) * np.sqrt(n_coeffs) / np.maximum(np.asarray(residual(sums_het)), 1e-12)
+    # Significant is not enough with many images: the drop must also be a fraction of what the consensus explains
+    explained_consensus = np.maximum(np.asarray(2.0 * sums_consensus[0] - sums_consensus[1]), 0.0)
+    ok = (gain >= n_sigma) & (np.asarray(residual(sums_consensus) - residual(sums_het)) >= min_gain * explained_consensus)
+    # Two consecutive rings must pass, so a lone chance ring cannot set the cutoff
+    passed = np.flatnonzero(ok[1:] & ok[:-1])
+    return max(minpx, int(passed[-1]) + 1) if passed.size else minpx
+
+
 def preprocess_particles(
         images: jax.Array,
         apply_mean_subtract: bool = True,
@@ -797,3 +819,17 @@ def match_per_image_contrast(pred, target, mask=None, mode="relative"):
         a = a / jnp.maximum(jnp.mean(a), 1e-6)
 
     return a * pred
+
+
+def explained_variance(pred, target, relative=False):
+    """Per-image variance the best-scaled prediction explains (detached): what the signal is worth in MSE units; relative=True gives R^2."""
+    p = jax.lax.stop_gradient(pred)
+    t = jax.lax.stop_gradient(target)
+    axes = (-2, -1)
+    p = p - jnp.mean(p, axis=axes, keepdims=True)
+    t = t - jnp.mean(t, axis=axes, keepdims=True)
+    var_t = jnp.mean(t * t, axis=axes)
+    explained = jnp.square(jnp.mean(p * t, axis=axes)) / (jnp.mean(p * p, axis=axes) + 1e-12)
+    # Noise alone correlates by chance: remove that bias
+    explained = jnp.maximum(explained - var_t / (p.shape[-2] * p.shape[-1]), 0.0)
+    return explained / (var_t + 1e-12) if relative else explained

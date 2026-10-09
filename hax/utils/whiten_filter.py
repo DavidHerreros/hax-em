@@ -139,7 +139,9 @@ def estimate_noise_psd(
 
 def whitening_filter_2d(
         noise_psd_1d: jax.Array,
-        image_shape: Tuple[int, int]
+        image_shape: Tuple[int, int],
+        band_mask: jax.Array = None,
+        preserve_scale: bool = False,
 ) -> jax.Array:
     """Build the unshifted 2D whitening filter from a 1D noise PSD.
 
@@ -162,12 +164,21 @@ def whitening_filter_2d(
     eps = 1e-6 * jnp.max(noise_psd_1d)
     radial_filter = 1.0 / (jnp.sqrt(noise_psd_1d) + eps)
 
-    # Normalise so the filter has unit gain on average over the spectrum; this
-    # keeps the whitened images on roughly the same scale as the input.
-    radial_filter = radial_filter / jnp.mean(radial_filter)
+    # Optional per-ring band mask; rings past its end (beyond Nyquist) are dropped
+    mask = (jnp.ones(n_rings) if band_mask is None
+            else jnp.pad(jnp.asarray(band_mask), (0, n_rings - band_mask.shape[0])))
+
+    if preserve_scale:
+        # Unit gain over the retained band, so whitening reweights the loss without rescaling it
+        kept = (mask > 0.0)[r]
+        radial_filter = radial_filter * jnp.sqrt(jnp.sum(kept * noise_psd_1d[r]) / jnp.maximum(jnp.sum(kept), 1.0))
+    else:
+        # Normalise so the filter has unit gain on average over the spectrum; this
+        # keeps the whitened images on roughly the same scale as the input.
+        radial_filter = radial_filter / jnp.mean(radial_filter)
 
     # Map the 1D filter values back to a 2D grid and unshift for multiplication
-    return fft.ifftshift(radial_filter[r])
+    return fft.ifftshift((radial_filter * mask)[r])
 
 
 def create_whitening_fn(

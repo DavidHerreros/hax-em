@@ -1,6 +1,6 @@
-from .losses import simae, correlation_coefficient_loss, ncc_loss, gradient_loss, diceLoss, contrastive_ce_loss, triplet_loss, sliced_wasserstein_loss, FRCLoss, dynamic_band_mask, recommended_band, chamfer_distance, soft_spherical_occupancy, candidate_coverage_loss, latent_variance_covariance_loss, geometry_prior_losses, support_loss, whitened_reconstruction_loss
+from .losses import match_per_image_contrast, explained_variance, simae, correlation_coefficient_loss, ncc_loss, gradient_loss, diceLoss, contrastive_ce_loss, triplet_loss, sliced_wasserstein_loss, FRCLoss, build_fourier_rings, ring_correlation_sums, validated_ring_cutoff, dynamic_band_mask, recommended_band, chamfer_distance, soft_spherical_occupancy, candidate_coverage_loss, latent_variance_covariance_loss, geometry_prior_losses, support_loss, whitened_reconstruction_loss
 from .neighbours_search import approximate_knn, morton_codes
-from .geometric_losses import calculate_deformation_regularity_loss, calculate_strain_loss, calculate_outlier_loss, calculate_neighbour_loss, calculate_repulsion_loss, calculate_deformation_coherence_loss, decoder_jacobian, geometric_correction_loss, composed_geometric_correction_loss
+from .geometric_losses import calculate_deformation_regularity_loss, calculate_strain_loss, update_strain_lambda, calculate_outlier_loss, calculate_neighbour_loss, calculate_repulsion_loss, calculate_deformation_coherence_loss, decoder_jacobian, geometric_correction_loss, composed_geometric_correction_loss
 from .ctf import computeCTF, ctf_freqs, computeDoseEnvelope
 from .euler import euler_matrix_batch, euler_from_matrix
 from .grid_interpolation import interpolate
@@ -8,7 +8,7 @@ from .fourier_filters import wiener2DFilter, ctfFilter, gaussianCTFFilter, gauss
 from .convolutional_filters import fast_gaussian_filter_3d
 from .zernike3d import computeBasis, basisDegreeVectors, precomputePolynomialsZernike, precomputePolynomialsSph
 from .segmentation import get_segmentation_centers, watershed_segmentation
-from .normalizers import min_max_scale, standard_normalization
+from .normalizers import min_max_scale, standard_normalization, standard_background_normalize
 from .random_gen import random_rotation_matrices
 from .miscellaneous import (estimate_noise_stddev, filter_latent_space, batched_knn, rigid_registration, estimate_envelopes,
                             sharpen_gaussian_envelope, estimate_particle_extent, equalize_masses, splat_cloud_volumes,

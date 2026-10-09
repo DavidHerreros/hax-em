@@ -22,6 +22,20 @@ def standard_normalization(images, mask=None):
     return (images - mean) / (jnp.sqrt(var) + 1e-8) * m
 
 
+def standard_background_normalize(images, bg_radius=None, eps=1e-6):
+    """Particle normalization of channel-last images: zero mean and unit std in the background outside bg_radius (default 0.375 * box)."""
+    size = images.shape[-2]
+    bg_radius = round(0.375 * size) if bg_radius is None else bg_radius
+    axis = jnp.arange(size, dtype=jnp.float32) - size // 2
+    yy, xx = jnp.meshgrid(axis, axis, indexing="ij")
+    background = (xx * xx + yy * yy > bg_radius ** 2)[:, :, None]
+    x = images.astype(jnp.float32)
+    n = jnp.sum(background)
+    mean = jnp.sum(jnp.where(background, x, 0.0), axis=(-3, -2), keepdims=True) / n
+    var = jnp.sum(jnp.where(background, jnp.square(x - mean), 0.0), axis=(-3, -2), keepdims=True) / n
+    return ((x - mean) / jnp.maximum(jnp.sqrt(var), eps)).astype(images.dtype)
+
+
 def logistic_transform_std_shift(self, errors, mu=None, sigma=None):
     """
     Transforms a 1D array of errors to a 0-1 scale using a logistic function,
