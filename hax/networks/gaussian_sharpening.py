@@ -229,7 +229,7 @@ def adapt_merge_gaussians(model, grads, key, target_max, mask, max_gaussians=500
     is_noise_chasing = normalized_grads > 0.010
     sigma_vox = jax.nn.softplus(model.sigma_param.get_value())[0]
     peak_density = merged_weights_param / ((2.0 * jnp.pi) ** 1.5 * sigma_vox ** 3)
-    is_density_exploding = peak_density > (target_max * 1.5)
+    is_density_exploding = peak_density > (target_max * 4.0)
     overfit_mask = is_noise_chasing | is_density_exploding
     split_mask = base_split_mask & overfit_mask
 
@@ -296,15 +296,13 @@ def sharpening_step_volume(graphdef, state, target_vol, mask, loss_weights, l1_w
             fx = jnp.fft.rfftfreq(d)[None, None, :]
             k_norm_sq = fz ** 2 + fy ** 2 + fx ** 2
             k_sq = k_norm_sq * (2.0 * jnp.pi) ** 2
-            #damping = jnp.exp(-2.0 * k_norm_sq)
 
             mult = hermitian_multiplicity(d)
             power = mult * (diff_ft.real ** 2 + diff_ft.imag ** 2)
-            snr_weight = fourier_weight ** 2
 
             norm_factor_ft = active_voxels * N_voxels
-            raw_grad = jnp.sum(snr_weight * k_sq * power) / norm_factor_ft
-            raw_lap = jnp.sum(snr_weight * (k_sq ** 2) * power) / norm_factor_ft
+            raw_grad = jnp.sum(k_sq * power) / norm_factor_ft
+            raw_lap = jnp.sum((k_sq ** 2) * power) / norm_factor_ft
         else:
             diff = recon_masked - target_vol
             raw_grad, raw_lap = 0.0, 0.0
@@ -314,9 +312,10 @@ def sharpening_step_volume(graphdef, state, target_vol, mask, loss_weights, l1_w
         raw_recon_loss = l1_weight * l1_loss + (1 - l1_weight) * l2_loss
         recon_loss = raw_recon_loss
 
-        diff_x = recon_masked[1:, :, :] - recon_masked[:-1, :, :]
-        diff_y = recon_masked[:, 1:, :] - recon_masked[:, :-1, :]
-        diff_z = recon_masked[:, :, 1:] - recon_masked[:, :, :-1]
+        tv_weight_map = jnp.clip(1.0 - target_vol, 0.0, 1.0)
+        diff_x = (recon_masked[1:, :, :] - recon_masked[:-1, :, :]) * tv_weight_map[:-1, :, :]
+        diff_y = (recon_masked[:, 1:, :] - recon_masked[:, :-1, :]) * tv_weight_map[:, :-1, :]
+        diff_z = (recon_masked[:, :, 1:] - recon_masked[:, :, :-1]) * tv_weight_map[:, :, :-1]
         raw_tv = (jnp.sum(jnp.abs(diff_x)) + jnp.sum(jnp.abs(diff_y)) + jnp.sum(jnp.abs(diff_z))) / active_voxels
         tv_loss = loss_weights['tv'] * raw_tv
 
@@ -406,7 +405,7 @@ def main():
     mask_data = ImageHandler(args.mask).getData()
 
     mask_fsc = gaussian_filter(mask_data, sigma=2.0)
-    fourier_weight, _ = compute_fsc_weight(half1=args.half_map_1, half2=args.half_map_2, mask=mask_fsc, mode='fsc',
+    fourier_weight, _ = compute_fsc_weight(half1=args.half_map_1, half2=args.half_map_2, mask=mask_fsc, mode='wiener',
                                                n_cones=250, cone_angle=20.0, phase_randomize=True, hard_cones=True,
                                                sr=args.sr)
     save_fourier_3dfsc(fourier_weight, mask_data.shape[0], "3dfsc.mrc")

@@ -278,6 +278,8 @@ def compute_fsc_weight(half1, half2, mask=None, mode="fsc_ref", directional=True
     # --- FSC -> restoration weight
     if mode == "fsc_ref":
         curves_w = jnp.sqrt(2.0 * curves_clipped / (1.0 + curves_clipped))
+    elif mode == "wiener":
+        curves_w = 2.0 * curves_clipped / (1.0 + curves_clipped)
     elif mode == "fsc":
         curves_w = curves_clipped
     else:
