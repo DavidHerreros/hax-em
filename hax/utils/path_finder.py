@@ -1,3 +1,4 @@
+import itertools
 import random
 import sys
 from contextlib import closing
@@ -663,7 +664,7 @@ class PathFinder(nnx.Module):
 
     def free_energy_function(self, epochs=200, batch_size=1024,
                              learning_rate=1e-3, weight_decay=1e-4, grad_penalty=1e-3,
-                             val_fraction=0.1, clip_percentiles=(1.0, 99.0), patience=15, min_delta=1e-4,
+                             val_fraction=0.1, clip_percentiles=(1.0, 99.9), patience=15, min_delta=1e-4,
                              log_dir=None, wall=True, wall_height=None, wall_radius_percentile=98.0,
                              wall_radius_margin=1.25, neg_weight=0.1, neg_sigma=(1.0, 3.0)):
         """Fit a small MLP so that G = f(z), saturating to ``wall_height`` outside the latent data"""
@@ -685,7 +686,7 @@ class PathFinder(nnx.Module):
 
     def energy_from_features_function(self, epochs=200, batch_size=1024,
                                       learning_rate=1e-3, weight_decay=1e-4, grad_penalty=1e-3,
-                                      val_fraction=0.1, clip_percentiles=(1.0, 99.0), patience=15, min_delta=1e-4,
+                                      val_fraction=0.1, clip_percentiles=(1.0, 99.9), patience=15, min_delta=1e-4,
                                       log_dir=None, wall=True, wall_height=None, wall_radius_percentile=98.0,
                                       wall_radius_margin=1.25, neg_weight=0.1, neg_sigma=(1.0, 3.0)):
         """Fit a small MLP so that E = f(F): the free energy predicted from the Gaussian features directly,
@@ -1000,15 +1001,17 @@ class PathFinder(nnx.Module):
             # edge distance)
             cost_edge = dist * jnp.maximum(fv.mean(-1) - E_floor, eps)
 
-            return jnp.where(fv.max(-1) > cmax, jnp.inf, cost_edge)
+            # Edge barrier: highest energy sampled along the edge
+            blocked = fv.max(-1) > cmax
+            return jnp.where(blocked, jnp.inf, cost_edge), jnp.where(blocked, jnp.inf, fv.max(-1) - E_floor)
 
         return self._chunked_map(one_chunk, (nodes, near), chunk)
 
     @staticmethod
-    @partial(jax.jit, static_argnames=("n", "max_iters"))
-    def _shortest_path_fmt(src_e, dst_e, w_e, n, max_iters):
-        cost_value = jnp.full(n, jnp.inf).at[0].set(0.0)
-        parent = jnp.full(n, -1, jnp.int32).at[0].set(0)
+    @partial(jax.jit, static_argnames=("n", "max_iters", "bottleneck"))
+    def _shortest_path_fmt(src_e, dst_e, w_e, n, max_iters, source=0, bottleneck=False):
+        cost_value = jnp.full(n, jnp.inf).at[source].set(-jnp.inf if bottleneck else 0.0)
+        parent = jnp.full(n, -1, jnp.int32).at[source].set(source)
 
         def cond(s):
             return s[2] & (s[3] < max_iters)
@@ -1017,7 +1020,7 @@ class PathFinder(nnx.Module):
             cost_value, parent, _, it = s
 
             # Step 1: Accumulative cost going from Q_start to a given node through the best route
-            cand = cost_value[src_e] + w_e
+            cand = jnp.maximum(cost_value[src_e], w_e) if bottleneck else cost_value[src_e] + w_e
 
             # Step 2: For each destination node, get the minimum accumulative cost to reach it
             # (i.e. find segments ending in the node and get the minimum cost among them)
@@ -1047,13 +1050,14 @@ class PathFinder(nnx.Module):
         cost_value, parent, _, iters = jax.lax.while_loop(cond, body, (cost_value, parent, True, 0))
         return cost_value, parent, iters
 
-    def plan_fmt(self, latent_init, latent_goal, *, n_samples=20000, k=None, quad=8, tau=None,
-                 tau_percentile=99.0, eps=1e-3, chunk=512, max_iters=None, sample_particles=True):
-        # Initialization
-        latent_init = jnp.asarray(latent_init, jnp.float32).reshape(self.lat_dim)
-        latent_goal = jnp.asarray(latent_goal, jnp.float32).reshape(self.lat_dim)
-        features_init, features_goal = self.features_at_latent(jnp.stack([latent_init, latent_goal]))
+    @staticmethod
+    def _trace_fmt(parent, source, goal):
+        idx = [goal]
+        while idx[-1] != source:
+            idx.append(int(parent[idx[-1]]))
+        return np.asarray(idx[::-1])
 
+    def _graph_fmt(self, features_end, n_samples, k, quad, tau, tau_percentile, eps, chunk, sample_particles):
         F = self.F[...]
         d = self.config["feat_dim"]
         n_samples = min(int(n_samples), F.shape[0])
@@ -1063,7 +1067,7 @@ class PathFinder(nnx.Module):
         else:
             features_lo, features_hi = F.min(0), F.max(0)
             Q_rand = features_lo + (features_hi - features_lo) * jax.random.uniform(seed, (n_samples, d))
-        nodes = jnp.concatenate([features_init[None], features_goal[None], Q_rand])
+        nodes = jnp.concatenate([features_end, Q_rand])
         N = nodes.shape[0]
 
         E_floor, E_ceiling = self._feature_energy_stats(tau_percentile)
@@ -1079,8 +1083,8 @@ class PathFinder(nnx.Module):
         # closest neighbours indices
         near = self._knn_graph_fmt(nodes, k=k, chunk=chunk)
 
-        # Compute edge cost
-        cost_edge = self._edge_costs_fmt(nodes, near, E_floor, cmax, eps, quad=quad, chunk=chunk)
+        # Compute edge cost and barrier
+        cost_edge, barrier_edge = self._edge_costs_fmt(nodes, near, E_floor, cmax, eps, quad=quad, chunk=chunk)
 
         # Get source, destination and weights for the undirected graph (each edge is bidirectional)
         src = jnp.repeat(jnp.arange(N, dtype=jnp.int32), k)  # src[i·k + j] = i
@@ -1088,6 +1092,18 @@ class PathFinder(nnx.Module):
         src_e = jnp.concatenate([src, dst])
         dst_e = jnp.concatenate([dst, src])
         w_e = jnp.concatenate([cost_edge.reshape(-1), cost_edge.reshape(-1)])
+        b_e = jnp.concatenate([barrier_edge.reshape(-1), barrier_edge.reshape(-1)])
+        return nodes, src_e, dst_e, w_e, b_e, k, E_floor, tau
+
+    def plan_fmt(self, latent_init, latent_goal, *, n_samples=20000, k=None, quad=8, tau=None,
+                 tau_percentile=99.0, eps=1e-3, chunk=512, max_iters=None, sample_particles=True):
+        # Initialization
+        latent_init = jnp.asarray(latent_init, jnp.float32).reshape(self.lat_dim)
+        latent_goal = jnp.asarray(latent_goal, jnp.float32).reshape(self.lat_dim)
+        nodes, src_e, dst_e, w_e, _, k, E_floor, tau = self._graph_fmt(
+            self.features_at_latent(jnp.stack([latent_init, latent_goal])), n_samples, k, quad, tau,
+            tau_percentile, eps, chunk, sample_particles)
+        N = nodes.shape[0]
 
         # Find shortest path from start to goal
         max_iters = N if max_iters is None else int(max_iters)
@@ -1097,11 +1113,7 @@ class PathFinder(nnx.Module):
             raise RuntimeError(f"goal unreachable with {N} nodes and k={k}; raise n_samples, k or tau")
 
         # Get the best path indices
-        parent = np.asarray(parent)
-        idx = [goal_idx]
-        while idx[-1] != 0:
-            idx.append(int(parent[idx[-1]]))
-        idx = np.asarray(idx[::-1])
+        idx = self._trace_fmt(np.asarray(parent), 0, goal_idx)
         path = np.asarray(nodes)[idx]
 
         # Compute energy profile along path and nodes in latent space
@@ -1111,4 +1123,167 @@ class PathFinder(nnx.Module):
         info = dict(nodes=int(N), k=int(k), iters=int(iters), particle_idx=particle_idx, path_features=path,
                     energy_cum=cum, energy_floor=E_floor, tau=tau, graph_cost=float(cost_value[goal_idx]),
                     node_idx=idx)
+        return path_latent, energy, cum, info
+
+    @staticmethod
+    def _mst(W):
+        """Prim's minimum spanning tree over the dense basin matrix W, as (i, j) edges"""
+        K, in_tree, edges = len(W), [0], []
+        while len(in_tree) < K:
+            i, j = min(((i, j) for i in in_tree for j in range(K) if j not in in_tree), key=lambda e: W[e])
+            in_tree.append(j)
+            edges.append((i, j))
+        return edges
+
+    @staticmethod
+    def _tree_walk(edges, length, K):
+        """Walk visiting every tree node from one end of the tree diameter to the other, side branches
+        backtracked, so only the diameter is not traversed twice"""
+        adj = {i: [] for i in range(K)}
+        for i, j in edges:
+            adj[i].append(j)
+            adj[j].append(i)
+
+        def dists(s):
+            d, parent, stack = {s: 0.0}, {s: s}, [s]
+            while stack:
+                u = stack.pop()
+                for v in adj[u]:
+                    if v not in d:
+                        d[v], parent[v] = d[u] + length[u, v], u
+                        stack.append(v)
+            return d, parent
+
+        d0, _ = dists(0)
+        a = max(d0, key=d0.get)
+        da, parent = dists(a)
+        b = max(da, key=da.get)
+        route = {b}
+        while b != a:
+            b = parent[b]
+            route.add(b)
+
+        walk = []
+
+        def visit(u, prev):
+            walk.append(u)
+            nxt = [v for v in adj[u] if v != prev]
+            for v in [v for v in nxt if v not in route] + [v for v in nxt if v in route]:
+                visit(v, u)
+                if v not in route:
+                    walk.append(u)
+
+        visit(a, None)
+        return walk
+
+    @staticmethod
+    def _best_order(W, tie=None):
+        """Exact visit-once order (Held-Karp, open path, free ends). With ``tie``, minimise the max of W
+        (barrier) and break ties by the sum of ``tie``; otherwise minimise the sum of W"""
+        K = len(W)
+        if tie is None:
+            comb, start = (lambda c, j, v: (c[0] + W[j, v],)), (0.0,)
+        else:
+            comb, start = (lambda c, j, v: (max(c[0], W[j, v]), c[1] + tie[j, v])), (-np.inf, 0.0)
+        best = {(1 << i, i): (start, -1) for i in range(K)}
+        for mask in range(1, 1 << K):
+            for j in range(K):
+                if (mask, j) not in best:
+                    continue
+                c = best[(mask, j)][0]
+                for v in range(K):
+                    if not mask >> v & 1:
+                        key, cv = (mask | 1 << v, v), comb(c, j, v)
+                        if key not in best or cv < best[key][0]:
+                            best[key] = (cv, j)
+        mask = (1 << K) - 1
+        j = min(range(K), key=lambda j: best[(mask, j)][0])
+        order = []
+        while j >= 0:
+            order.append(j)
+            mask, j = mask & ~(1 << j), best[(mask, j)][1]
+        return order[::-1]
+
+    def plan_fmt_multi(self, latents, *, weight="barrier", visit_once=False, n_samples=20000, k=None, quad=8,
+                       tau=None, tau_percentile=99.0, eps=1e-3, chunk=512, max_iters=None, sample_particles=True,
+                       max_exact=12):
+        """Route through all basins in ``latents`` (K, lat_dim) on one FMT graph. ``weight`` is "barrier"
+        (minimax barrier between basins) or "cost" (integrated cost). The basins are joined by the minimum
+        spanning tree of the pairwise weights, walked end to end (side branches backtracked); with
+        ``visit_once`` the exact visit-once order is used instead (Held-Karp up to ``max_exact`` basins)"""
+        if weight not in ("barrier", "cost"):
+            raise ValueError(f"weight must be 'barrier' or 'cost', got {weight!r}")
+        latents = jnp.asarray(latents, jnp.float32).reshape(-1, self.lat_dim)
+        K = latents.shape[0]
+        if K < 2:
+            raise ValueError("at least two basins are needed")
+        nodes, src_e, dst_e, w_e, b_e, k, E_floor, tau = self._graph_fmt(
+            self.features_at_latent(latents), n_samples, k, quad, tau, tau_percentile, eps, chunk, sample_particles)
+        N = nodes.shape[0]
+        max_iters = N if max_iters is None else int(max_iters)
+        bottleneck = weight == "barrier"
+
+        # Pairwise basin weights, one single-source run per basin (basins are nodes 0..K-1)
+        W = np.stack([np.asarray(self._shortest_path_fmt(src_e, dst_e, b_e if bottleneck else w_e, n=N,
+                                                         max_iters=max_iters, source=s, bottleneck=bottleneck)[0][:K])
+                      for s in range(K)])
+        W = np.minimum(W, W.T)
+        np.fill_diagonal(W, 0.0)
+        if not np.isfinite(W).all():
+            pairs = [(int(i), int(j)) for i, j in zip(*np.nonzero(~np.isfinite(W))) if i < j]
+            raise RuntimeError(f"basin pairs {pairs} unreachable with {N} nodes and k={k}; raise n_samples, k or tau")
+
+        # Leg between two basins: cheapest path, restricted to edges under the pair barrier when weight="barrier"
+        legs, leg_cost = {}, {}
+
+        def leg(i, j):
+            if (i, j) not in legs:
+                w = jnp.where(b_e <= W[i, j], w_e, jnp.inf) if bottleneck else w_e
+                cost_value, parent, _ = self._shortest_path_fmt(src_e, dst_e, w, n=N, max_iters=max_iters, source=i)
+                if not np.isfinite(float(cost_value[j])):
+                    raise RuntimeError(f"no leg between basins {i} and {j} within max_iters={max_iters}")
+                legs[(i, j)] = self._trace_fmt(np.asarray(parent), i, j)
+                legs[(j, i)] = legs[(i, j)][::-1]
+                leg_cost[(i, j)] = leg_cost[(j, i)] = float(cost_value[j])
+            return legs[(i, j)]
+
+        tree = self._mst(W)
+        length = np.zeros((K, K))
+        for i, j in tree:
+            leg(i, j)
+            length[i, j] = length[j, i] = leg_cost[(i, j)]
+        walk = self._tree_walk(tree, length, K)
+        if not visit_once:
+            stops = walk
+        elif K <= max_exact:
+            tie = None
+            if bottleneck:
+                tie = np.zeros((K, K))
+                for i, j in itertools.combinations(range(K), 2):
+                    leg(i, j)
+                    tie[i, j] = tie[j, i] = leg_cost[(i, j)]
+            stops = self._best_order(W, tie)
+        else:
+            print(f"WARNING: {K} basins > max_exact={max_exact}; visit-once order taken from the tree walk")
+            stops = list(dict.fromkeys(walk))
+
+        # Join the legs; stop_pos marks where each stop sits along the path
+        idx, stop_pos = [stops[0]], [0]
+        for i, j in zip(stops[:-1], stops[1:]):
+            idx.extend(leg(i, j)[1:].tolist())
+            stop_pos.append(len(idx) - 1)
+        idx = np.asarray(idx)
+        path = np.asarray(nodes)[idx]
+
+        energy, cum = self._path_profile(path, E_floor, quad)
+        latents_np = np.asarray(latents)
+        path_latent, particle_idx = self._path_to_latent(path, latents_np[stops[0]], latents_np[stops[-1]])
+
+        combine = max if bottleneck else sum
+        info = dict(nodes=int(N), k=int(k), particle_idx=particle_idx, path_features=path, energy_cum=cum,
+                    energy_floor=E_floor, tau=tau, node_idx=idx, weight=weight, weights=W,
+                    tree=[(i, j, float(W[i, j])) for i, j in tree], walk=walk, stops=list(stops),
+                    stop_pos=stop_pos, tree_weight=float(combine(W[i, j] for i, j in tree)),
+                    route_weight=float(combine(W[i, j] for i, j in zip(stops[:-1], stops[1:]))),
+                    leg_cost={key: c for key, c in leg_cost.items() if key[0] < key[1]})
         return path_latent, energy, cum, info
