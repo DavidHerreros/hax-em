@@ -1017,12 +1017,6 @@ def main():
         # Prepare summary writer
         writer = JaxSummaryWriter(os.path.join(args.output_path, "Zernike3Deep_metrics"))
 
-        # Prepare data loader
-        data_loader_train = generator.return_grain_dataset(batch_size=args.batch_size, shuffle="global_data_loader",
-                                                           num_epochs=None, num_workers=-1, num_threads=1,
-                                                           load_to_ram=args.load_images_to_ram, stack_tomo=isTomo)
-        steps_per_epoch = int(n_items / args.batch_size)
-
         # Projector help text in Tensorboard
         legend_projector = """
                 <h3>WARNING: Images shown in projector</h3>
@@ -1084,6 +1078,33 @@ def main():
                                         rngs=nnx.Rngs(model_key))
 
         zernike3deep.train()
+
+        # Resolve --batch_size auto from the peak memory of the train step
+        if args.batch_size == "auto":
+            from hax.utils import estimate_batch_size
+            estimated = None
+            if isTomo:
+                print(f"{bcolors.WARNING}\nAutomatic batch size is not supported in Tomo mode; "
+                      f"using a fixed batch size instead.{bcolors.ENDC}")
+            else:
+                params_probe = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('flow_decoder')))
+                params_grays_probe = nnx.All(nnx.Param, nnx.PathContains('phys_decoder'))
+                probe_optimizer = nnx.Optimizer(zernike3deep, optax.adam(args.learning_rate), wrt=params_probe)
+                probe_optimizer_grays = nnx.Optimizer(zernike3deep, optax.adam(args.learning_rate), wrt=params_grays_probe)
+                probe_graphdef, probe_state = nnx.split((zernike3deep, probe_optimizer, probe_optimizer_grays))
+                estimated = estimate_batch_size(probe_graphdef, probe_state, train_step_zernike3deep, md_columns, rng,
+                                                (zernike3deep.xsize, zernike3deep.xsize, 1),
+                                                step_kwargs=dict(do_update=True), max_batch=min(1024, n_items))
+                del probe_optimizer, probe_optimizer_grays, probe_graphdef, probe_state
+            args.batch_size = estimated if estimated is not None else 8
+            if estimated is None:
+                print(f"{bcolors.WARNING}Falling back to --batch_size {args.batch_size}.{bcolors.ENDC}")
+
+        # Prepare data loader
+        data_loader_train = generator.return_grain_dataset(batch_size=args.batch_size, shuffle="global_data_loader",
+                                                           num_epochs=None, num_workers=-1, num_threads=1,
+                                                           load_to_ram=args.load_images_to_ram, stack_tomo=isTomo)
+        steps_per_epoch = int(n_items / args.batch_size)
 
         # Example of training data for Tensorboard (tomo stacks -> first tilt of each particle)
         x_example, labels_example = next(iter(data_loader_train))
@@ -1361,6 +1382,10 @@ def main():
 
         def xmippEulerFromMatrix(matrix):
             return -jnp.rad2deg(euler_from_matrix_batch(matrix))
+
+        # Inference uses a fixed default batch size when auto
+        if args.batch_size == "auto":
+            args.batch_size = 8
 
         # Prepare data loader
         data_loader = generator.return_grain_dataset(batch_size=args.batch_size, shuffle=False, num_epochs=1,
