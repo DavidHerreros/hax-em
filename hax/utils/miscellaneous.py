@@ -777,3 +777,9 @@ def tilt_mean(fn, x, *args, mask=None):
 def per_particle(a, like):
     """Insert singleton tilt axes so a per-particle ``(B, ...)`` array broadcasts against a per-tilt ``(B, T, ...)`` one."""
     return jnp.expand_dims(a, tuple(range(1, 1 + like.ndim - a.ndim)))
+
+
+def nested_dropout_mask(key, shape, group, p):
+    """Keeps a geometric-length prefix of every group of latent dims (Rippel et al. 2014)"""
+    keep = jax.random.geometric(key, p, shape[:-1] + (shape[-1] // group,))
+    return (jnp.arange(shape[-1]) % group < jnp.repeat(keep, group, axis=-1)).astype(jnp.float32)
