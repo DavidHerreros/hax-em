@@ -598,18 +598,21 @@ class Zernike3Deep(nnx.Module):
         return flow, self.coords
 
 @partial(jax.jit, static_argnames=("do_update", "pose_refine_reg", "pose_refine_max_angle", "shift_refine_reg",
-                                   "shift_refine_max", "rigid_drift_lambda", "per_image_contrast", "strain_penalty", "probe"))
+                                   "shift_refine_max", "rigid_drift_lambda", "per_image_contrast", "strain_penalty", "probe",
+                                   "decoupling_lambda", "nested_dropout"))
 def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True, graph_lambda=1.0,
                             pose_refine_reg=0.1, pose_refine_max_angle=8.0, shift_refine_reg=0.1, shift_refine_max=4.0,
-                            rigid_drift_lambda=1.0, per_image_contrast="off", kl_lambda=0.0, strain_penalty="huber", probe=None):
+                            rigid_drift_lambda=1.0, per_image_contrast="off", kl_lambda=0.0, strain_penalty="huber", probe=None,
+                            decoupling_lambda=1e-4, nested_dropout=0.0, noise_invariance_lambda=0.0, noise_filter=None):
     model, optimizer, optimizer_grays = nnx.merge(graphdef, state)
-    distributions_key, choice_key, random_pose_key, key = jax.random.split(key, 4)
+    distributions_key, choice_key, random_pose_key, nested_key, noise_key, key = jax.random.split(key, 6)
 
     strain_loss = calculate_bounded_strain_loss if strain_penalty == "bounded" else calculate_strain_loss
     calculate_strain_loss_batch = jax.vmap(strain_loss, in_axes=(0, None, None, None))
     calculate_repulsion_loss_batch = jax.vmap(calculate_repulsion_loss, in_axes=(0, None, None))
 
     def loss_fn(model, x):
+        x_raw = x
         x = model.prepare_images(x)
 
         # Encode latent E(z)
@@ -630,9 +633,14 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True,
             else:
                 latent, (rotations_rigid, shifts_rigid) = model.encoder(x, return_alignment_refinement=True, rngs=distributions_key)
 
+        if probe == "encoder_data":
+            rotations_rigid, shifts_rigid = jax.lax.stop_gradient((rotations_rigid, shifts_rigid))
+
         # Decode flow field
-        flow, rigid_fraction, rigid_drift = model.flow_decoder(sample if model.isVae else latent, model.coords,
-                                                               model.xsize, return_diagnostics=True)
+        z_dec = sample if model.isVae else latent
+        if nested_dropout > 0.0:
+            z_dec = z_dec * nested_dropout_mask(nested_key, z_dec.shape, z_dec.shape[-1], nested_dropout)
+        flow, rigid_fraction, rigid_drift = model.flow_decoder(z_dec, model.coords, model.xsize, return_diagnostics=True)
 
         # Get rotation matrices
         if euler_angles.ndim == 2:
@@ -752,13 +760,26 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True,
         else:
             decoupling_loss = 0.0
 
-        loss = (recons_loss_all + kl_lambda * kl_loss + 0.0001 * decoupling_loss + graph_lambda * loss_graph + 0.01 * loss_dp + 0.01 * loss_cm
-                + pose_refine_reg * pose_refine_loss + shift_refine_reg * shift_refine_loss + rigid_drift_lambda * rigid_drift)
+        # Noise invariance: 1 - per dim correlation with the latent of a second noise draw (scale-free, collapse scores 1)
+        if noise_filter is not None and not model.isTomo:
+            x_noisy = x_raw + colored_noise(noise_key, x_raw.shape[:-1], noise_filter)[..., None]
+            latent_noisy = model(x_noisy, rngs=distributions_key, return_alignment_refinement=False)
+            z_a, z_b = latent - jnp.mean(latent, axis=0), latent_noisy - jnp.mean(latent_noisy, axis=0)
+            noise_corr = jnp.sum(z_a * z_b, axis=0) / jnp.sqrt(jnp.sum(z_a ** 2, axis=0) * jnp.sum(z_b ** 2, axis=0) + 1e-12)
+            noise_inv_loss = jnp.mean(1.0 - noise_corr)
+        else:
+            noise_inv_loss = 0.0
 
-        if probe == "data":
+        loss = (recons_loss_all + kl_lambda * kl_loss + decoupling_lambda * decoupling_loss + graph_lambda * loss_graph + 0.01 * loss_dp + 0.01 * loss_cm
+                + pose_refine_reg * pose_refine_loss + shift_refine_reg * shift_refine_loss + rigid_drift_lambda * rigid_drift
+                + noise_invariance_lambda * noise_inv_loss)
+
+        if probe in ("data", "encoder_data"):
             loss = recons_loss_all
         elif probe == "prior":
             loss = loss_graph
+        elif probe == "noise":
+            loss = noise_inv_loss
 
         theta_deg = jnp.rad2deg(jnp.arccos(jnp.clip(cos_theta_rigid, -1.0 + 1e-6, 1.0 - 1e-6)))
         disp_A = jnp.linalg.norm(flow, axis=-1) * model.sr
@@ -770,7 +791,8 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True,
                    "strain_p95": strain_p95,
                    "signal": signal,
                    "latent_std": jnp.mean(jnp.std(latent, axis=0)),
-                   "latent_max": jnp.max(jnp.abs(latent))}
+                   "latent_max": jnp.max(jnp.abs(latent)),
+                   "noise_inv": noise_inv_loss}
         return loss, (recon_loss, latent, jax.lax.stop_gradient(metrics))
 
     # Tomo stacks carry a tilt axis: x is (B, T, H, W, 1) and labels (B, T)
@@ -821,8 +843,9 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True,
         ctf_random = jnp.ones([labels.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
 
     if probe is not None:
-        decoder_params = nnx.All(nnx.Param, nnx.PathContains('flow_decoder'))
-        grads = nnx.grad(lambda m, x: loss_fn(m, x)[0], argnums=nnx.DiffState(0, decoder_params))(model, x)
+        probe_path = 'encoder' if probe in ("encoder_data", "noise") else 'flow_decoder'
+        probe_params = nnx.All(nnx.Param, nnx.PathContains(probe_path))
+        grads = nnx.grad(lambda m, x: loss_fn(m, x)[0], argnums=nnx.DiffState(0, probe_params))(model, x)
         return jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in jax.tree.leaves(grads)))
     grad_fn = nnx.value_and_grad(loss_fn, argnums=nnx.DiffState(0, (params, params_grays)), has_aux=True)
     (loss, (recon_loss, latent, metrics)), grads_combined = grad_fn(model, x)
@@ -908,6 +931,15 @@ def main():
                         help=f"Strength of the graph deformation priors (relative edge strain + repulsion) with respect to the reconstruction loss: "
                              f"after the first epoch, the prior weight is set once (then kept fixed) so its gradient on the decoder is this fraction of the reconstruction gradient. "
                              f"Lower for larger motions, higher for stiffer ones, 0 disables it.")
+    parser.add_argument("--nested_dropout", required=False, type=float, default=0.0,
+                        help=f"Nested dropout on the decoded latent: each training sample keeps only its first k dimensions, k ~ Geometric(p), "
+                             f"so the dimensions are ordered by importance (PCA-like). Typical 0.1 to 0.5; 0 disables it.")
+    parser.add_argument("--noise_invariance_strength", required=False, type=float, default=0.0,
+                        help=f"Strength of the penalty 1 - correlation, per latent dimension, between the latents of the image and of the image with a second draw "
+                             f"of noise coloured like its background: after the first epoch, its weight is recalibrated every epoch "
+                             f"so its encoder gradient is this fraction of the reconstruction one. Typical 0.1 to 0.5; 0 disables it.")
+    parser.add_argument("--decoupling_lambda", required=False, type=float, default=1e-4,
+                        help=f"Weight of the decoupling regularization that makes the latent invariant to pose and CTF.")
     parser.add_argument("--strain_penalty", required=False, type=str, default="huber", choices=["huber", "bounded"],
                         help=f"Penalty on the relative edge strain. {bcolors.ITALIC}huber{bcolors.ENDC}: grows without limit with the strain; "
                              f"{bcolors.ITALIC}bounded{bcolors.ENDC}: saturates, so domains stay rigid while a contact between them can open at a fixed cost.")
@@ -1068,8 +1100,8 @@ def main():
         # Optimizers (Zernike3Deep)
         params = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('flow_decoder')))
         params_grays = nnx.All(nnx.Param, nnx.PathContains('phys_decoder'))
-        optimizer = nnx.Optimizer(zernike3deep, optax.adamw(args.learning_rate), wrt=params)
-        optimizer_grays = nnx.Optimizer(zernike3deep, optax.adamw(args.learning_rate), wrt=params_grays)  # TODO: Check if it is better to fix it to 1e-5 always
+        optimizer = nnx.Optimizer(zernike3deep, optax.adam(args.learning_rate), wrt=params)
+        optimizer_grays = nnx.Optimizer(zernike3deep, optax.adam(args.learning_rate), wrt=params_grays)  # TODO: Check if it is better to fix it to 1e-5 always
         graphdef, state = nnx.split((zernike3deep, optimizer, optimizer_grays))
 
         # Resume if checkpoint exists
@@ -1121,6 +1153,13 @@ def main():
                     bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
         iter_data_loader_train = iter(data_loader_train)
+        noise_filter, noise_lambda = None, 0.0
+        if args.noise_invariance_strength > 0.0 and not zernike3deep.isTomo:
+            background, noise_power = 1.0 - zernike3deep.particle_mask(), 0.0
+            for _ in range(16):
+                (x_n, _) = next(iter_data_loader_train)
+                noise_power += background_noise_power(jnp.asarray(x_n[..., 0], jnp.float32), background) / 16
+            noise_filter = noise_coloring_filter(noise_power)
         for total_steps in pbar:
             (x, labels) = next(iter_data_loader_train)
 
@@ -1143,6 +1182,18 @@ def main():
                                 graphdef, state, x_p, labels_p, md_columns, rng, do_update=False,
                                 per_image_contrast=args.per_image_contrast, strain_penalty=args.strain_penalty, probe=probe))
                     graph_lambda = args.deformation_strength * norms["data"] / max(norms["prior"], 5e-4 * norms["data"])
+
+                # Noise invariance weight such that its encoder gradient is --noise_invariance_strength times the reconstruction one
+                if noise_filter is not None and i >= 1:
+                    norms = {"encoder_data": 0.0, "noise": 0.0}
+                    for _ in range(max(1, min(PRIOR_CALIBRATION_BATCHES, steps_per_epoch // 10))):
+                        (x_p, labels_p) = next(iter_data_loader_train)
+                        for probe in norms:
+                            norms[probe] += float(train_step_zernike3deep(
+                                graphdef, state, x_p, labels_p, md_columns, rng, do_update=False,
+                                per_image_contrast=args.per_image_contrast, strain_penalty=args.strain_penalty, probe=probe,
+                                decoupling_lambda=args.decoupling_lambda, nested_dropout=args.nested_dropout, noise_filter=noise_filter))
+                    noise_lambda = args.noise_invariance_strength * norms["encoder_data"] / max(norms["noise"], 5e-4 * norms["encoder_data"])
 
                 # Log intermediate results at the end of the epoch
                 if logger.should("images", i):
@@ -1225,7 +1276,11 @@ def main():
                                                                             rigid_drift_lambda=args.rigid_drift_lambda,
                                                                             per_image_contrast=args.per_image_contrast,
                                                                             kl_lambda=args.kl_lambda,
-                                                                            strain_penalty=args.strain_penalty)
+                                                                            strain_penalty=args.strain_penalty,
+                                                                            decoupling_lambda=args.decoupling_lambda,
+                                                                            nested_dropout=args.nested_dropout,
+                                                                            noise_invariance_lambda=noise_lambda,
+                                                                            noise_filter=noise_filter)
             total_loss += loss
             total_recon_loss += recon_loss
 
@@ -1267,9 +1322,14 @@ def main():
                 writer.add_scalar('Deformation prior weight (Zernike3Deep)',
                                   float(graph_lambda),
                                   i * steps_per_epoch + step)
+                if noise_filter is not None:
+                    writer.add_scalars('Noise invariance (Zernike3Deep)',
+                                       {"loss": float(metrics["noise_inv"]), "weight": float(noise_lambda)},
+                                       i * steps_per_epoch + step)
+                noise_str = f" | noise_inv={float(metrics['noise_inv']):.3f}/{noise_lambda:.1e}" if noise_filter is not None else ""
 
                 # Progress bar update  (TQDM)
-                pbar.set_postfix_str(f"loss={mean_loss:.5f} | recon_loss={mean_recon_loss:.5f} | pose={float(metrics['pose_angle_deg']):.2f}deg/{float(metrics['shift_norm_px']):.2f}px | rigid={float(metrics['rigid_fraction']):.3f} | def={float(metrics['deformation_A']):.2f}/{float(metrics['deformation_p99_A']):.1f}A(mean/p99) | strain_p95={strain_p95:.3f} | signal={float(metrics['signal']):.2e} | graph_lambda={float(graph_lambda):.5f}")
+                pbar.set_postfix_str(f"loss={mean_loss:.5f} | recon_loss={mean_recon_loss:.5f} | pose={float(metrics['pose_angle_deg']):.2f}deg/{float(metrics['shift_norm_px']):.2f}px | rigid={float(metrics['rigid_fraction']):.3f} | def={float(metrics['deformation_A']):.2f}/{float(metrics['deformation_p99_A']):.1f}A(mean/p99){noise_str} | strain_p95={strain_p95:.3f} | signal={float(metrics['signal']):.2e} | graph_lambda={float(graph_lambda):.5f}")
 
             step += 1
             total_steps += 1
