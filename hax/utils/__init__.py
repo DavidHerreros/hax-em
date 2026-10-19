@@ -14,7 +14,7 @@ from .miscellaneous import (estimate_noise_stddev, filter_latent_space, batched_
                             sharpen_gaussian_envelope, estimate_particle_extent, equalize_masses, splat_cloud_volumes,
                             sparse_finite_3D_differences, build_graph_from_coordinates, sample_mask_points, safe_norm,
                             positional_encoding, soft_circular_mask, tilt_mean, tilt_mask, per_particle)
-from .whiten_filter import estimate_noise_psd, create_whitening_fn, whitening_filter_2d
+from .whiten_filter import estimate_noise_psd, create_whitening_fn, whitening_filter_2d, background_noise_power, noise_coloring_filter, colored_noise
 from .loggers import bcolors
 from .symmetry_groups import symmetry_matrices
 from .reconstruction import (reconstruct_consensus_volume, consensus_mask, volume_fsc, shell_relative_error,

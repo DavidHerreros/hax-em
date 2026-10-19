@@ -49,7 +49,7 @@ PRIOR_CALIBRATION_BATCHES = 16
 OCC_KAPPA = 0.1
 OCC_TV_RATIO = 1.0
 
-LATENT_SCALE = 0.05
+LATENT_SCALE = 1.0
 # resmlp encoder: images Fourier-cropped to this size; deterministic latent bounded to this many LATENT_SCALE units
 ENCODER_SIZE = 128
 LATENT_BOUND = 20.0
@@ -77,6 +77,12 @@ revivable_relu.defvjp(_revivable_relu_fwd, _revivable_relu_bwd)
 def bound_latent(latent):
     """Deterministic latent on the VAE scale: linear near zero, saturating at LATENT_BOUND units"""
     return LATENT_SCALE * LATENT_BOUND * jnp.tanh(latent / LATENT_BOUND)
+
+
+def nested_dropout_mask(key, shape, group, p):
+    """Keeps a geometric-length prefix of every group of latent dims (Rippel et al. 2014)"""
+    keep = jnr.geometric(key, p, shape[:-1] + (shape[-1] // group,))
+    return (jnp.arange(shape[-1]) % group < jnp.repeat(keep, group, axis=-1)).astype(jnp.float32)
 
 
 def bound_displacement(field):
@@ -361,7 +367,7 @@ class FiLMField(nnx.Module):
         self.hidden = nnx.List(hidden)
         self.film_gamma = nnx.List(film_gamma)
         self.film_beta = nnx.List(film_beta)
-        self.readout = Linear(width, out_features, rngs=rngs, kernel_init=zeros, bias_init=zeros)
+        self.readout = Linear(width, out_features, rngs=rngs, kernel_init=nnx.initializers.normal(1e-4), bias_init=zeros)
 
     def __call__(self, x, points):
         # Order-one latent into the modulation
@@ -388,8 +394,9 @@ class DeltaVolumeDecoder(nnx.Module):
         self.point_transformer = point_transformer
 
         # Indices to (normalized) coords
-        mins, maxs = coords.min(axis=0), coords.max(axis=0)
-        self.scale = 0.5 * max(maxs[0] - mins[0], maxs[1] - mins[1], maxs[2] - mins[2])
+        # mins, maxs = coords.min(axis=0), coords.max(axis=0)
+        # self.scale = 0.5 * max(maxs[0] - mins[0], maxs[1] - mins[1], maxs[2] - mins[2])
+        self.scale = 0.5 * volume_size
         self.centering = jnp.array((0.5 * volume_size, 0.5 * volume_size, 0.5 * volume_size))[None, None, ...]
         self.coords = ((coords[None, ...] - self.centering) / self.scale)
 
@@ -1084,7 +1091,8 @@ class HetSIREN(nnx.Module):
                                    "decoupling_lambda", "distance_preservation_lambda", "kl_lambda", "kl_free_bits",
                                    "geometric_lambda", "rigid_drift_lambda", "pose_refine_max_angle",
                                    "shift_refine_reg", "shift_refine_max",
-                                   "occupancy_strength", "per_image_contrast", "probe"))
+                                   "occupancy_strength", "per_image_contrast", "probe",
+                                   "nested_dropout"))
 def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_lambda=1e-4, graph_lambda=1e-4,
                         pose_refine_reg=0.1, decoupling_lambda=1e-4, distance_preservation_lambda=1e-4,
                         kl_lambda=1e-3, kl_free_bits=0.0, geometric_lambda=0.0,
@@ -1092,9 +1100,10 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
                         occ_alpha=1.0, occupancy_strength=0.0,
                         amp_recon_weight=0.1, per_image_contrast="off", rigid_drift_lambda=1.0,
                         loss_filter=None, ring_index=None, probe=None,
+                        nested_dropout=0.0, noise_invariance_lambda=0.0, noise_filter=None,
                         ):
     model, optimizer = nnx.merge(graphdef, state)
-    distributions_key, rot_sample_key, choice_key, random_pose_key, key = jnr.split(key, 5)
+    distributions_key, rot_sample_key, choice_key, random_pose_key, nested_key, noise_key, key = jnr.split(key, 7)
 
     # TODO: Explore sampling the posterior with M>1
     M = 1
@@ -1114,6 +1123,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
     calculate_repulsion_loss_batch = jax.vmap(calculate_repulsion_loss, in_axes=(0, None, None, None))
 
     def loss_fn(model, x):
+        x_raw = x
         x = model.prepare_images(x)
         x_in = x
 
@@ -1135,8 +1145,13 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
             else:
                 latent, (rotations_rigid, shifts_rigid, rotations_logscale) = model.encoder(x_in, return_alignment_refinement=True, rngs=distributions_key)
 
+        if probe == "encoder_data":
+            rotations_rigid, shifts_rigid = jax.lax.stop_gradient((rotations_rigid, shifts_rigid))
+
         # Decode volumes
         z_dec = sample if model.isVae else latent
+        if nested_dropout > 0.0:
+            z_dec = z_dec * nested_dropout_mask(nested_key, z_dec.shape, model.delta_volume_decoder.lat_motion, nested_dropout)
 
         dp_active = distance_preservation_lambda > 0.0
         coords, values, rigid_fraction, occ_change, rigid_drift = model.delta_volume_decoder(z_dec, occ_alpha=occ_alpha, return_diagnostics=True)
@@ -1295,6 +1310,16 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         else:
             kl_loss = 0.0
 
+        # Noise invariance: 1 - per dim correlation with the latent of a second noise draw (scale-free, collapse scores 1)
+        if noise_filter is not None and not model.isTomoSIREN:
+            x_noisy = x_raw + colored_noise(noise_key, x_raw.shape[:-1], noise_filter)[..., None]
+            latent_noisy = model(x_noisy, rngs=distributions_key, return_alignment_refinement=False)
+            z_a, z_b = latent - jnp.mean(latent, axis=0), latent_noisy - jnp.mean(latent_noisy, axis=0)
+            noise_corr = jnp.sum(z_a * z_b, axis=0) / jnp.sqrt(jnp.sum(z_a ** 2, axis=0) * jnp.sum(z_b ** 2, axis=0) + 1e-12)
+            noise_inv_loss = jnp.mean(1.0 - noise_corr)
+        else:
+            noise_inv_loss = 0.0
+
         # Variational loss (poses)
         if M > 1:
             # Importance weighting over the M sampled poses
@@ -1399,12 +1424,15 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         loss = (nll + kl_lambda * kl_loss + 0.000001 * kl_pose + decoupling_lambda * decoupling_loss
                 + l1_lambda * l1_loss + graph_lambda * loss_graph + 100. * hist_loss + distance_preservation_lambda * loss_dp
                 + pose_refine_reg * pose_refine_loss + shift_refine_reg * shift_refine_loss
-                + geometric_lambda * loss_geometric + loss_occupancy + rigid_drift_lambda * rigid_drift)
+                + geometric_lambda * loss_geometric + loss_occupancy + rigid_drift_lambda * rigid_drift
+                + noise_invariance_lambda * noise_inv_loss)
 
-        if probe == "data":
+        if probe in ("data", "encoder_data"):
             loss = nll
         elif probe == "prior":
             loss = loss_graph
+        elif probe == "noise":
+            loss = noise_inv_loss
 
         # Pose diagnostics
         theta_deg = jnp.rad2deg(jnp.arccos(jnp.clip(cos_theta_rigid, -1.0 + 1e-6, 1.0 - 1e-6)))
@@ -1427,7 +1455,8 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
                    "recon_mse": jnp.mean(recon_mse),
                    "occ_fraction": occ_fraction,
                    "latent_std": jnp.mean(jnp.std(latent, axis=0)),
-                   "latent_max": jnp.max(jnp.abs(latent))}
+                   "latent_max": jnp.max(jnp.abs(latent)),
+                   "noise_inv": noise_inv_loss}
         metrics = jax.lax.stop_gradient(metrics)
 
         return loss, (recon_loss.mean(), latent, metrics)
@@ -1484,8 +1513,9 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
 
     params = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('delta_volume_decoder')))
     if probe is not None:
-        decoder_params = nnx.All(nnx.Param, nnx.PathContains('delta_volume_decoder'))
-        grads = nnx.grad(lambda m, x: loss_fn(m, x)[0], argnums=nnx.DiffState(0, decoder_params))(model, x)
+        probe_path = 'encoder' if probe in ("encoder_data", "noise") else 'delta_volume_decoder'
+        probe_params = nnx.All(nnx.Param, nnx.PathContains(probe_path))
+        grads = nnx.grad(lambda m, x: loss_fn(m, x)[0], argnums=nnx.DiffState(0, probe_params))(model, x)
         return jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in jax.tree.leaves(grads)))
     grad_fn = nnx.value_and_grad(loss_fn, has_aux=True, argnums=nnx.DiffState(0, params))
     (loss, (recon_loss, latent, metrics)), grads = grad_fn(model, x)
@@ -1718,6 +1748,13 @@ def main():
                         help=f"Strength of the graph deformation priors (relative edge strain + repulsion) with respect to the reconstruction loss: "
                              f"after the first epoch, the prior weight is recalibrated every epoch so its gradient on the decoder is this fraction of the reconstruction gradient. "
                              f"The same value acts alike on every dataset; lower for larger motions, higher for stiffer ones, 0 disables it. Only with mass transport and a reference.")
+    parser.add_argument("--nested_dropout", required=False, type=float, default=0.0,
+                        help=f"Nested dropout on the decoded latent: each training sample keeps only its first k dimensions, k ~ Geometric(p), "
+                             f"so the dimensions are ordered by importance (PCA-like). Typical 0.1 to 0.5; 0 disables it.")
+    parser.add_argument("--noise_invariance_strength", required=False, type=float, default=0.0,
+                        help=f"Strength of the penalty 1 - correlation, per latent dimension, between the latents of the image and of the image with a second draw "
+                             f"of noise coloured like its background: after the first epoch, its weight is recalibrated every epoch "
+                             f"so its encoder gradient is this fraction of the reconstruction one. Typical 0.1 to 0.5; 0 disables it.")
     parser.add_argument("--decoupling_lambda", required=False, type=float, default=1e-4,
                         help=f"Weight of the decoupling regularization that makes the latent invariant to pose and CTF.")
     parser.add_argument("--distance_preservation_lambda", required=False, type=float, default=1e-4,
@@ -1987,6 +2024,13 @@ def main():
         # Whitening: Fourier rings of the loss (corners pooled into the Nyquist ring, then masked out)
         iter_data_loader_train = iter(data_loader_train)
         loss_filter, ring_index = None, None
+        noise_filter, noise_lambda = None, 0.0
+        if args.noise_invariance_strength > 0.0 and not hetsiren.isTomoSIREN:
+            background, noise_power = 1.0 - hetsiren.particle_mask(), 0.0
+            for _ in range(16):
+                (x_n, _) = next(iter_data_loader_train)
+                noise_power += background_noise_power(jnp.asarray(x_n[..., 0], jnp.float32), background) / 16
+            noise_filter = noise_coloring_filter(noise_power)
         if args.whiten_loss:
             freq = np.fft.fftfreq(hetsiren.xsize) * hetsiren.xsize
             ring_index_np = np.minimum(np.round(np.hypot(freq[:, None], freq[None, :])), hetsiren.xsize // 2).astype(np.int32)
@@ -2014,9 +2058,9 @@ def main():
         params = nnx.All(nnx.Param, (nnx.PathContains('encoder'), nnx.PathContains('delta_volume_decoder')))
         params_inv = nnx.All(nnx.Param, nnx.PathContains('inverse_volume_decoder'))
         if args.grad_clip_norm and args.grad_clip_norm > 0:
-            tx = optax.chain(optax.clip_by_global_norm(args.grad_clip_norm), optax.adamw(lr_value, eps=1e-12))
+            tx = optax.chain(optax.clip_by_global_norm(args.grad_clip_norm), optax.adam(lr_value))
         else:
-            tx = optax.adamw(lr_value, eps=1e-12)
+            tx = optax.adam(lr_value)
         optimizer = nnx.Optimizer(hetsiren, tx, wrt=params)
         optimizer_inv = nnx.Optimizer(hetsiren, optax.adam(1e-4), wrt=params_inv)
         graphdef, state = nnx.split((hetsiren, optimizer))
@@ -2135,6 +2179,19 @@ def main():
                                     per_image_contrast=args.per_image_contrast, probe=probe))
                         graph_lambda = args.deformation_strength * norms["data"] / max(norms["prior"], 5e-4 * norms["data"])
 
+                    # Same calibration for the noise invariance, on the encoder
+                    if noise_filter is not None and i >= 1:
+                        norms = {"encoder_data": 0.0, "noise": 0.0}
+                        for _ in range(max(1, min(PRIOR_CALIBRATION_BATCHES, steps_per_epoch // 10))):
+                            (x_p, labels_p) = next(iter_data_loader_train)
+                            for probe in norms:
+                                norms[probe] += float(train_step_hetsiren(
+                                    graphdef, state, x_p, labels_p, md_columns, rng, do_update=False,
+                                    occ_alpha=occ_alpha, amp_recon_weight=amp_recon_weight,
+                                    per_image_contrast=args.per_image_contrast, probe=probe,
+                                    nested_dropout=args.nested_dropout, noise_filter=noise_filter))
+                        noise_lambda = args.noise_invariance_strength * norms["encoder_data"] / max(norms["noise"], 5e-4 * norms["encoder_data"])
+
                     # Log intermediate results at the begining of the epoch.
                     if logger.should("images", i):
                         with logger.section():
@@ -2234,7 +2291,10 @@ def main():
                                                                    amp_recon_weight=amp_recon_weight,
                                                                    per_image_contrast=args.per_image_contrast,
                                                                    loss_filter=loss_filter,
-                                                                   ring_index=ring_index)
+                                                                   ring_index=ring_index,
+                                                                   nested_dropout=args.nested_dropout,
+                                                                   noise_invariance_lambda=noise_lambda,
+                                                                   noise_filter=noise_filter)
 
                 if ring_index is not None:
                     ring_sum, ring_n = ring_sum + pose_metrics["ring_power"], ring_n + 1
@@ -2295,6 +2355,10 @@ def main():
                     writer.add_scalar('Explained signal (HetSIREN)',
                                       float(pose_metrics["signal"]),
                                       i * steps_per_epoch + step)
+                    if noise_filter is not None:
+                        writer.add_scalars('Noise invariance (HetSIREN)',
+                                           {"loss": float(pose_metrics["noise_inv"]), "weight": float(noise_lambda)},
+                                           i * steps_per_epoch + step)
                     writer.add_scalar('Deformation prior weight (HetSIREN)',
                                       float(graph_lambda),
                                       i * steps_per_epoch + step)
@@ -2308,6 +2372,7 @@ def main():
                                 f"def={deformation_A:.2f}/{deformation_p99_A:.1f}A(mean/p99)")
                     # Scientific notation: the values span several decades
                     occ_str = f" | occ={occ_fraction:.2e}" if transport_mass else ""
+                    occ_str += f" | noise_inv={float(pose_metrics['noise_inv']):.3f}/{noise_lambda:.1e}" if noise_filter is not None else ""
                     if args.transport_mass:
                         pbar.set_postfix_str(f"loss={mean_loss:.5f} | recon_loss={mean_recon_loss:.5f} | {pose_str}{occ_str} | strain_p95={strain_p95:.3f} | signal={float(pose_metrics['signal']):.2e} | graph_lambda={float(graph_lambda):.5f}")
                     else:

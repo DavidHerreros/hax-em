@@ -225,3 +225,22 @@ def create_whitening_fn(
         return jnp.expand_dims(whitened_images, axis=-1)
 
     return whiten_batch
+
+
+def background_noise_power(images: jax.Array, background: jax.Array) -> jax.Array:
+    """Mean 2D power spectrum (ortho FFT) of (B, H, W) images under a soft background mask, corrected for the mask."""
+    mean = jnp.sum(images * background, axis=(-2, -1), keepdims=True) / jnp.sum(background)
+    power = jnp.square(jnp.abs(fft.fft2((images - mean) * background, norm="ortho")))
+    return jnp.mean(power, axis=0) / jnp.mean(jnp.square(background))
+
+
+def noise_coloring_filter(power_2d: jax.Array) -> jax.Array:
+    """Unshifted 2D filter turning unit white noise into noise with the radial average of power_2d."""
+    r, n_rings = _radius_grid(power_2d.shape)
+    total_power = jnp.bincount(r.ravel(), weights=fft.fftshift(power_2d).ravel(), length=n_rings)
+    radial_psd = total_power / jnp.maximum(jnp.bincount(r.ravel(), length=n_rings), 1)
+    return fft.ifftshift(jnp.sqrt(radial_psd)[r])
+
+
+def colored_noise(key: jax.Array, shape: Tuple[int, ...], noise_filter: jax.Array) -> jax.Array:
+    return jnp.real(fft.ifft2(fft.fft2(jax.random.normal(key, shape)) * noise_filter))
