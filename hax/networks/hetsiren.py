@@ -79,12 +79,6 @@ def bound_latent(latent):
     return LATENT_SCALE * LATENT_BOUND * jnp.tanh(latent / LATENT_BOUND)
 
 
-def nested_dropout_mask(key, shape, group, p):
-    """Keeps a geometric-length prefix of every group of latent dims (Rippel et al. 2014)"""
-    keep = jnr.geometric(key, p, shape[:-1] + (shape[-1] // group,))
-    return (jnp.arange(shape[-1]) % group < jnp.repeat(keep, group, axis=-1)).astype(jnp.float32)
-
-
 def bound_displacement(field):
     """Soft isotropic bound: identity near zero, norm below MAX_DISPLACEMENT."""
     return field / jnp.sqrt(1.0 + jnp.sum(jnp.square(field), axis=-1, keepdims=True) / MAX_DISPLACEMENT ** 2)
