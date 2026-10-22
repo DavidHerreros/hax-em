@@ -6,7 +6,7 @@ def _distance_activation(pairwise_distances, mean_neighbour_distance):
     """A continuous assignment of 'neighbour-like-ness'."""
     cutoff = mean_neighbour_distance
     # Clamp distances between tau and 1.5 * tau
-    x2 = jnp.clip(pairwise_distances, a_min=cutoff, a_max=1.5 * cutoff)
+    x2 = jnp.clip(pairwise_distances, min=cutoff, max=1.5 * cutoff)
     # Quadratic kernel logic
     activation = (1.0 - (4.0 / cutoff ** 2.) * (x2 - cutoff) ** 2.) ** 2.
     return activation
@@ -15,9 +15,9 @@ def _distance_activation(pairwise_distances, mean_neighbour_distance):
 def _neighbour_activation(neighbours_per_point, minimum=1.0, maximum=3.0):
     """Quadratic penalisation on number of neighbours outside range."""
     # Penalty for too few neighbors
-    x1 = jnp.clip(neighbours_per_point, a_max=minimum)
+    x1 = jnp.clip(neighbours_per_point, max=minimum)
     # Penalty for too many neighbors
-    x2 = jnp.clip(neighbours_per_point, a_min=maximum)
+    x2 = jnp.clip(neighbours_per_point, min=maximum)
     return (x1 - minimum) ** 2. + (x2 - maximum) ** 2.
 
 
@@ -85,7 +85,7 @@ def calculate_repulsion_loss(positions, radius_graph, tau, edge_weights=None, ep
 
     # Relative penalty once a pair gets closer than half of tau (scalar spacing or per-edge rest distance)
     cutoff = 0.5 * tau
-    penalty = jnp.clip(distances, a_max=cutoff)
+    penalty = jnp.clip(distances, max=cutoff)
     penalty = jnp.abs(penalty - cutoff) / cutoff
     if edge_weights is not None:
         return jnp.sum(edge_weights * penalty) / (jnp.sum(edge_weights) + eps)
@@ -98,7 +98,7 @@ def calculate_outlier_loss(positions, knn_graph, tau, eps=1e-8):
     distances = jnp.sqrt(jnp.sum(diffs ** 2., axis=-1) + eps)
 
     cutoff = 1.5 * tau
-    penalty = jnp.clip(distances, a_min=cutoff)
+    penalty = jnp.clip(distances, min=cutoff)
     return jnp.mean((penalty - cutoff) ** 2.)
 
 def calculate_neighbour_loss(positions, radius_graph, tau, num_points, eps=1e-8):
@@ -252,7 +252,7 @@ def geometric_correction_loss(latents, model, eps=1e-8):
     gram_determinant = jnp.linalg.det(gram)           # (B,)
 
     # Geometric correction loss (clip guards against tiny negative dets)
-    loss = jnp.square(1. - jnp.sqrt(jnp.clip(gram_determinant, a_min=0.0) + eps)).mean()
+    loss = jnp.square(1. - jnp.sqrt(jnp.clip(gram_determinant, min=0.0) + eps)).mean()
 
     return loss
 
@@ -362,5 +362,5 @@ def composed_geometric_correction_loss(latents, render_point_fn, ctx, num_output
     grams = jax.vmap(gram_one)(latents, ctx, keys)     # (B, d, d)
     gram_determinant = jnp.linalg.det(grams)           # (B,)
 
-    loss = jnp.square(1. - jnp.sqrt(jnp.clip(gram_determinant, a_min=0.0) + eps)).mean()
+    loss = jnp.square(1. - jnp.sqrt(jnp.clip(gram_determinant, min=0.0) + eps)).mean()
     return loss

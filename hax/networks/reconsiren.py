@@ -210,9 +210,9 @@ def repulsion_loss(
 
 def rot6d_to_matrix(rotations_6d):
     a1, a2 = jnp.split(rotations_6d, 2, axis=-1)
-    b1 = a1 / jnp.clip(jnp.linalg.norm(a1, axis=-1, keepdims=True), a_min=1e-6)
+    b1 = a1 / jnp.clip(jnp.linalg.norm(a1, axis=-1, keepdims=True), min=1e-6)
     a2_ortho = a2 - jnp.sum(a2 * b1, axis=-1, keepdims=True) * b1
-    b2 = a2_ortho / jnp.clip(jnp.linalg.norm(a2_ortho, axis=-1, keepdims=True), a_min=1e-6)
+    b2 = a2_ortho / jnp.clip(jnp.linalg.norm(a2_ortho, axis=-1, keepdims=True), min=1e-6)
     b3 = jnp.cross(b1, b2, axis=-1)
     return jnp.stack([b1, b2, b3], axis=-1)
 

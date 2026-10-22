@@ -373,7 +373,7 @@ def triplet_loss(
 
     # Negative term ‑‑ push dissimilar samples apart (only if within margin)
     # loss_neg = jnp.square(jnp.clip(margin - dist_neg, a_min=0.0))
-    loss_neg = jnp.clip(margin - dist_neg, a_min=0.0)
+    loss_neg = jnp.clip(margin - dist_neg, min=0.0)
 
     per_pair = 0.5 * (loss_pos + loss_neg)   # 0.5 is conventional; optional
 
