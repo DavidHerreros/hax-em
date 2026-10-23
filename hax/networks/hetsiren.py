@@ -544,7 +544,8 @@ class DeltaVolumeDecoder(nnx.Module):
 
         return gauged.astype(field.dtype), rigid_fraction
 
-    def __call__(self, x, c=None, occ_alpha=1.0, return_diagnostics=False):
+    def __call__(self, x, c=None, occ_alpha=1.0, return_diagnostics=False, ref_delta=None):
+        ref = self.coords if ref_delta is None else self.coords + ref_delta
         if self.transport_mass:
             if self.point_transformer:
                 # Disjoint latent subspaces for the two pathways
@@ -572,7 +573,7 @@ class DeltaVolumeDecoder(nnx.Module):
 
             elif self.is_implicit and self.film_heads:
                 if c is None:
-                    c = self.coords[0]
+                    c = ref[0]
                 x_coords, x_map = jnp.split(x, indices_or_sections=2, axis=-1)
                 x_coords = x if self.motion_only else x_coords
                 x_coords = self.hidden_coords(x_coords, c)
@@ -581,7 +582,7 @@ class DeltaVolumeDecoder(nnx.Module):
             elif self.is_implicit:
                 # Query coords
                 if c is None:
-                    c = self.coords[0]
+                    c = ref[0]
                 c = jnp.tile(c[None, ...], (x.shape[0], 1, 1))
 
                 # Adjust latents
@@ -627,8 +628,8 @@ class DeltaVolumeDecoder(nnx.Module):
 
             delta_coords, delta_values = x_coords, x_map
 
-            # TODO: Leaving this to consider a corrected (possibly learnable) consensus
-            c0, w0 = self.coords, self.reference_values
+            # Reference (positions learnable with --learn_reference_epochs)
+            c0, w0 = ref, self.reference_values
 
             # Rigid motion correction for the field
             raw_coords = delta_coords.astype(jnp.float32)
@@ -1081,12 +1082,53 @@ class HetSIREN(nnx.Module):
             raise UserWarning("The network was not trained with decoder inversion support.")
 
 
+@jax.jit
+def reference_adam(coords, grad, m, v, t, lr, b1=0.9, b2=0.999, eps=1e-8):
+    """Adam step on the reference positions"""
+    m = b1 * m + (1.0 - b1) * grad
+    v = b2 * v + (1.0 - b2) * grad ** 2
+    step = lr * (m / (1.0 - b1 ** t)) / (jnp.sqrt(v / (1.0 - b2 ** t)) + eps)
+    return coords - step, m, v
+
+
+@jax.jit
+def deformed_reference(graphdef, state, x):
+    model, _ = nnx.merge(graphdef, state)
+    latent = model(x, return_alignment_refinement=False)
+    coords, _ = model.delta_volume_decoder(latent)
+    return coords / model.delta_volume_decoder.scale
+
+
+def recenter_reference(graphdef, state, loader, n_candidates, n_keep=100):
+    """Reference <- per point mean of the deformed positions of the least deformed particles (DynaMight consensus update)"""
+    dv = state[0]['delta_volume_decoder']
+    c0 = np.asarray(dv['coords'])
+    deformed, norms, n = [], [], 0
+    while n < n_candidates:
+        x, _ = next(loader)
+        d = np.asarray(deformed_reference(graphdef, state, x))
+        deformed.append(d)
+        norms.append(np.sqrt(np.sum((d - c0) ** 2, axis=(1, 2))))
+        n += d.shape[0]
+    keep = np.argsort(np.concatenate(norms))[:n_keep]
+    dv['coords'] = jnp.asarray(np.concatenate(deformed)[keep].mean(0, keepdims=True), dtype=jnp.float32)
+    return state
+
+
+def update_rest_lengths(state):
+    """The rest lengths of the graph prior follow the reference"""
+    dv = state[0]['delta_volume_decoder']
+    c, (i, j) = dv['coords'][0], dv['edge_index']
+    dv['consensus_distances'] = jnp.sqrt(jnp.sum((c[i] - c[j]) ** 2, axis=-1) + 1e-12)
+    return state
+
+
 @partial(jax.jit, static_argnames=("do_update", "l1_lambda", "pose_refine_reg",
                                    "decoupling_lambda", "distance_preservation_lambda", "kl_lambda", "kl_free_bits",
                                    "geometric_lambda", "rigid_drift_lambda", "pose_refine_max_angle",
                                    "shift_refine_reg", "shift_refine_max",
                                    "occupancy_strength", "per_image_contrast", "probe",
-                                   "nested_dropout"))
+                                   "nested_dropout", "freeze_networks"))
 def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_lambda=1e-4, graph_lambda=1e-4,
                         pose_refine_reg=0.1, decoupling_lambda=1e-4, distance_preservation_lambda=1e-4,
                         kl_lambda=1e-3, kl_free_bits=0.0, geometric_lambda=0.0,
@@ -1095,6 +1137,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
                         amp_recon_weight=0.1, per_image_contrast="off", rigid_drift_lambda=1.0,
                         loss_filter=None, ring_index=None, probe=None,
                         nested_dropout=0.0, noise_invariance_lambda=0.0, noise_filter=None,
+                        ref_delta=None, freeze_networks=False,
                         ):
     model, optimizer = nnx.merge(graphdef, state)
     distributions_key, rot_sample_key, choice_key, random_pose_key, nested_key, noise_key, key = jnr.split(key, 7)
@@ -1116,7 +1159,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
     calculate_strain_loss_batch = jax.vmap(calculate_strain_loss, in_axes=(0, None, None, None))
     calculate_repulsion_loss_batch = jax.vmap(calculate_repulsion_loss, in_axes=(0, None, None, None))
 
-    def loss_fn(model, x):
+    def loss_fn(model, x, ref_delta=None):
         x_raw = x
         x = model.prepare_images(x)
         x_in = x
@@ -1148,7 +1191,7 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
             z_dec = z_dec * nested_dropout_mask(nested_key, z_dec.shape, model.delta_volume_decoder.lat_motion, nested_dropout)
 
         dp_active = distance_preservation_lambda > 0.0
-        coords, values, rigid_fraction, occ_change, rigid_drift = model.delta_volume_decoder(z_dec, occ_alpha=occ_alpha, return_diagnostics=True)
+        coords, values, rigid_fraction, occ_change, rigid_drift = model.delta_volume_decoder(z_dec, occ_alpha=occ_alpha, return_diagnostics=True, ref_delta=ref_delta)
 
         # Get rotation matrices
         if euler_angles.ndim == 2:
@@ -1511,13 +1554,19 @@ def train_step_hetsiren(graphdef, state, x, labels, md, key, do_update=True, l1_
         probe_params = nnx.All(nnx.Param, nnx.PathContains(probe_path))
         grads = nnx.grad(lambda m, x: loss_fn(m, x)[0], argnums=nnx.DiffState(0, probe_params))(model, x)
         return jnp.sqrt(sum(jnp.sum(jnp.square(g)) for g in jax.tree.leaves(grads)))
-    grad_fn = nnx.value_and_grad(loss_fn, has_aux=True, argnums=nnx.DiffState(0, params))
-    (loss, (recon_loss, latent, metrics)), grads = grad_fn(model, x)
+    if ref_delta is not None:
+        grad_fn = nnx.value_and_grad(loss_fn, has_aux=True, argnums=(nnx.DiffState(0, params), 2))
+        (loss, (recon_loss, latent, metrics)), (grads, ref_grad) = grad_fn(model, x, ref_delta)
+        metrics = dict(metrics, ref_grad=ref_grad)
+    else:
+        grad_fn = nnx.value_and_grad(loss_fn, has_aux=True, argnums=nnx.DiffState(0, params))
+        (loss, (recon_loss, latent, metrics)), grads = grad_fn(model, x)
 
     if do_update:
         grads, _ = grads.split(params, ...)
 
-        optimizer.update(model, grads)
+        if not freeze_networks:
+            optimizer.update(model, grads)
 
         # Update memory bank
         model.memory_bank.enqueue(latent)
@@ -1680,6 +1729,14 @@ def main():
                   help=f"Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data - "
                        f"{bcolors.WARNING}NOTE{bcolors.ENDC}: If a reference volume was provided, HetSIREN also learns a gray level adjustment. In this case, "
                        f"reload must be the path to a folder containing two additional folders called: {bcolors.UNDERLINE}HetSIREN{bcolors.ENDC} and {bcolors.UNDERLINE}Gaussian_volume_fitting{bcolors.ENDC})")
+    parser.add_argument("--refit_reference", action='store_true',
+                        help=f"With {bcolors.ITALIC}--reload{bcolors.ENDC} in train mode: fit the Gaussians to {bcolors.ITALIC}--vol{bcolors.ENDC} (e.g. a MoDART map) and fine tune the reloaded "
+                             f"network on them. Needs a network trained with mass transport and an implicit or point transformer decoder.")
+    parser.add_argument("--learn_reference_epochs", required=False, type=int, default=0,
+                        help="Learn the positions of the reference Gaussians during the first N epochs, then freeze them. "
+                             "Needs mass transport and an implicit decoder.")
+    parser.add_argument("--reference_lr", required=False, type=float, default=None,
+                        help=f"Step size of {bcolors.ITALIC}--learn_reference_epochs{bcolors.ENDC} (default: 2e-4 * sqrt(batch_size / 128))")
     parser.add_argument("--denoising_strength", required=False, type=float, default=1e-4,
                         help=f"Weight of the L1 denoising on the decoded densities (recommended range 0.0001 to 0.1).")
     parser.add_argument("--implicit_network", action='store_true',
@@ -1858,9 +1915,17 @@ def main():
     rng = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
     rng, model_key, choice_key = jax.random.split(rng, 3)
 
-    # Reload network
+    # Reload network (with --refit_reference it is rebuilt below on the Gaussians of --vol)
     if args.reload is not None:
-        hetsiren = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "HetSIREN"))
+        reloaded = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "HetSIREN"))
+        refit_reference = args.refit_reference and args.mode == "train"
+        if not refit_reference:
+            hetsiren = reloaded
+        elif args.vol is None or not reloaded.config["transport_mass"] or not (reloaded.config["is_implicit"] or reloaded.config["point_transformer"]):
+            raise ValueError(f"{bcolors.FAIL}--refit_reference needs --vol and a network trained with mass transport and an implicit "
+                             f"or point transformer decoder.{bcolors.ENDC}")
+        else:
+            transport_mass = True
 
 
     # Train network
@@ -1946,20 +2011,33 @@ def main():
             if not use_vae:
                 print(f"\n{bcolors.WARNING}--kl_lambda is 0: disabling the VAE (using a deterministic latent).{bcolors.ENDC}")
 
-            hetsiren = HetSIREN(args.lat_dim, vol, mask, coords, values,
-                                generator.md.getMetaDataImage(0).shape[0], args.sr, sigma=sigma,
-                                ctf_type=args.ctf_type, decoupling=True, isVae=use_vae, transport_mass=transport_mass,
-                                local_reconstruction=local_reconstruction, bank_size=10000,
-                                isTomoSIREN=isTomoSIREN, is_implicit=use_implicit,
-                                point_transformer=use_point_transformer, film_heads=args.film_heads,
-                                motion_only=args.motion_only, train_inverse=train_inverse,
-                                loss_type=args.loss_type,
-                                rigid_gauge=args.rigid_gauge != "off",
-                                rigid_gauge_irls=3 if args.rigid_gauge == "core" else 0,
-                                lattice_stride=args.lattice_stride,
-                                bilinear_scatter=args.bilinear_scatter, normalize_images=args.normalize_images,
-                                particle_radius=particle_radius, model_version=HETSIREN_MODEL_VERSION, architecture=args.encoder_arch,
-                                rngs=nnx.Rngs(model_key))
+            if args.reload is not None:
+                # Architecture of the reloaded network, new reference, reloaded weights (and batch statistics)
+                config = {k: v for k, v in reloaded.config.items() if k != "_target_"}
+                config.update(reference_volume=vol, reconstruction_mask=mask, coords=coords, values=values, sigma=sigma)
+                hetsiren = HetSIREN(**config, rngs=nnx.Rngs(model_key))
+                weights = nnx.Any(nnx.Param, nnx.BatchStat)
+                source = dict(nnx.to_flat_state(nnx.state(reloaded, weights)))
+                target = nnx.to_flat_state(nnx.state(hetsiren, weights))
+                kept = [p for p, v in target if p in source and source[p].shape == v.shape]
+                nnx.update(hetsiren, nnx.from_flat_state([(p, source[p] if p in kept else v) for p, v in target]))
+                print(f"{bcolors.OKGREEN}Reference refitted ({coords.shape[0]} Gaussians); {len(kept)}/{len(target)} reloaded weight arrays kept{bcolors.ENDC}")
+                del reloaded
+            else:
+                hetsiren = HetSIREN(args.lat_dim, vol, mask, coords, values,
+                                    generator.md.getMetaDataImage(0).shape[0], args.sr, sigma=sigma,
+                                    ctf_type=args.ctf_type, decoupling=True, isVae=use_vae, transport_mass=transport_mass,
+                                    local_reconstruction=local_reconstruction, bank_size=10000,
+                                    isTomoSIREN=isTomoSIREN, is_implicit=use_implicit,
+                                    point_transformer=use_point_transformer, film_heads=args.film_heads,
+                                    motion_only=args.motion_only, train_inverse=train_inverse,
+                                    loss_type=args.loss_type,
+                                    rigid_gauge=args.rigid_gauge != "off",
+                                    rigid_gauge_irls=3 if args.rigid_gauge == "core" else 0,
+                                    lattice_stride=args.lattice_stride,
+                                    bilinear_scatter=args.bilinear_scatter, normalize_images=args.normalize_images,
+                                    particle_radius=particle_radius, model_version=HETSIREN_MODEL_VERSION, architecture=args.encoder_arch,
+                                    rngs=nnx.Rngs(model_key))
 
             if args.rigid_gauge != "off" and not hetsiren.delta_volume_decoder.gauge.available:
                 print(f"\n{bcolors.WARNING}--rigid_gauge {args.rigid_gauge} was requested, but without mass transport the gauge needs a reference "
@@ -2128,13 +2206,24 @@ def main():
         if not os.path.isdir(os.path.join(args.output_path, "HetSIREN_No_Inv")):
             print(f"{bcolors.OKCYAN}\n###### Training variability... ######")
 
-            i = 0
+            i = resume_epoch
             graph_prior = args.vol is not None and hetsiren.delta_volume_decoder.transport_mass and args.deformation_strength > 0
             graph_lambda = 0.0
             amp_recon_weight = jnp.float32(args.recon_split_final)
             pbar = tqdm(range(resume_epoch * steps_per_epoch, args.epochs * steps_per_epoch), file=sys.stdout,
                         ascii=" >=", colour="green",
                         bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
+
+            # Learned reference positions: own Adam state
+            if args.learn_reference_epochs > 0:
+                dv = hetsiren.delta_volume_decoder
+                if not dv.transport_mass or dv.point_transformer:
+                    raise ValueError(f"{bcolors.FAIL}--learn_reference_epochs needs mass transport and an implicit decoder.{bcolors.ENDC}")
+                ref_lr = args.reference_lr or 2e-4 * np.sqrt(args.batch_size / 128)
+                ref_zeros = jnp.zeros_like(state[0]['delta_volume_decoder']['coords'])
+                ref_m, ref_v, ref_t = ref_zeros, ref_zeros, 0
+                ref_start = np.asarray(state[0]['delta_volume_decoder']['coords'])
+
             for total_steps in pbar:
                 (x, labels) = next(iter_data_loader_train)
 
@@ -2160,6 +2249,15 @@ def main():
                             ring_weight = np.bincount(ring_index_np.ravel(), weight.ravel(), minlength=len(ring_counts)) / ring_counts
                             loss_filter = jnp.asarray(np.sqrt(weight), jnp.float32)
                         ring_sum, ring_n = 0.0, 0
+
+                    # Learned reference: re-centring every 3 epochs; the prior's rest lengths follow it until it is frozen
+                    if 0 < args.learn_reference_epochs and i <= args.learn_reference_epochs:
+                        if i % 3 == 1 and i < args.learn_reference_epochs:
+                            state = recenter_reference(graphdef, state, iter_data_loader_train, min(2048, len(generator.md)))
+                        state = update_rest_lengths(state)
+                        moved = np.asarray(state[0]['delta_volume_decoder']['coords']) - ref_start
+                        print(f"\nReference moved {np.sqrt(np.mean(np.sum(moved ** 2, -1))) * 0.5 * hetsiren.xsize * hetsiren.sr:.2f} A RMS"
+                              f"{' (frozen from now on)' if i == args.learn_reference_epochs else ''}")
 
                     # Prior weight such that its decoder gradient is --deformation_strength times the reconstruction one
                     if graph_prior and i >= 1:
@@ -2267,9 +2365,11 @@ def main():
                 else:
                     occ_alpha = 1.0
 
+                ref_on = i - 1 < args.learn_reference_epochs
+                ref_only = ref_on and (i - 1) % 3 == 2
                 loss, recon_loss, pose_metrics, state, rng = train_step_hetsiren(graphdef, state, x, labels, md_columns, rng,
                                                                    l1_lambda=args.denoising_strength,
-                                                                   graph_lambda=graph_lambda,
+                                                                   graph_lambda=0.0 if ref_only else graph_lambda,
                                                                    pose_refine_reg=args.pose_refine_reg,
                                                                    pose_refine_max_angle=args.pose_refine_max_angle,
                                                                    shift_refine_reg=args.shift_refine_reg,
@@ -2288,10 +2388,17 @@ def main():
                                                                    ring_index=ring_index,
                                                                    nested_dropout=args.nested_dropout,
                                                                    noise_invariance_lambda=noise_lambda,
-                                                                   noise_filter=noise_filter)
+                                                                   noise_filter=noise_filter,
+                                                                   ref_delta=ref_zeros if ref_on else None,
+                                                                   freeze_networks=ref_only)
 
                 if ring_index is not None:
                     ring_sum, ring_n = ring_sum + pose_metrics["ring_power"], ring_n + 1
+
+                if ref_on:
+                    ref_t += 1
+                    state[0]['delta_volume_decoder']['coords'], ref_m, ref_v = reference_adam(
+                        state[0]['delta_volume_decoder']['coords'], pose_metrics["ref_grad"], ref_m, ref_v, ref_t, ref_lr)
 
                 total_loss += loss
                 total_recon_loss += recon_loss
@@ -2379,6 +2486,11 @@ def main():
             # Export the EMA-averaged weights as the final model
             if ema_params is not None:
                 nnx.update(hetsiren, ema_params)
+
+            if args.learn_reference_epochs > 0:
+                dv = hetsiren.delta_volume_decoder
+                ImageHandler().write(np.asarray(dv.decode_consensus_volume(sigma=hetsiren.sigma)[0]),
+                                     os.path.join(args.output_path, "learned_reference.mrc"), overwrite=True)
 
             # Save model
             NeuralNetworkCheckpointer.save(hetsiren, os.path.join(args.output_path, "HetSIREN_No_Inv"))
