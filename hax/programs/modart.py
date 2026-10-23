@@ -1,357 +1,194 @@
 #!/usr/bin/env python
 
 
+from functools import partial
+
+import numpy as np
 import jax
 from jax import numpy as jnp
-from jax.scipy.ndimage import map_coordinates
 from flax import nnx
-import dm_pix
-
-from einops import rearrange
 
 from hax.utils import *
-from hax.layers import *
-from hax.programs.gaussian_volume_fitting import FastVariableBlur3D
+from hax.utils.reconstruction import _fsc_filter
 
 
-def mse(a, b):
-    return jnp.mean(jnp.square(a - b), axis=(-3, -2, -1))
+def warped_detector_coords(vox, field, rotations, shifts, xsize):
+    """(row, col) on the 2x oversampled detector of the warped and rotated voxels"""
+    coords = jnp.matmul(vox[None, ...] + field, jnp.swapaxes(rotations, -1, -2))
+    q = coords[..., :2] - shifts[:, None, :] + 0.5 * xsize
+    return 2.0 * jnp.stack([q[..., 1], q[..., 0]], axis=-1)
 
 
-class DeltaVolume(nnx.Module):
-    def __init__(self, total_voxels, volume_size, inds, reference_values, num_maps=1, *, rngs: nnx.Rngs):
-        self.volume_size = volume_size
-        self.inds = inds
-        self.reference_values = reference_values
-        self.total_voxels = total_voxels
-        self.num_maps = num_maps
-        # initializer = jax.nn.initializers.glorot_uniform()
+def bilinear_corners(q, size):
+    """Flat indices and weights (B, C, 4) of the detector pixels around each point; corners off the detector weigh zero"""
+    base = jnp.floor(q)
+    t = q - base
+    base = base.astype(jnp.int32)
+    idx, w = [], []
+    for dr, dc in ((0, 0), (1, 0), (0, 1), (1, 1)):
+        r, c = base[..., 0] + dr, base[..., 1] + dc
+        inside = (r >= 0) & (r < size) & (c >= 0) & (c < size)
+        idx.append(jnp.clip(r, 0, size - 1) * size + jnp.clip(c, 0, size - 1))
+        w.append(jnp.where(inside, (t[..., 0] if dr else 1.0 - t[..., 0]) * (t[..., 1] if dc else 1.0 - t[..., 1]), 0.0))
+    return jnp.stack(idx, axis=-1), jnp.stack(w, axis=-1)
 
-        # Indices to (normalized) coords
-        self.factor = 0.5 * volume_size
-        coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)[None, ...]
-        self.coords = (coords - self.factor) / self.factor
 
-        if jnp.all(reference_values) == 0:
-            self.lambda_parameter = 1.0
-        else:
-            self.lambda_parameter = nnx.Param(1e-4)
+def knn_field_chunk(fields, idx, weights):
+    """Displacement (B, C, 3) at C voxels from the field (B, G, 3) on the model points"""
+    field = 0.0
+    for j in range(idx.shape[1]):
+        field = field + weights[None, :, j, None] * fields[:, idx[:, j], :]
+    return field
 
-        # Learnable parameters (keep this in case it is useful in the future)
-        # if self.num_maps == 1:
-        #     self.params = nnx.Param(initializer(jax.random.key(0), (1, total_voxels * 4,), jnp.float32))
-        # else:
-        #     self.params = [nnx.Param(initializer(jax.random.key(0), (1, total_voxels * 4,), jnp.float32)),
-        #                              nnx.Param(initializer(jax.random.key(1), (1, total_voxels * 4,), jnp.float32))]
 
-        hidden_linear = [Linear(in_features=total_voxels * 3, out_features=8, rngs=rngs, dtype=jnp.bfloat16,
-                                     kernel_init=siren_init_first(c=1.))]
-        for _ in range(4):
-            hidden_linear.append(Linear(in_features=8, out_features=8, rngs=rngs, dtype=jnp.bfloat16, kernel_init=siren_init(c=1.)))
-        self.hidden_linear = nnx.List(hidden_linear)
+def splat_deapodization(xsize):
+    """Inverse transfer of the bilinear splat on the 2x oversampled detector, on the rfft2 grid of the detector"""
+    fy, fx = np.fft.fftfreq(xsize), np.fft.rfftfreq(xsize)
+    return jnp.asarray(1.0 / (np.sinc(0.5 * fy)[:, None] ** 2 * np.sinc(0.5 * fx)[None, :] ** 2), jnp.float32)
 
-        if self.num_maps == 1:
-            self.params = Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs)
-        else:
-            params = [Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs),
-                      Linear(in_features=8, out_features=4 * total_voxels, rngs=rngs)]
-            self.params = nnx.List(params)
 
-    def __call__(self):
-        # (keep this in case it is useful in the future)
-        # if self.num_maps == 2:
-        #     params = jnp.concatenate(self.params, axis=0)
-        # else:
-        #     params = self.params
+def detector_pipeline(img_os, deapod, ctf, ctf_type, xsize):
+    """Oversampled splat -> detector (Fourier crop, splat kernel divided out) -> CTF"""
+    ft = jnp.fft.rfft2(img_os)
+    ft = jnp.concatenate([ft[:, :(xsize + 1) // 2, :xsize // 2 + 1], ft[:, ft.shape[1] - xsize // 2:, :xsize // 2 + 1]], axis=1)
+    img = jnp.fft.irfft2(ft * deapod, s=(xsize, xsize))
+    if ctf_type in ("apply", "wiener"):
+        img = ctfFilter(img, ctf, pad_factor=2)
+    return img
 
-        coords = self.coords.flatten()[None, ...]
 
-        # Decode voxel values
-        x = jnp.sin(1.0 * self.hidden_linear[0](coords))
-        for layer in self.hidden_linear[1:]:
-            x = jnp.sin(x + 1.0 * layer(x))
+def warped_corners(c, chunk, vox, knn_idx, knn_w, fields, rotations, shifts, xsize):
+    sl = lambda a: jax.lax.dynamic_slice_in_dim(a, c * chunk, chunk, axis=0)
+    field = 0.0 if fields is None else knn_field_chunk(fields, sl(knn_idx), sl(knn_w))
+    return bilinear_corners(warped_detector_coords(sl(vox), field, rotations, shifts, xsize), 2 * xsize)
 
-        if self.num_maps == 1:
-            params = self.params(x)
-        else:
-            params = jnp.concatenate([self.params[0](x), self.params[1](x)], axis=0)
 
-        # Extract delta_coords and values
-        x = jnp.reshape(self.lambda_parameter * params, (self.num_maps, self.total_voxels, 4))
-        delta_coords, delta_values = x[..., :3], x[..., 3]
+@partial(jax.jit, static_argnames=("xsize", "chunk", "ctf_type"))
+def project_maps(X, half, vox, knn_idx, knn_w, fields, rotations, shifts, ctf, deapod, xsize, chunk, ctf_type):
+    """A X: the projection of each particle's map (X[half]) through its motion, pose and CTF"""
+    B, size = rotations.shape[0], 2 * xsize
+    offsets = (jnp.arange(B) * size * size)[:, None, None]
 
-        # Recover volume values (TODO: Check if applying ReLu is really needed)
-        values = nnx.relu(self.reference_values + delta_values)
+    def splat(c, img):
+        idx, w = warped_corners(c, chunk, vox, knn_idx, knn_w, fields, rotations, shifts, xsize)
+        values = jax.lax.dynamic_slice_in_dim(X, c * chunk, chunk, axis=1)[half]
+        return img.at[(idx + offsets).ravel()].add((w * values[..., None]).ravel())
 
-        # Recover coords (non-normalized)
-        coords = self.factor * (self.coords + delta_coords)
+    img_os = jax.lax.fori_loop(0, vox.shape[0] // chunk, splat, jnp.zeros(B * size * size))
+    return detector_pipeline(img_os.reshape(B, size, size), deapod, ctf, ctf_type, xsize)
 
-        return coords, values
 
-    def decode_volume(self, filter=True):
-        # Decode volume values
-        coords, values = self.__call__()
+@partial(jax.jit, static_argnames=("xsize", "chunk", "ctf_type", "forward"))
+def backproject_residual(X, data, valid, half, vox, knn_idx, knn_w, fields, rotations, shifts, ctf, deapod,
+                         xsize, chunk, ctf_type, forward=True):
+    """A^T (data - A X), one row per map; the adjoint is the warped back-projection of the residual"""
+    B, size = rotations.shape[0], 2 * xsize
+    residual = data
+    if forward:
+        residual = data - project_maps(X, half, vox, knn_idx, knn_w, fields, rotations, shifts, ctf, deapod,
+                                       xsize, chunk, ctf_type)
+    residual = valid[:, None, None] * residual
 
-        # Displace coordinates
-        coords = coords + self.factor
+    pipeline = lambda img: detector_pipeline(img, deapod, ctf, ctf_type, xsize)
+    _, pipeline_t = jax.vjp(pipeline, jnp.zeros((B, size, size)))
+    residual = pipeline_t(residual)[0].reshape(B, size * size)
+    maps = jax.nn.one_hot(half, X.shape[0]).T
 
-        # Place values on grid
-        grids = jnp.zeros((self.num_maps, self.volume_size, self.volume_size, self.volume_size))
+    def backproject(c, out):
+        idx, w = warped_corners(c, chunk, vox, knn_idx, knn_w, fields, rotations, shifts, xsize)
+        values = jnp.sum(w * jnp.take_along_axis(residual, idx.reshape(B, -1), axis=1).reshape(idx.shape), axis=-1)
+        return jax.lax.dynamic_update_slice_in_dim(out, maps @ values, c * chunk, axis=1)
 
-        # Scatter volume
-        bposf = jnp.floor(coords)
-        bposi = bposf.astype(jnp.int32)
-        bposf = coords - bposf
+    return jax.lax.fori_loop(0, vox.shape[0] // chunk, backproject, jnp.zeros_like(X))
 
-        bamp0 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
-        bamp1 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
-        bamp2 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
-        bamp3 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
-        bamp4 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
-        bamp5 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
-        bamp6 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
-        bamp7 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
 
-        bamp = jnp.concat([bamp0, bamp1, bamp2, bamp3, bamp4, bamp5, bamp6, bamp7], axis=1)
-        bposi = jnp.concat(
-            [bposi, bposi + jnp.array((1, 0, 0)), bposi + jnp.array((0, 1, 0)), bposi + jnp.array((0, 0, 1)),
-             bposi + jnp.array((0, 1, 1)), bposi + jnp.array((1, 0, 1)), bposi + jnp.array((1, 1, 0)),
-             bposi + jnp.array((1, 1, 1))], axis=1)
+def half_map_fsc(vol_a, vol_b, support, seed=0):
+    """Half-map FSC under a soft support, corrected for the support edge by phase randomisation (Chen et al. 2013)"""
+    from scipy.ndimage import binary_dilation, gaussian_filter
+    from scipy.fft import fftn, ifftn
+    box = vol_a.shape[0]
+    n = box // 2 + 1
+    w = np.clip(gaussian_filter(binary_dilation(support, iterations=2).astype(np.float64), 2.0), 0.0, 1.0)
+    f = np.fft.fftfreq(box)
+    shells = np.round(np.sqrt(f[:, None, None] ** 2 + f[None, :, None] ** 2 + f[None, None, :] ** 2) * box).astype(int).ravel()
 
-        def scatter_volume(vol, bpos_i, bamp_i):
-            return vol.at[bpos_i[..., 2], bpos_i[..., 1], bpos_i[..., 0]].add(bamp_i)
+    def fsc(a, b):
+        A, B = fftn(a * w, workers=-1).ravel(), fftn(b * w, workers=-1).ravel()
+        s = lambda v: np.bincount(shells, v, minlength=n)[:n]
+        return s(np.real(A * np.conj(B))) / np.sqrt(s(np.abs(A) ** 2) * s(np.abs(B) ** 2) + 1e-30)
 
-        grids = jax.vmap(scatter_volume, in_axes=(0, 0, 0))(grids, bposi, bamp)
+    raw = fsc(vol_a, vol_b)
+    k0 = int(np.argmax(raw < 0.8)) if np.any(raw < 0.8) else n
+    rng = np.random.default_rng(seed)
 
-        # Filter volume
-        if filter:
-            grids = jax.vmap(low_pass_3d)(grids)
+    def randomise(v):
+        F = fftn(v, workers=-1)
+        phase = np.angle(fftn(rng.standard_normal(v.shape), workers=-1))
+        return np.real(ifftn(np.where(shells.reshape(v.shape) > k0, np.abs(F) * np.exp(1j * phase), F), workers=-1))
 
-        if self.num_maps == 1:
-            return grids[0]
-        else:
-            return grids[0], grids[1]
+    rand = fsc(randomise(vol_a), randomise(vol_b))
+    corrected = np.where(np.arange(n) > k0, (raw - rand) / (1.0 - rand + 1e-9), raw)
 
-class PhysDecoder:
-    def __init__(self, xsize):
-        self.xsize = xsize
+    # The correction is unstable for a few shells past the randomisation start: bridge them
+    gap = np.arange(k0 + 1, min(k0 + 5, n - 1))
+    if gap.size:
+        corrected[gap] = np.interp(gap, [k0, gap[-1] + 1], corrected[[k0, gap[-1] + 1]])
+    return corrected
 
-    def __call__(self, x, values, coords, xsize, rotations, shifts, ctf, ctf_type, filter=True):
-        # Volume factor
-        factor = 0.5 * xsize
 
-        # Apply rotation matrices
-        coords = jnp.matmul(coords, rearrange(rotations, "b r c -> b c r"))
+@partial(jax.jit, static_argnames=("xsize", "ctf_type"))
+def batch_geometry(md, labels, rot_refine, shift_refine, sym, sr, xsize, ctf_type):
+    """Rotations, shifts and CTFs of a batch, repeated once per symmetry operator"""
+    euler_angles = md["euler_angles"][labels]
+    rotations = euler_matrix_batch(euler_angles[:, 0], euler_angles[:, 1], euler_angles[:, 2])
+    rotations = jnp.matmul(rotations, rot_refine)
+    shifts = md["shifts"][labels] + shift_refine
+    rotations = jnp.einsum("gji,bjk->gbik", sym, rotations).reshape(-1, 3, 3)
+    shifts = jnp.tile(shifts, (sym.shape[0], 1))
 
-        # Apply shifts
-        coords = coords[..., :-1] - shifts[:, None, :] + factor
-
-        # Scatter image
-        B = rotations.shape[0]
-        c_sampling = jnp.stack([coords[..., 1], coords[..., 0]], axis=2)
-        images = jnp.zeros((B, xsize, xsize), dtype=x.dtype)
-
-        bposf = jnp.floor(c_sampling)
-        bposi = bposf.astype(jnp.int32)
-        bposf = c_sampling - bposf
-
-        bamp0 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1])
-        bamp1 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1])
-        bamp2 = values * (bposf[:, :, 0]) * (bposf[:, :, 1])
-        bamp3 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1])
-        bamp = jnp.concat([bamp0, bamp1, bamp2, bamp3], axis=1)
-        bposi = jnp.concat([bposi, bposi + jnp.array((1, 0)), bposi + jnp.array((1, 1)), bposi + jnp.array((0, 1))], axis=1)
-
-        def scatter_img(image, bpos_i, bamp_i):
-            return image.at[bpos_i[..., 0], bpos_i[..., 1]].add(bamp_i)
-
-        images = jax.vmap(scatter_img)(images, bposi, bamp)
-
-        # Gaussian filter (needed by forward interpolation)
-        if filter:
-            images = dm_pix.gaussian_blur(images[..., None], 1.0, kernel_size=3)[..., 0]
-
-        # Apply CTF
-        if ctf_type in ["apply", "wiener", "squared"]:
-            images = ctfFilter(images, ctf, pad_factor=2)
-
-        return images
-
-class MoDART(nnx.Module):
-    def __init__(self, reference_volume, reconstruction_mask, xsize, sr, ctf_type="apply",
-                 symmetry_group="c1", reconstruct_halves=False, *, rngs: nnx.Rngs):
-        super(MoDART, self).__init__()
-        self.xsize = xsize
-        self.ctf_type = ctf_type
-        self.sr = sr
-        self.reference_volume = reference_volume
-        self.reconstruction_mask = reconstruction_mask.astype(float)
-        self.inds = jnp.asarray(jnp.where(reconstruction_mask > 0.0)).T
-        self.symmetry_matrices = symmetry_matrices(symmetry_group)
-        self.num_maps = 2 if reconstruct_halves else 1
-        reference_values = reference_volume[self.inds[..., 0], self.inds[..., 1], self.inds[..., 2]][None, ...]
-        self.delta_volume_decoder = DeltaVolume(self.inds.shape[0], self.xsize, self.inds, reference_values,
-                                                num_maps=self.num_maps, rngs=rngs)
-        self.phys_decoder = PhysDecoder(self.xsize)
-
-    def __call__(self, **kwargs):
-        return self.delta_volume_decoder.decode_volume(**kwargs)
+    ctf = None
+    if ctf_type not in (None, "None"):
+        ctf = computeCTF(md["ctfDefocusU"][labels], md["ctfDefocusV"][labels], md["ctfDefocusAngle"][labels],
+                         md["ctfSphericalAberration"][labels], md["ctfVoltage"][labels][0], sr,
+                         [2 * xsize, xsize + 1], labels.shape[0], True)
+    return rotations, shifts, ctf
 
 
 @jax.jit
-def single_step_modart(graphdef, state, x, labels, md, fields_modart, key):
-    model, optimizer = nnx.merge(graphdef, state)
-
-    # Random keys
-    key, choice_key = jax.random.split(key, 2)
-
-    # Vmap functions
-    phys_decoder = jax.vmap(model.phys_decoder, in_axes=(1, 1, 1, None, 1, 1, 1, None), out_axes=1)
-    wiener2DFilter_vmap = jax.vmap(wiener2DFilter, in_axes=(1, 1, None), out_axes=1)
-    ctfFilter_vmap = jax.vmap(ctfFilter, in_axes=(1, 1, None), out_axes=1)
-
-    def loss_fn(model, x):
-        # Decode volume
-        coords, values = model.delta_volume_decoder()
-
-        # Random symmetry matrices
-        random_indices = jax.random.choice(choice_key, jnp.arange(model.symmetry_matrices.shape[0]), shape=(rotations.shape[0],))
-        rotations_sym = jnp.matmul(jnp.transpose(model.symmetry_matrices[random_indices], (0, 2, 1))[:, None, ...], rotations)
-
-        # Generate projections
-        images_corrected = phys_decoder(x, values[None, ...], fields_modart + coords[None, ...], model.xsize, rotations_sym, shifts, ctf, model.ctf_type)
-
-        # Losses
-        images_corrected_loss = images_corrected[..., 0] if images_corrected.shape[-1] == 1 else images_corrected
-        x_loss = x[..., 0] if x.shape[-1] == 1 else x
-
-        # Consider CTF if Wiener/Squared mode (only for loss)
-        if model.ctf_type == "wiener":
-            x_loss = wiener2DFilter_vmap(x_loss, ctf, 2)
-            images_corrected_loss = wiener2DFilter_vmap(images_corrected_loss, ctf, 2)
-        elif model.ctf_type == "squared":
-            x_loss = ctfFilter_vmap(x_loss, ctf, 2)
-            images_corrected_loss = ctfFilter_vmap(images_corrected_loss, ctf, 2)
-
-        recon_loss = mse(images_corrected_loss[..., None], x_loss[..., None])
-
-        # L1 based denoising
-        l1_loss = jnp.mean(jnp.abs(values))
-
-        # L1 and L2 total variation
-        diff_x, diff_y, diff_z = sparse_finite_3D_differences(values, model.inds, model.xsize)
-        l1_grad_loss = jnp.abs(diff_x).mean() + jnp.abs(diff_z).mean() + jnp.abs(diff_y).mean()
-        l2_grad_loss = jnp.square(diff_x).mean() + jnp.square(diff_z).mean() + jnp.square(diff_y).mean()
-
-        loss = recon_loss.mean() + 0.001 * l1_loss + 0.001 * (l1_grad_loss + l2_grad_loss)
-        return loss, recon_loss.mean(axis=0)
-
-    # Labels to single batch size
-    labels_broadcasted = jnp.reshape(labels, (-1, ))
-
-    # Precompute batch aligments
-    euler_angles = md["euler_angles"][labels_broadcasted]
-    rotations = euler_matrix_batch(euler_angles[..., 0], euler_angles[..., 1], euler_angles[..., 2])
-    rotations = jnp.reshape(rotations, (labels.shape[0], labels.shape[1], 3, 3))
-
-    # Precompute batch shifts
-    shifts = md["shifts"][labels_broadcasted]
-    shifts = jnp.reshape(shifts, (labels.shape[0], labels.shape[1], 2))
-
-    # Precompute batch CTFs
-    if model.ctf_type is not None:
-        defocusU = md["ctfDefocusU"][labels_broadcasted]
-        defocusV = md["ctfDefocusV"][labels_broadcasted]
-        defocusAngle = md["ctfDefocusAngle"][labels_broadcasted]
-        cs = md["ctfSphericalAberration"][labels_broadcasted]
-        kv = md["ctfVoltage"][labels_broadcasted][0]
-        ctf = computeCTF(defocusU, defocusV, defocusAngle, cs, kv,
-                         model.sr, [2 * model.xsize, int(2 * 0.5 * model.xsize + 1)],
-                         labels_broadcasted.shape[0], True)
-    else:
-        ctf = jnp.ones([labels_broadcasted.shape[0], 2 * model.xsize, int(2.0 * 0.5 * model.xsize + 1)], dtype=x.dtype)
-    ctf = jnp.reshape(ctf, (labels.shape[0], labels.shape[1], ctf.shape[-2], ctf.shape[-1]))
-
-    if model.ctf_type == "precorrect":
-        # Wiener filter
-        x = wiener2DFilter_vmap(x[..., 0], ctf, 2)[..., None]
-
-    grad_fn = nnx.value_and_grad(loss_fn, has_aux=True)
-    (loss, recon_loss), grads = grad_fn(model, x)
-
-    optimizer.update(model, grads)
-
-    state = nnx.state((model, optimizer))
-
-    return loss, recon_loss, state
-
-
-@jax.jit
-def interpolate_image_field(graphdef, state, images, initial_inds_modart):
-    xsize = images.shape[1]
+def encode_particles(graphdef, state, images):
+    """Latents and refined poses of the motion model"""
     model = nnx.merge(graphdef, state)
-    map_coordinates_vmap = jax.vmap(map_coordinates, in_axes=(-1, None, None), out_axes=-1)
-    factor = xsize / model.xsize
-    initial_scale = 0.5 * model.xsize
-    scale = 0.5 * xsize
+    images = jax.image.resize(images, (images.shape[0], model.xsize, model.xsize, 1), method="bilinear")
+    latents, (rotations, shifts) = model(images)
+    return latents, rotations, shifts
 
-    # Get coordinates and field
-    images_resized = jax.image.resize(images, (images.shape[0], model.xsize, model.xsize, 1), method='bilinear')
-    fields, initial_coords = model.decode_field(images_resized)
-    # fields_values = jnp.concatenate((fields, values[..., None]), axis=-1)
-    initial_coords = jnp.round(initial_scale * initial_coords + initial_scale).astype(jnp.int32)
-    fields = scale * fields
-    initial_inds_modart = initial_inds_modart / factor
 
-    # Empty grids
-    grids = jnp.zeros((images.shape[0], model.xsize, model.xsize, model.xsize, 3))
-
-    # Place values on grid
-    def place_on_single_grid(grid, inds, values):
-        grid = grid.at[inds[..., 2], inds[..., 1], inds[..., 0], 0].set(values[..., 0])
-        grid = grid.at[inds[..., 2], inds[..., 1], inds[..., 0], 1].set(values[..., 1])
-        grid = grid.at[inds[..., 2], inds[..., 1], inds[..., 0], 2].set(values[..., 2])
-        # grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2], 0].set(values[..., 3])
-        return grid
-    place_on_grids = jax.vmap(place_on_single_grid, in_axes=(0, None, 0))
-    grids = place_on_grids(grids, initial_coords, fields)
-
-    # Low pass filter grids
-    gaussian_filter = FastVariableBlur3D((model.xsize, model.xsize, model.xsize))
-    grids = gaussian_filter(grids, sigma=1.0)
-    fields_modart = []
-    for grid in grids:
-        fields_modart.append(map_coordinates_vmap(grid, initial_inds_modart.T, 1))
-    fields_modart = jnp.stack(fields_modart, axis=0)
-
-    return fields_modart
+@partial(jax.jit, static_argnames=("xsize",))
+def decode_fields(graphdef, state, latents, xsize):
+    """Field on the model points and those points, centred voxel units of the reconstruction box"""
+    model = nnx.merge(graphdef, state)
+    fields, coords = model.decode_field(latents)
+    return 0.5 * xsize * fields, 0.5 * xsize * jnp.reshape(coords, (-1, 3))
 
 
 def main():
     import os
     import sys
-    import shutil
+    import time
     from tqdm import tqdm
-    import random
-    import numpy as np
     import argparse
     from xmipp_metadata.image_handler import ImageHandler
-    import optax
-    from contextlib import closing, ExitStack
-    from flax.training.early_stopping import EarlyStopping
     from hax.generators import MetaDataGenerator, extract_columns
-    from hax.metrics import JaxSummaryWriter, TrainingLogger
-    from hax.networks import VolumeAdjustment, train_step_volume_adjustment
-    from hax.schedulers import CosineAnnealingScheduler
+    from hax.metrics import JaxSummaryWriter
     from hax.checkpointer import NeuralNetworkCheckpointer
 
     from hax.cli import common_args as ca
 
     parser = argparse.ArgumentParser()
     ca.add_md(parser)
-    ca.add_vol(parser, help="If provided, MoDART will perform a refinement of this volume")
+    ca.add_vol(parser, help="If provided, MoDART starts from this volume, after matching its contrast to the images")
     ca.add_mask(parser,
-                help=f"Determines the initial position of the mass available to MoDART to reconstruct a volume. This mask can be tight to the input volume (if provided). "
+                help=f"Determines the voxels MoDART reconstructs. If not provided, it is derived from --vol, or from a consensus reconstruction of the particles. "
                      f"{bcolors.WARNING}WARNING{bcolors.ENDC}: The mask provided here MUST be BINARY.")
     ca.add_load_images_to_ram(parser)
     ca.add_sr(parser)
@@ -359,329 +196,250 @@ def main():
     ca.add_ctf_type(parser)
     ca.add_batch_size(parser)
     parser.add_argument("--reconstruct_halves", action="store_true",
-                        help="If not provided, MoDART will reconstruct a single volume. Otherwise, MoDART will reconstruct two half maps by splitting the dataset into even/odd parts.")
+                        help="Also write the two unfiltered half maps (even/odd particles). They are always reconstructed: their FSC filters the final map.")
     parser.add_argument("--motion_correction", type=str,
                         help=f"If provided, MoDART will perform a motion correction while reconstructing the volume to reduce motion blurring. Otherwise, a standard reconstruction is performed. "
                              f"{bcolors.WARNING} NOTE {bcolors.ENDC}: When providing this parameter, you MUST give the path to a trained {bcolors.UNDERLINE} HetSIREN (with transport of mass) "
                              f"{bcolors.ENDC} or {bcolors.UNDERLINE} Zernike3Deep {bcolors.ENDC} neural network.")
+    parser.add_argument("--iterations", required=False, type=int, default=10,
+                        help=f"Conjugate gradient iterations, one pass over the particles each (default {bcolors.ITALIC}10{bcolors.ENDC}). More iterations recover finer detail and also fit more noise.")
+    parser.add_argument("--regularization", required=False, type=float, default=0.0,
+                        help=f"Tikhonov weight, relative to the mean diagonal of the normal equations (default {bcolors.ITALIC}0{bcolors.ENDC}).")
+    parser.add_argument("--chunk_size", required=False, type=int, default=65536,
+                        help=f"Voxels projected at a time (default {bcolors.ITALIC}65536{bcolors.ENDC}). Lower it if the GPU runs out of memory; it does not change the result.")
     ca.add_output_path(parser)
     ca.add_ssd_scratch_folder(parser)
     ca.add_logging_args(parser, landscape=False, checkpoint=False)
     args = ca.parse_with_config(parser)
 
+    batch_size = 8 if args.batch_size == "auto" else int(args.batch_size)
+    ctf_type = None if args.ctf_type in (None, "None") else args.ctf_type
+    if ctf_type == "wiener":
+        print(f"{bcolors.WARNING}--ctf_type wiener: the CTF is part of the least-squares model, which already inverts it; using apply.{bcolors.ENDC}")
+    os.makedirs(args.output_path, exist_ok=True)
+
     # Prepare metadata
     generator = MetaDataGenerator(args.md)
     md_columns = extract_columns(generator.md)
+    n_particles = len(generator.md)
+    xsize = generator.md.getMetaDataImage(0).shape[0]
 
-    # Prepare grain dataset
-    if not args.load_images_to_ram:
+    # Images: in RAM, or streamed from ArrayRecord shards
+    if args.load_images_to_ram:
+        images_ram = generator.load_images_to_ram()
+    else:
         mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
         generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4,
                                              precision=np.float16, group_size=1, shard_size=10000)
 
-    # Preprocess volume (and mask)
-    xsize = generator.md.getMetaDataImage(0).shape[0]
-    if args.vol is not None:
-        vol = ImageHandler(args.vol).getData()
-    else:
-        vol = np.zeros((xsize, xsize, xsize))
+    def image_batches():
+        if args.load_images_to_ram:
+            for s in range(0, n_particles, batch_size):
+                yield images_ram[s:s + batch_size], np.arange(s, min(s + batch_size, n_particles))
+        else:
+            loader = generator.return_grain_dataset(batch_size=batch_size, shuffle=False, num_epochs=1, num_workers=2,
+                                                    load_to_ram=False)
+            for x, labels in loader:
+                yield np.asarray(x, np.float32), np.asarray(labels)
 
+    # Volume and mask
+    vol = ImageHandler(args.vol).getData() if args.vol is not None else None
     if args.mask is not None:
         mask = ImageHandler(args.mask).getData()
     else:
-        mask = ImageHandler().createCircularMask(boxSize=xsize, radius=int(0.25 * xsize), is3D=True)
+        reference = vol
+        if reference is None:
+            reference = reconstruct_consensus_volume(generator.md, md_columns, args.sr, use_ctf=ctf_type is not None, batch_size=256,
+                                                     scratch_dir=args.ssd_scratch_folder or args.output_path)
+            ImageHandler().write(reference, os.path.join(args.output_path, "consensus_reconstruction.mrc"), overwrite=True)
+        mask = consensus_mask(reference)
+        ImageHandler().write(mask, os.path.join(args.output_path, "consensus_mask.mrc"), overwrite=True)
+        print(f"{bcolors.OKGREEN}Reconstruction mask derived from the {'input' if vol is not None else 'consensus'} volume: "
+              f"{int(mask.sum())} voxels{bcolors.ENDC}")
 
-    # If exists, clean MMAP
-    # if mmap and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap")):
-    #     shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap"))
+    # Reconstruction voxels (centred, x-y-z), padded to a whole number of chunks
+    inds = np.argwhere(mask > 0.0)
+    n_vox = inds.shape[0]
+    chunk = int(min(args.chunk_size, int(2 ** np.ceil(np.log2(n_vox)))))
+    n_pad = int(np.ceil(n_vox / chunk) * chunk)
+    vox = np.full((n_pad, 3), 1e6, np.float32)
+    vox[:n_vox] = inds[:, ::-1] - 0.5 * xsize
+    vox = jnp.asarray(vox)
+    support = jnp.asarray(np.arange(n_pad) < n_vox, jnp.float32)
+    iz, iy, ix = (jnp.asarray(inds[:, k]) for k in range(3))
+    num_maps = 2
+    sym = jnp.asarray(symmetry_matrices(args.symmetry_group), jnp.float32)
+    deapod = splat_deapodization(xsize)
 
-    # Random keys
-    rng = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
-    rng, model_key = jax.random.split(rng, 2)
-
-    # MoDART model
-    modart = MoDART(vol, mask, xsize, args.sr, ctf_type=args.ctf_type, symmetry_group=args.symmetry_group,
-                  reconstruct_halves=args.reconstruct_halves, rngs=nnx.Rngs(model_key))
-
-    # Volume adjustment (only if reference volume is provided)
-    if args.vol is not None:
-        # Extract mask coords
-        inds = np.asarray(np.where(mask > 0.0)).T
-        values = vol[inds[:, 0], inds[:, 1], inds[:, 2]]
-        factor = 0.5 * vol.shape[0]
-        coords = jnp.stack([inds[:, 2], inds[:, 1], inds[:, 0]], axis=1)
-        coords = (coords - factor) / factor
-
-        # Define volume adjustment network
-        volumeAdjustment = VolumeAdjustment(lat_dim=3, coords=coords, values=values, predicts_value=True, rngs=nnx.Rngs(model_key))
-
+    # Motion model: latents and refined poses once, the field from the latents in every pass
+    knn_idx = knn_w = None
+    latents = rot_refine = shift_refine = None
     if args.motion_correction is not None:
-        # Reload network to perform motion correction
         model = NeuralNetworkCheckpointer.load(args.motion_correction)
-        graphdef_motion_correction, state_motion_correction = nnx.split(model)
+        model.eval()
+        graphdef_mc, state_mc = nnx.split(model)
+        model_xsize = model.xsize
+        del model
 
-    # Prepare summary writer
-    writer = JaxSummaryWriter(os.path.join(args.output_path, "MoDART_metrics"))
+        print(f"{bcolors.OKCYAN}\n###### Encoding particles with the motion model... ######{bcolors.ENDC}")
+        # Stored by label: the streamed loader does not return particles in metadata order
+        for x, labels in tqdm(image_batches(), total=int(np.ceil(n_particles / batch_size)), file=sys.stdout,
+                              ascii=" >=", colour="green", bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}"):
+            z, r, s = encode_particles(graphdef_mc, state_mc, jnp.asarray(x))
+            if latents is None:
+                latents = np.zeros((n_particles, z.shape[-1]), np.float32)
+                rot_refine = np.zeros((n_particles, 3, 3), np.float32)
+                shift_refine = np.zeros((n_particles, 2), np.float32)
+            latents[labels], rot_refine[labels], shift_refine[labels] = np.asarray(z), np.asarray(r), np.asarray(s)
+        shift_refine = shift_refine * (xsize / model_xsize)
 
-    # Jitted functions for volume prediction
+        _, source = decode_fields(graphdef_mc, state_mc, jnp.asarray(latents[:1]), xsize)
+        knn_idx, knn_w = build_knn_field_operator(np.asarray(source), np.asarray(vox[:n_vox]))
+        knn_idx = jnp.pad(knn_idx, ((0, n_pad - n_vox), (0, 0)))
+        knn_w = jnp.pad(knn_w, ((0, n_pad - n_vox), (0, 0)))
+        print(f"{bcolors.OKGREEN}Motion field carried from {source.shape[0]} model points to {n_vox} voxels; "
+              f"refined poses: {np.rad2deg(np.mean(np.arccos(np.clip((np.trace(rot_refine, axis1=1, axis2=2) - 1) / 2, -1, 1)))):.2f} deg mean, "
+              f"{np.sqrt(np.mean(shift_refine ** 2)):.2f} px RMS shift{bcolors.ENDC}")
+
+    def geometry(labels):
+        """Per-batch arrays, padded to the batch size and repeated per symmetry operator"""
+        n = labels.shape[0]
+        labels_p = np.pad(labels, (0, batch_size - n))
+        valid = np.tile(np.arange(batch_size) < n, sym.shape[0]).astype(np.float32)
+        half = np.tile(labels_p % 2, sym.shape[0])
+        if latents is None:
+            rr, ss, fields = np.tile(np.eye(3, dtype=np.float32), (batch_size, 1, 1)), np.zeros((batch_size, 2), np.float32), None
+        else:
+            rr, ss = rot_refine[labels_p], shift_refine[labels_p]
+            fields, _ = decode_fields(graphdef_mc, state_mc, jnp.asarray(latents[labels_p]), xsize)
+            fields = jnp.tile(fields, (sym.shape[0], 1, 1))
+        rotations, shifts, ctf = batch_geometry(md_columns, jnp.asarray(labels_p), jnp.asarray(rr), jnp.asarray(ss), sym,
+                                                args.sr, xsize, ctf_type)
+        ctf_rep = None if ctf is None else jnp.tile(ctf, (sym.shape[0], 1, 1))
+        return dict(valid=jnp.asarray(valid), half=jnp.asarray(half), fields=fields, rotations=rotations, shifts=shifts,
+                    ctf=ctf_rep), ctf
+
+    def data_term(x, ctf):
+        x = jnp.asarray(np.pad(x[..., 0], ((0, batch_size - x.shape[0]), (0, 0), (0, 0))))
+        if ctf_type == "precorrect":
+            x = wiener2DFilter(x, ctf, 2)
+        return jnp.tile(x, (sym.shape[0], 1, 1))
+
+    common = dict(vox=vox, knn_idx=knn_idx, knn_w=knn_w, deapod=deapod, xsize=xsize, chunk=chunk, ctf_type=ctf_type)
+
+    # Starting map, contrast matched to the images as in HetSIREN / Zernike3Deep (median of per-image slopes)
+    X0 = jnp.zeros((num_maps, n_pad))
+    if vol is not None:
+        x0 = jnp.pad(jnp.asarray(vol[inds[:, 0], inds[:, 1], inds[:, 2]], jnp.float32), (0, n_pad - n_vox))
+        X0 = jnp.tile(x0[None], (num_maps, 1))
+        slopes, n_target = [], min(8192, n_particles)
+        for x, labels in image_batches():
+            g, ctf = geometry(labels)
+            p = project_maps(X0, g["half"], fields=g["fields"], rotations=g["rotations"], shifts=g["shifts"], ctf=g["ctf"], **common)
+            p, t = np.asarray(p[:labels.shape[0]]), np.asarray(data_term(x, ctf)[:labels.shape[0]])
+            p, t = p - p.mean((1, 2), keepdims=True), t - t.mean((1, 2), keepdims=True)
+            var_p = np.mean(p * p, (1, 2))
+            slopes.append(np.where(var_p > 0, np.mean(p * t, (1, 2)) / np.maximum(var_p, 1e-30), np.nan))
+            if sum(len(s) for s in slopes) >= n_target:
+                break
+        slopes = np.concatenate(slopes)
+        scale = max(float(np.median(slopes[np.isfinite(slopes)])), 0.0) if np.any(np.isfinite(slopes)) else 1.0
+        X0 = scale * X0
+        print(f"{bcolors.OKGREEN}Contrast scale of the starting volume: {scale:.4f} (median of {int(np.isfinite(slopes).sum())} images){bcolors.ENDC}")
+
+    # Preconditioner: |k| / (detector response power + eps), the inverse of the normal operator for even pose coverage
+    first_labels = np.arange(min(batch_size, n_particles))
+    g, _ = geometry(first_labels)
+    delta = jnp.zeros((g["rotations"].shape[0], 2 * xsize, 2 * xsize)).at[:, xsize, xsize].set(1.0)
+    power = np.mean(np.abs(np.fft.rfft2(np.asarray(detector_pipeline(delta, deapod, g["ctf"], ctf_type, xsize)))) ** 2, axis=0)
+    f2 = np.sqrt(np.fft.fftfreq(xsize)[:, None] ** 2 + np.fft.rfftfreq(xsize)[None, :] ** 2)
+    shell2 = np.round(f2 * xsize).astype(int)
+    profile = np.bincount(shell2.ravel(), power.ravel()) / np.maximum(np.bincount(shell2.ravel()), 1)
+    fz = np.fft.fftfreq(xsize)
+    f3 = np.sqrt(fz[:, None, None] ** 2 + fz[None, :, None] ** 2 + np.fft.rfftfreq(xsize)[None, None, :] ** 2)
+    response = profile[np.minimum(np.round(f3 * xsize).astype(int), profile.shape[0] - 1)]
+    weight = jnp.asarray(np.maximum(f3, 1.0 / xsize) / (response + 0.05 * profile.max()), jnp.float32)
+
     @jax.jit
-    def get_modart_volume(graphdef, state):
-        model, _ = nnx.merge(graphdef, state)
-        return model(filter=True)
+    def precondition(v):
+        grid = jnp.zeros((num_maps, xsize, xsize, xsize)).at[:, iz, iy, ix].set(v[:, :n_vox])
+        grid = jnp.fft.irfftn(jnp.fft.rfftn(grid, axes=(1, 2, 3)) * weight, s=(xsize,) * 3, axes=(1, 2, 3))
+        return jnp.pad(grid[:, iz, iy, ix], ((0, 0), (0, n_pad - n_vox)))
 
-    def write_intermediate_modart(volumes, step_idx):
-        """Write the intermediate map(s) to disk and log their central slices.
+    counts = np.bincount(np.arange(n_particles) % num_maps, minlength=num_maps)
+    lam = jnp.asarray(args.regularization * counts * sym.shape[0] * float(np.mean(power)), jnp.float32)[:, None]
 
-        Runs on the logging thread; ``volumes`` are host-side numpy arrays so they are
-        safe to hand over. One tuple entry per half (or a single entry otherwise).
-        """
-        specs = (((volumes[0], "modart_first_half_intermediate.mrc", "Predicted MoDART first half (slices)"),
-                  (volumes[1], "modart_second_half_intermediate.mrc", "Predicted MoDART second half (slices)"))
-                 if args.reconstruct_halves else
-                 ((volumes[0], "modart_map_intermediate.mrc", "Predicted MoDART volume (slices)"),))
-        for vol_arr, fn, tag in specs:
-            ImageHandler().write(vol_arr, os.path.join(args.output_path, fn), overwrite=True)
-            middle_slize = int(np.round(0.5 * vol_arr.shape[-1]))
-            slice_xy, slice_xz, slice_yz = (min_max_scale(vol_arr[middle_slize, :, :]),
-                                            min_max_scale(vol_arr[:, middle_slize, :]),
-                                            min_max_scale(vol_arr[:, :, middle_slize]))
-            slices = np.stack([slice_xy, slice_xz, slice_yz], axis=0)[..., None]
-            writer.add_images(tag, slices, dataformats="NHWC", global_step=step_idx)
+    def to_volumes(X):
+        X = np.asarray(X)
+        vols = np.zeros((num_maps, xsize, xsize, xsize), np.float32)
+        vols[:, inds[:, 0], inds[:, 1], inds[:, 2]] = X[:, :n_vox]
+        return vols
 
-    # Prepare data loader
-    if args.reconstruct_halves:
-        data_loader_even, data_loader_odd = generator.return_grain_dataset(batch_size=int(0.5 * args.batch_size),
-                                                                           shuffle="global", num_epochs=None,
-                                                                           num_workers=-1, num_threads=1,
-                                                                           split_fraction=[0.5, 0.5],
-                                                                           load_to_ram=args.load_images_to_ram)
-        steps_per_epoch_even = int(int(0.5 * len(generator.md)) / args.batch_size)
-    else:
-        data_loader = generator.return_grain_dataset(batch_size=args.batch_size,  shuffle="global", num_epochs=None,
-                                                     num_workers=-1, num_threads=1, split_fraction=None,
-                                                     load_to_ram=args.load_images_to_ram)
-    steps_per_epoch = int(len(generator.md) / args.batch_size)
+    writer = JaxSummaryWriter(os.path.join(args.output_path, "MoDART_metrics"))
+    f = np.fft.fftfreq(xsize)
+    shells = np.minimum(np.round(np.sqrt(f[:, None, None] ** 2 + f[None, :, None] ** 2 + f[None, None, :] ** 2) * xsize).astype(int), xsize // 2)
 
-    # Example of training data for Tensorboard
-    example_loader = data_loader_even if args.reconstruct_halves else data_loader
-    with closing(iter(example_loader)) as iter_data_loader:
-        x_example, labels_example = next(iter_data_loader)
-        x_example = jax.vmap(min_max_scale)(x_example)
-        writer.add_images("Example of data batch", x_example, dataformats="NHWC")
-
-    if args.vol is not None:
-        checkpoint_volume_adjustment = os.path.join(args.output_path, "VolumeAdjustment")
-        if not os.path.isdir(checkpoint_volume_adjustment):
-            # Optimizers (Volume Adjustment)
-            optimizer_vol = nnx.Optimizer(volumeAdjustment, optax.adam(1e-5), wrt=nnx.Param)
-            graphdef, state = nnx.split((volumeAdjustment, optimizer_vol))
-
-            # Number epochs (volume adjustment)
-            if len(generator.md) >= 1000000:
-                num_epochs_vol = 5
-            else:
-                num_epochs_vol = 20
-
-            data_loader_vol = generator.return_grain_dataset(batch_size=args.batch_size, shuffle="global", num_epochs=None,
-                                                             num_workers=-1, num_threads=1, split_fraction=None,
-                                                             load_to_ram=args.load_images_to_ram)
-
-            # Training loop (Volume Adjustment)
-            print(f"{bcolors.OKCYAN}\n###### Training volume adjustment... ######")
-
-            i = 0
-            pbar = tqdm(range(num_epochs_vol * steps_per_epoch), file=sys.stdout, ascii=" >=",
-                        colour="green",
-                        bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
-
-            with closing(iter(data_loader_vol)) as iter_data_loader_vol:
-                for total_steps in pbar:
-                    (x, labels) = next(iter_data_loader_vol)
-
-                    if total_steps % steps_per_epoch == 0:
-                        total_loss = 0
-
-                        # For progress bar (TQDM)
-                        step = 1
-                        pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}/{num_epochs_vol}")
-
-                    i += 1
-
-                    loss, state = train_step_volume_adjustment(graphdef, state, x, labels, md_columns, args.sr,
-                                                               args.ctf_type, vol.shape[0])
-                    total_loss += loss
-
-                    # Progress bar update  (TQDM)
-                    pbar.set_postfix_str(f"loss={total_loss / step:.5f}")
-
-                    # Summary writer (training loss)
-                    if step % int(np.ceil(0.1 * steps_per_epoch)) == 0:
-                        writer.add_scalar('Training loss (volume adjustment)',
-                                          total_loss / step,
-                                          i * steps_per_epoch + step)
-
-                    step += 1
-
-            volumeAdjustment, optimizer_vol = nnx.merge(graphdef, state)
-            NeuralNetworkCheckpointer.save(volumeAdjustment, checkpoint_volume_adjustment)
-        else:
-            volumeAdjustment = NeuralNetworkCheckpointer.load(checkpoint_path=checkpoint_volume_adjustment)
-
-        values = volumeAdjustment()
-
-        # Place values on grid and replace MoDART reference volume
-        grid = jnp.zeros_like(vol)
-        grid = grid.at[inds[..., 0], inds[..., 1], inds[..., 2]].set(values)
-        modart.reference_volume = grid
-        modart.delta_volume_decoder.reference_values = values
-
-    # Learning rate scheduler
-    total_steps_per_epoch =  steps_per_epoch if not args.reconstruct_halves else steps_per_epoch_even
-    total_steps = 20 * total_steps_per_epoch
-    lr_schedule = CosineAnnealingScheduler.getScheduler(peak_value=1e-3, total_steps=total_steps, warmup_frac=0.1, init_value=0.0, end_value=0.0)
-
-    # Early stopping
-    early_stop = EarlyStopping(min_delta=1e-6, patience=2. * total_steps_per_epoch)
-
-    # Optimizers (MoDART)
-    optimizer = nnx.Optimizer(modart, optax.adam(lr_schedule), wrt=nnx.Param)
-    graphdef, state = nnx.split((modart, optimizer))
-
-    # Logging cadence + background offload of the host-side logging work.
-    logger = TrainingLogger(image_every=args.log_images_every,
-                            steps_per_epoch=total_steps_per_epoch,
-                            time_budget=args.log_time_budget,
-                            background=not args.log_sync).start()
-
-    # Reconstruction loop (MoDART)
-    print(f"{bcolors.OKCYAN}\n###### Starting MoDART reconstruction... ######")
-
-    i = 0
-    total_steps = 0
-    pbar = tqdm(range(steps_per_epoch), file=sys.stdout, ascii=" >=", colour="green",
-                bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
-
-    with ExitStack() as stack:
+    def write_maps(X, suffix=""):
+        """Half maps (if asked) and their average weighted by sqrt(2 FSC / (1 + FSC)); returns the half-map FSC"""
+        from scipy.fft import fftn, ifftn
+        vols = to_volumes(X)
         if args.reconstruct_halves:
-            iter_data_loader_even = stack.enter_context(closing(iter(data_loader_even)))
-            iter_data_loader_odd = stack.enter_context(closing(iter(data_loader_odd)))
-        else:
-            iter_data_loader = stack.enter_context(closing(iter(data_loader)))
+            ImageHandler().write(vols[0], os.path.join(args.output_path, f"modart_first_half{suffix}.mrc"), overwrite=True)
+            ImageHandler().write(vols[1], os.path.join(args.output_path, f"modart_second_half{suffix}.mrc"), overwrite=True)
+        fsc = half_map_fsc(vols[0], vols[1], mask > 0.0)
+        filtered = np.real(ifftn(fftn(vols.mean(0), workers=-1) * _fsc_filter(fsc)[shells], workers=-1)).astype(np.float32)
+        ImageHandler().write(filtered, os.path.join(args.output_path, f"modart_map{suffix}.mrc"), overwrite=True)
+        return fsc
 
-        while not early_stop.should_stop:
+    def normal_pass(desc, P):
+        """-(A^T A) P over all particles, from the labels alone"""
+        out = jnp.zeros_like(P)
+        zeros = jnp.zeros((batch_size * sym.shape[0], xsize, xsize))
+        for s in tqdm(range(0, n_particles, batch_size), desc=desc, file=sys.stdout, ascii=" >=", colour="green",
+                      bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}"):
+            g, _ = geometry(np.arange(s, min(s + batch_size, n_particles)))
+            out = out + backproject_residual(P, zeros, **g, **common)
+        return out
 
-            if total_steps % steps_per_epoch == 0:
+    # Right-hand side: A^T (y - A X0)
+    print(f"{bcolors.OKCYAN}\n###### Starting MoDART reconstruction (conjugate gradient)... ######{bcolors.ENDC}")
+    t0 = time.time()
+    R = jnp.zeros((num_maps, n_pad))
+    for x, labels in tqdm(image_batches(), total=int(np.ceil(n_particles / batch_size)), desc="Back-projection",
+                          file=sys.stdout, ascii=" >=", colour="green", bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}"):
+        g, ctf = geometry(labels)
+        R = R + backproject_residual(X0, data_term(x, ctf), **g, **common, forward=vol is not None)
+    R = (R - lam * X0) * support
 
-                total_loss = 0
-                total_recon_loss = 0 if not args.reconstruct_halves else jnp.zeros((2, ))
+    # Preconditioned conjugate gradient on (A^T A + lam) X = A^T y, one map per row
+    X = X0
+    Z = precondition(R) * support
+    P = Z
+    rz = jnp.sum(R * Z, axis=1)
+    r0 = jnp.sqrt(jnp.sum(R * R, axis=1))
+    for it in range(args.iterations):
+        HP = (lam * P - normal_pass(f"Iteration {it + 1}/{args.iterations}", P)) * support
+        curvature = jnp.sum(P * HP, axis=1)
+        alpha = jnp.where(curvature > 0, rz / jnp.where(curvature > 0, curvature, 1.0), 0.0)
+        X = X + alpha[:, None] * P
+        R = R - alpha[:, None] * HP
+        Z = precondition(R) * support
+        rz_new = jnp.sum(R * Z, axis=1)
+        P = Z + jnp.where(rz > 0, rz_new / jnp.where(rz > 0, rz, 1.0), 0.0)[:, None] * P
+        rz = rz_new
 
-                # For progress bar (TQDM)
-                step = 1
-                pbar.reset()
-                pbar.set_description(f"Epoch {int(total_steps / steps_per_epoch + 1)}")
+        rel = np.asarray(jnp.sqrt(jnp.sum(R * R, axis=1)) / r0)
+        writer.add_scalar("Relative residual (MoDART)", float(rel.mean()), it + 1)
+        write_maps(X, "_intermediate")
+        print(f"{bcolors.OKGREEN}Iteration {it + 1}: relative residual {', '.join(f'{v:.3e}' for v in rel)} ({time.time() - t0:.0f} s){bcolors.ENDC}")
 
-                # Intermediate volume
-                if logger.should("images", i):
-                    with logger.section():
-                        modart_volume = get_modart_volume(graphdef, state)
-                        if args.reconstruct_halves:
-                            volumes = (np.array(modart_volume[0]), np.array(modart_volume[1]))
-                        else:
-                            volumes = (np.array(modart_volume),)
-                    logger.submit(write_intermediate_modart, volumes, i)
-
-                i += 1
-
-            # For progress bar (TQDM)
-            if args.reconstruct_halves:
-                (x_even, labels_even) = next(iter_data_loader_even)
-                (x_odd, labels_odd) = next(iter_data_loader_odd)
-                x = jnp.stack([x_even, x_odd], axis=1)
-                labels = jnp.stack([labels_even, labels_odd], axis=1)
-
-                if args.motion_correction is not None:
-                    x_interpolation = jnp.reshape(x, (-1, x.shape[2], x.shape[3], 1))
-                    field_modart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x_interpolation, modart.inds)
-                    field_modart = jnp.reshape(x, (x.shape[0], x.shape[1], field_modart.shape[1], field_modart.shape[2]))
-                else:
-                    field_modart = jnp.zeros((x.shape[0], modart.inds.shape[0], 3))[:, None, ...]
-
-                loss, recon_loss, state = single_step_modart(graphdef, state, x, labels, md_columns, field_modart, rng)
-                total_loss += loss
-                total_recon_loss += recon_loss
-
-                # Progress bar update  (TQDM)
-                pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss.mean() / step:.5f}")
-
-                # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * steps_per_epoch_even)) == 0:
-                    writer.add_scalar('Training loss (MoDART)',
-                                      total_loss / step,
-                                      i * steps_per_epoch_even + step)
-
-                    writer.add_scalars('Reconstruction loss (MoDART)',
-                                       {"First half": total_recon_loss[0] / step, "Second half": total_recon_loss[1] / step},
-                                       i * steps_per_epoch_even + step)
-
-                # Update early stopping criteria
-                early_stop = early_stop.update(total_loss / step)
-                if early_stop.should_stop:
-                    print(
-                        f"{bcolors.WARNING}End of reconstruction detected. Finishing reconstruction epochs...{bcolors.ENDC}")
-                    break
-
-                step += 1
-            else:
-                (x, labels) = next(iter_data_loader)
-                if args.motion_correction is not None:
-                    field_modart = interpolate_image_field(graphdef_motion_correction, state_motion_correction, x, modart.inds)
-                else:
-                    field_modart = jnp.zeros((x.shape[0], modart.inds.shape[0], 3))
-
-                x = x[:, None, ...]
-                labels = labels[:, None, ...]
-                field_modart = field_modart[:, None, ...]
-
-                loss, recon_loss, state = single_step_modart(graphdef, state, x, labels, md_columns, field_modart, rng)
-                total_loss += loss
-                total_recon_loss += recon_loss[0]
-
-                # Progress bar update  (TQDM)
-                pbar.set_postfix_str(f"loss={total_loss / step:.5f} | recon_loss={total_recon_loss / step:.5f}")
-
-                # Summary writer (training loss)
-                if step % int(np.ceil(0.1 * steps_per_epoch)) == 0:
-                    writer.add_scalar('Training loss (MoDART)',
-                                      total_loss / step,
-                                      i * steps_per_epoch + step)
-
-                    writer.add_scalar('Reconstruction loss (MoDART)',
-                                      total_recon_loss / step,
-                                      i * steps_per_epoch + step)
-
-                # Update early stopping criteria
-                early_stop = early_stop.update(total_loss / step)
-                if early_stop.should_stop:
-                    print(f"{bcolors.WARNING}End of reconstruction detected. Finishing reconstruction epochs...{bcolors.ENDC}")
-                    break
-
-                step += 1
-
-            pbar.update()
-            total_steps += 1
-
-    # Let the background logging thread finish before writing the final map.
-    logger.close()
-
-    # Save final MoDART volume
-    modart_volume = get_modart_volume(graphdef, state)
-    if args.reconstruct_halves:
-        ImageHandler().write(np.array(modart_volume[0]), os.path.join(args.output_path, "modart_first_half.mrc"), overwrite=True)
-        ImageHandler().write(np.array(modart_volume[1]), os.path.join(args.output_path, "modart_second_half.mrc"), overwrite=True)
-        ImageHandler().write(np.array(0.5 * (modart_volume[0] + modart_volume[1])), os.path.join(args.output_path, "modart_map.mrc"), overwrite=True)
-    else:
-        ImageHandler().write(np.array(modart_volume), os.path.join(args.output_path, "modart_map.mrc"), overwrite=True)
-
-    # If exists, clean MMAP
-    # if not args.load_images_to_ram and os.path.isdir(os.path.join(mmap_output_dir, "images_mmap_grain")):
-    #     shutil.rmtree(os.path.join(mmap_output_dir, "images_mmap_grain"))
+    fsc = write_maps(X)
+    freq = np.arange(fsc.shape[0]) / (xsize * args.sr)
+    np.savetxt(os.path.join(args.output_path, "half_map_fsc.txt"), np.stack([freq, fsc], axis=1), header="1/A FSC")
+    below = np.flatnonzero(fsc[1:] < 0.143)
+    print(f"{bcolors.OKGREEN}Half-map FSC = 0.143 at {1.0 / freq[below[0] + 1] if below.size else 2.0 * args.sr:.2f} A (mask-corrected); "
+          f"modart_map.mrc is the FSC-weighted average{bcolors.ENDC}")
+    for name in ("modart_map", "modart_first_half", "modart_second_half"):
+        path = os.path.join(args.output_path, f"{name}_intermediate.mrc")
+        if os.path.isfile(path):
+            os.remove(path)

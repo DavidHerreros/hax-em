@@ -66,3 +66,23 @@ def approximate_knn(points, values=None, k=6, window=32, n_shifts=3):
     distances = jnp.where(jnp.any(duplicate, axis=-1), jnp.inf, distances)
     _, best = jax.lax.top_k(-distances, k)
     return jnp.take_along_axis(indices, best, axis=1)
+
+
+def build_knn_field_operator(source_coords, target_coords, k=6, h=None):
+    """Normalised Gaussian k-NN weights carrying a field from source points to target points"""
+    import numpy as np
+    from scipy.spatial import cKDTree
+
+    k = int(min(k, source_coords.shape[0]))
+    dist, idx = cKDTree(np.asarray(source_coords, np.float32)).query(np.asarray(target_coords, np.float32), k=k, workers=-1)
+    dist, idx = dist.reshape(dist.shape[0], k), idx.reshape(idx.shape[0], k)
+    h = max(float(np.median(dist[:, 0])) if h is None else float(h), 1e-3)
+    w = np.exp(-0.5 * (dist / h) ** 2)
+    w = w / np.maximum(w.sum(axis=1, keepdims=True), 1e-12)
+    return jnp.asarray(idx, jnp.int32), jnp.asarray(w, jnp.float32)
+
+
+@jax.jit
+def apply_knn_field(field_source, idx, weights):
+    """(B, S, C) source field to (B, T, C) target field"""
+    return jnp.einsum("tk,btkc->btc", weights, field_source[:, idx, :])
