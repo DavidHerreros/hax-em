@@ -143,7 +143,8 @@ def batch_geometry(md, labels, rot_refine, shift_refine, sym, sr, xsize, ctf_typ
     rotations = euler_matrix_batch(euler_angles[:, 0], euler_angles[:, 1], euler_angles[:, 2])
     rotations = jnp.matmul(rotations, rot_refine)
     shifts = md["shifts"][labels] + shift_refine
-    rotations = jnp.einsum("gji,bjk->gbik", sym, rotations).reshape(-1, 3, 3)
+    # Copy g is posed R S_g: the projector maps a voxel v to R v
+    rotations = jnp.einsum("bij,gjk->gbik", rotations, sym).reshape(-1, 3, 3)
     shifts = jnp.tile(shifts, (sym.shape[0], 1))
 
     ctf = None
@@ -152,6 +153,24 @@ def batch_geometry(md, labels, rot_refine, shift_refine, sym, sr, xsize, ctf_typ
                          md["ctfSphericalAberration"][labels], md["ctfVoltage"][labels][0], sr,
                          [2 * xsize, xsize + 1], labels.shape[0], True)
     return rotations, shifts, ctf
+
+
+def symmetry_field_operator(sources, vox, sym):
+    """k-NN operator from the model points to the voxels for every symmetry copy (copy-major, then one block per point set).
+    Copy g needs the field at S_g u, read from the points rotated by S_g^T"""
+    operators = [build_knn_field_operator(np.asarray(source) @ np.asarray(s), vox) for s in sym for source in sources]
+    offsets = np.cumsum([0] + [np.asarray(source).shape[0] for _ in sym for source in sources][:-1])
+    knn_idx = jnp.concatenate([idx + offset for (idx, _), offset in zip(operators, offsets)], axis=1)
+    knn_w = jnp.concatenate([w for _, w in operators], axis=1)
+    return knn_idx, knn_w
+
+
+def symmetry_copy_fields(fields, sym):
+    """Fields of the symmetry copies (copy-major, as batch_geometry). Copy g, posed R S_g, moves voxel u by S_g^T f(S_g u),
+    so that it lands at R (S_g u + f(S_g u)); each copy's field sits on its own block of symmetry_field_operator"""
+    rotated = jnp.einsum("bpi,gij->gbpj", fields, sym)
+    blocks = jnp.einsum("gbpj,gh->gbhpj", rotated, jnp.eye(sym.shape[0], dtype=fields.dtype))
+    return blocks.reshape(sym.shape[0] * fields.shape[0], sym.shape[0] * fields.shape[1], 3)
 
 
 @jax.jit
@@ -294,7 +313,7 @@ def main():
         shift_refine = shift_refine * (xsize / model_xsize)
 
         _, source = decode_fields(graphdef_mc, state_mc, jnp.asarray(latents[:1]), xsize)
-        knn_idx, knn_w = build_knn_field_operator(np.asarray(source), np.asarray(vox[:n_vox]))
+        knn_idx, knn_w = symmetry_field_operator([source], np.asarray(vox[:n_vox]), sym)
         knn_idx = jnp.pad(knn_idx, ((0, n_pad - n_vox), (0, 0)))
         knn_w = jnp.pad(knn_w, ((0, n_pad - n_vox), (0, 0)))
         print(f"{bcolors.OKGREEN}Motion field carried from {source.shape[0]} model points to {n_vox} voxels; "
@@ -312,7 +331,7 @@ def main():
         else:
             rr, ss = rot_refine[labels_p], shift_refine[labels_p]
             fields, _ = decode_fields(graphdef_mc, state_mc, jnp.asarray(latents[labels_p]), xsize)
-            fields = jnp.tile(fields, (sym.shape[0], 1, 1))
+            fields = symmetry_copy_fields(fields, sym)
         rotations, shifts, ctf = batch_geometry(md_columns, jnp.asarray(labels_p), jnp.asarray(rr), jnp.asarray(ss), sym,
                                                 args.sr, xsize, ctf_type)
         ctf_rep = None if ctf is None else jnp.tile(ctf, (sym.shape[0], 1, 1))
