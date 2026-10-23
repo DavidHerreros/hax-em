@@ -19,7 +19,8 @@ dependencies = ["einops<=0.8.2", "tqdm<=4.67.2", "matplotlib<=3.10.8", "numpy<=2
                 "orbax-checkpoint<=0.11.32", "cloudpickle<=3.1.2", "dm_pix<=0.4.4", "tensorboard<=2.19.0", "pynndescent<=0.6.0",
                 "napari[all] >=0.6.0, < 0.7.0", "napari-molecule-reader", "umap-learn<=0.5.11", "setuptools==81",
                 "mmap_ninja<=0.8.2", "lz4<=4.4.5", "tensorboardX<=2.6.4", "tbb<=2022.3.1", "sympy<=1.14.0", "ott-jax<=0.6.0",
-                "pyyaml<=6.0.3", "nvalchemi-toolkit-ops==0.5.0"]
+                "pyyaml<=6.0.3"]
+# Future: add "nvalchemi-toolkit-ops==0.5.0"
 
 [project.scripts]
 hax_project_manager = "hax.cli:main"
@@ -27,8 +28,10 @@ hax_project_manager = "hax.cli:main"
 [project.optional-dependencies]
 torch_datasets = ["torch<=2.0.1"]
 tensorflow_datasets = ["tensorflow<=2.19.0", "tensorflow-datasets<=4.9.9"]
-cuda12 = ["jax[cuda12]==0.10.1", "cuml-cu12==25.12.*", "cupy-cuda12x>13.6.0,<=14.0.1", "jztree[cuda12]==1.1.0"]
-cuda13 = ["jax[cuda13]==0.10.1", "cuml-cu13==25.12.*", "cupy-cuda13x>13.6.0,<=14.0.1", "jztree[cuda13]==1.1.0"]
+cuda12 = ["jax[cuda12]==0.10.1", "cuml-cu12==25.12.*", "cupy-cuda12x>13.6.0,<=14.0.1"]
+# Future: add "jztree[cuda12]==1.1.0"
+cuda13 = ["jax[cuda13]==0.10.1", "cuml-cu13==25.12.*", "cupy-cuda13x>13.6.0,<=14.0.1"]
+# Future: add "jztree[cuda13]==1.1.0"
 
 [tool.setuptools.packages.find]
 where = ["."]
