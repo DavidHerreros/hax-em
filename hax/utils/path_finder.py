@@ -26,6 +26,14 @@ def _pbar(steps, **kwargs):
                 bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}", **kwargs)
 
 
+def decode_gaussians(model, z):
+    """Deformed Gaussian coordinates (voxels, centred on the box) and weights of a HetSIREN or Zernike3Deep"""
+    if hasattr(model, "delta_volume_decoder"):
+        return model.delta_volume_decoder(z)
+    coords = model.flow_decoder.factor * model.coords[None] + model.flow_decoder(z, model.coords, model.xsize)
+    return coords.astype(jnp.float32), jnp.broadcast_to(model.values, coords.shape[:2])
+
+
 class FreeEnergyMLP(nnx.Module):
     """Small MLP mapping a latent vector z to a scalar free energy G = f(z)"""
 
@@ -180,11 +188,11 @@ class PathFinder(nnx.Module):
     @property
     def hetsiren(self):
         if self._hetsiren.value is None:
-            raise RuntimeError("No HetSIREN attached: call attach_model(graphdef, state) first")
+            raise RuntimeError("No model attached: call attach_model(graphdef, state) first")
         return self._hetsiren.value
 
     def attach_model(self, graphdef, state, latent_space=None):
-        """Attach the HetSIREN (graphdef, state) and optionally the latent space of every particle"""
+        """Attach the HetSIREN or Zernike3Deep (graphdef, state) and optionally the latent space of every particle"""
         self._hetsiren.value = (graphdef, state)
         if latent_space is not None:
             derived = {}
@@ -259,12 +267,10 @@ class PathFinder(nnx.Module):
         graphdef, state = self.hetsiren
 
         @jax.jit
-        def decode_gaussians(z):
-            model = nnx.merge(graphdef, state)
-            coords, values = model.delta_volume_decoder(z)
-            return coords, values
+        def decode(z):
+            return decode_gaussians(nnx.merge(graphdef, state), z)
 
-        return decode_gaussians
+        return decode
 
     def _build_feature_fn(self):
         """Differentiable map z -> F"""
@@ -976,36 +982,47 @@ class PathFinder(nnx.Module):
 
         return self._chunked_map(one_chunk, nodes, chunk)
 
-    @partial(jax.jit, static_argnums=(0,), static_argnames=("quad", "chunk"))
-    def _edge_costs_fmt(self, nodes, near, E_floor, cmax, eps, *, quad, chunk):
-        d = self.config["feat_dim"]
-        k = near.shape[1]
+    @staticmethod
+    @partial(jax.jit, static_argnames=("chunk", "quad"))
+    def _edge_segments_fmt(nodes, near, start, *, chunk, quad):
+        # Step1: Get closest points Q_new to each node Q_near
+        Q_near = jax.lax.dynamic_slice_in_dim(nodes, start, chunk)
+        Q_new = nodes[jax.lax.dynamic_slice_in_dim(near, start, chunk)]
+
+        # Step 2: Draw n samples (quad) along the segment Q_near -> Q_new
         t = (jnp.arange(quad) + 0.5) / quad
+        diff = Q_new - Q_near[:, None, :]
+        seg = Q_near[:, None, None, :] + t[None, None, :, None] * diff[:, :, None, :]
 
-        def one_chunk(args):
-            # Step1: Get closest points Q_new to each node Q_near
-            Q_near, nb = args
-            Q_new = nodes[nb]
+        # Step 4: Compute the distance of the segment Q_near -> Q_new
+        return seg.reshape(-1, nodes.shape[-1]), jnp.linalg.norm(diff, axis=-1)
 
-            # Step 2: Draw n samples (quad) along the segment Q_near -> Q_new
-            diff = Q_new - Q_near[:, None, :]
-            seg = Q_near[:, None, None, :] + t[None, None, :, None] * diff[:, :, None, :]
+    @staticmethod
+    @jax.jit
+    def _edge_reduce_fmt(fv, dist, E_floor, cmax, eps):
+        # Step 5: Cost of a an edge following the paper (average energy along the edge weighted by the
+        # edge distance)
+        cost_edge = dist * jnp.maximum(fv.mean(-1) - E_floor, eps)
+
+        # Edge barrier: highest energy sampled along the edge
+        blocked = fv.max(-1) > cmax
+        return jnp.where(blocked, jnp.inf, cost_edge), jnp.where(blocked, jnp.inf, fv.max(-1) - E_floor)
+
+    def _edge_costs_fmt(self, nodes, near, E_floor, cmax, eps, *, quad, chunk):
+        n, k = near.shape
+        pad = (-n) % chunk
+        nodes, near = jnp.pad(nodes, ((0, pad), (0, 0))), jnp.pad(near, ((0, pad), (0, 0)))
+        cost_edge, barrier_edge = [], []
+        for start in range(0, n + pad, chunk):
+            seg, dist = self._edge_segments_fmt(nodes, near, start, chunk=chunk, quad=quad)
 
             # Step 3: Compute the cost value (energy) at the n samples along the segments Q_near -> Q_new
-            fv = self.compute_energy_from_features_at(seg.reshape(-1, d)).reshape(-1, k, quad)
-
-            # Step 4: Compute the distance of the segment Q_near -> Q_new
-            dist = jnp.linalg.norm(diff, axis=-1)
-
-            # Step 5: Cost of a an edge following the paper (average energy along the edge weighted by the 
-            # edge distance)
-            cost_edge = dist * jnp.maximum(fv.mean(-1) - E_floor, eps)
-
-            # Edge barrier: highest energy sampled along the edge
-            blocked = fv.max(-1) > cmax
-            return jnp.where(blocked, jnp.inf, cost_edge), jnp.where(blocked, jnp.inf, fv.max(-1) - E_floor)
-
-        return self._chunked_map(one_chunk, (nodes, near), chunk)
+            fv = jnp.concatenate([self.compute_energy_from_features_at(seg[i:i + 4096])
+                                  for i in range(0, len(seg), 4096)]).reshape(chunk, k, quad)
+            c, b = self._edge_reduce_fmt(fv, dist, E_floor, cmax, eps)
+            cost_edge.append(c)
+            barrier_edge.append(b)
+        return jnp.concatenate(cost_edge)[:n], jnp.concatenate(barrier_edge)[:n]
 
     @staticmethod
     @partial(jax.jit, static_argnames=("n", "max_iters", "bottleneck"))
@@ -1034,8 +1051,8 @@ class PathFinder(nnx.Module):
             # previous iteration
             hit = (cand == best[dst_e]) & improved[dst_e]
 
-            # Find the parent node connecting to the desination node whose edge became a winner based on 
-            # prvious criteria (segment_max is basically used to ignore -1 entries representing source that 
+            # Find the parent node connecting to the destination node whose edge became a winner based on
+            # previous criteria (segment_max is basically used to ignore -1 entries representing source that
             # whose edge did not lead to any improvement, ensuring that an arbitrary best node is chosen if 
             # there exists a tie)
             new_parent = jax.ops.segment_max(jnp.where(hit, src_e, -1), dst_e, n)
