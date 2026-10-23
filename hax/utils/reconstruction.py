@@ -63,7 +63,8 @@ from .ctf import eval_ctf
 from .euler import euler_matrix_batch
 from .loggers import bcolors
 
-__all__ = ["reconstruct_consensus_volume", "consensus_mask"]
+__all__ = ["reconstruct_consensus_volume", "consensus_mask", "projection_contrast", "contrast_from_sums",
+           "global_contrast_from_sums"]
 
 
 def _slice_geometry(box, sr):
@@ -787,3 +788,117 @@ def consensus_mask(volume, threshold=0.02, dilate=2, keep_largest=True):
     if dilate and dilate > 0:
         mask = binary_dilation(mask, iterations=int(dilate))
     return mask.astype(np.float32)
+
+
+def _padded_transform(volume, pad):
+    """Centred transform of the volume zero-padded ``pad`` times and gridding corrected, so that
+    ``_project`` extracts accurate slices from it."""
+    box = volume.shape[0]
+    size = pad * box
+    lo = size // 2 - box // 2
+    padded = np.zeros((size,) * 3, np.float32)
+    padded[lo:lo + box, lo:lo + box, lo:lo + box] = volume
+    padded /= _gridding_correction(size)
+    return jnp.asarray(np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(padded))).astype(np.complex64))
+
+
+@partial(jax.jit, static_argnums=(9, 10, 11))
+def _contrast_sums(volume_ft, mask_ft, images, rotations, shifts, ctf, k_rot, f0, f1, size, lo, box):
+    crop = (slice(None), slice(lo, lo + box), slice(lo, lo + box))
+    p = _project(volume_ft, rotations, shifts, ctf, k_rot, size, f0, f1)[crop]
+    if mask_ft is None:
+        w = jnp.ones_like(p)
+    else:
+        # Footprint of the mask: where its projection crosses at least half a voxel
+        footprint = _project(mask_ft, rotations, shifts, jnp.ones_like(ctf), k_rot, size, f0, f1)[crop]
+        w = (footprint > 0.5).astype(p.dtype)
+    axes = (1, 2)
+    return jnp.stack([jnp.sum(w * p * p, axes), jnp.sum(w * p * images, axes), jnp.sum(w * p, axes),
+                      jnp.sum(w * images, axes), jnp.sum(w, axes)], axis=1)
+
+
+def projection_contrast(volume, md, columns, sr, mask=None, use_ctf=True, premultiplied=False,
+                        dose_weighting=True, batch_size=256, threads=8, scratch_dir=None, quiet=False):
+    """Least-squares sums between every image and the map projected at its pose.
+
+    The projection ``p`` carries the particle's shift and CTF (squared when the images are
+    ``premultiplied``), so it predicts the image ``y`` as stored. Returns an ``(n, 5)`` array with
+    the sums of ``p*p``, ``p*y``, ``p``, ``y`` and of the weights, restricted to the footprint of
+    the projected ``mask`` when one is given. ``contrast_from_sums`` and
+    ``global_contrast_from_sums`` turn them into gray scales.
+    """
+    n = len(md)
+    box = int(volume.shape[0])
+    # 2x oversampled transform for accurate slices, up to box 256 to bound the memory
+    pad = 2 if box <= 256 else 1
+    size = pad * box
+    lo = size // 2 - box // 2
+    reader = _StackReader(md, scratch_dir)
+    s, a, k_rot, f0, f1 = _slice_geometry(size, sr)
+
+    volume_ft = _padded_transform(np.asarray(volume, np.float32), pad)
+    mask_ft = None if mask is None else _padded_transform((np.asarray(mask) > 0).astype(np.float32), pad)
+
+    angles = np.asarray(columns["euler_angles"], np.float32)
+    shifts = np.asarray(columns["shifts"], np.float32)
+    has_ctf = use_ctf and "ctfDefocusU" in columns
+    premultiplied = bool(premultiplied) and has_ctf
+    dose = np.asarray(columns["preExposure"], np.float32).ravel() if "preExposure" in columns else None
+    scalefactor = (np.asarray(columns["ctfScaleFactor"], np.float32).ravel()
+                   if "ctfScaleFactor" in columns else None)
+    inv2nc = (_critical_dose_reciprocal(s)
+              if dose_weighting and has_ctf and (dose is not None or scalefactor is not None)
+              else None)
+    if has_ctf:
+        kv = float(np.asarray(columns["ctfVoltage"]).ravel()[0])
+
+    sums = np.zeros((n, 5), np.float64)
+    n_chunks = (n + batch_size - 1) // batch_size
+    for labels, images in tqdm(_stream_chunks(reader, n, batch_size, threads), total=n_chunks,
+                               file=sys.stdout, ascii=" >=", colour="green", disable=quiet):
+        ang = jnp.asarray(angles[labels])
+        rotations = euler_matrix_batch(ang[:, 0], ang[:, 1], ang[:, 2])
+
+        if has_ctf:
+            ctf = eval_ctf(s[None], a[None],
+                           jnp.asarray(np.asarray(columns["ctfDefocusU"])[labels]),
+                           jnp.asarray(np.asarray(columns["ctfDefocusV"])[labels]),
+                           angast=jnp.asarray(np.asarray(columns["ctfDefocusAngle"])[labels]),
+                           cs=jnp.asarray(np.asarray(columns["ctfSphericalAberration"])[labels]),
+                           kv=kv)
+        else:
+            ctf = jnp.ones((labels.shape[0], size, size), jnp.float32)
+        if inv2nc is not None:
+            ctf = ctf * _dose_weight(inv2nc, _rows(dose, labels, 0.0), _rows(scalefactor, labels, 1.0))
+
+        sums[labels] = np.asarray(_contrast_sums(volume_ft, mask_ft, jnp.asarray(images), rotations,
+                                                 jnp.asarray(shifts[labels]), ctf ** 2 if premultiplied else ctf,
+                                                 k_rot, f0, f1, size, lo, box), np.float64)
+    return sums
+
+
+def _centred(sums, offset):
+    pp, py, p, y, w = np.asarray(sums, np.float64).T
+    w = np.maximum(w, 1.0)
+    if offset:
+        return pp - p * p / w, py - p * y / w, p, y, w
+    return pp, py, p, y, w
+
+
+def contrast_from_sums(sums, offset=False):
+    """Per image ``y ~ a p`` (or ``y ~ a p + b`` with ``offset``) in closed form.
+
+    Returns ``(a, b)``; ``a`` is NaN where the projection is flat and carries no scale.
+    """
+    var, cov, p, y, w = _centred(sums, offset)
+    ok = var > 1e-12 * max(float(var.max()), 1e-30)
+    a = np.where(ok, cov / np.where(ok, var, 1.0), np.nan)
+    b = (y - a * p) / w if offset else np.zeros_like(a)
+    return a, b
+
+
+def global_contrast_from_sums(sums, offset=False):
+    """One scale for the whole set, ``y ~ a p`` (or ``y ~ a p + b_i`` with ``offset``, one offset
+    per image)."""
+    var, cov, _, _, _ = _centred(sums, offset)
+    return float(cov.sum() / var.sum()) if var.sum() > 0 else float("nan")

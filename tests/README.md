@@ -269,42 +269,29 @@ same network path already covered by `decode_states_from_latents`.
 
 ### image_gray_scale_adjustment coverage (`test_image_gray_scale_adjustment.py`)
 
-Learns a per-image gray-level adjustment matching projections of a reference
-volume (`--vol`) to the images in `--md`. Train saves an `imageAdjustment` model;
-predict writes `adjusted_images.mrcs` + a metadata file.
+Fits, in closed form, the gray scale (and optionally an offset) of every image
+against the projection of a reference map (`--vol`) at its pose, and writes the
+rescaled images. Single pass, no network.
 
 | Option / axis | Covered by |
 |---|---|
-| `--ctf_type None / apply / wiener` | `train_none` / `train_apply_pv` / `train_wiener_mmap` |
-| `--mode train / predict` (+ `--reload`) | `train_*` / `predict_pv` |
-| `--predict_value` on / off | `*_pv` / `train_none` |
-| `--vol` (required) / `--mask` provided vs auto-generated | most / `train_automask` |
-| `--load_images_to_ram` (on) / mmap (off) + `--ssd_scratch_folder` | most / `train_wiener_mmap` |
-| `--lat_dim`, `--batch_size`, `--learning_rate`, `--dataset_split_fraction` | varied |
-| outputs `imageAdjustment`; `adjusted_images.mrcs` + `.xmd` | train / predict |
+| `--ctf_type apply / wiener / None` | `adjust_apply` / `adjust_wiener_scratch` / `adjust_none` |
+| `--per_image_contrast relative / absolute` | `adjust_apply` / `adjust_absolute_offset_mask` |
+| `--fit_offset`, `--mask` | `adjust_absolute_offset_mask` |
+| `--batch_size`, `--threads`, `--ssd_scratch_folder` | `adjust_wiener_scratch` |
+| outputs `adjusted_images.mrcs` + `.xmd` | all |
 
 ### volume_gray_scale_adjustment coverage (`test_volume_gray_scale_adjustment.py`)
 
-Learns a gray-level adjustment for a reference volume so its projections match the
-images in `--md`. Train saves a `volumeAdjustment` model; predict writes
-`adjusted_volume.mrc` (predict needs only `--vol` + `--reload`).
+Fits, in closed form, the single gray scale that makes the projections of a map
+match the images, and writes the map times that scale. Single pass, no network.
 
 | Option / axis | Covered by |
 |---|---|
-| `--ctf_type None / apply / wiener` | `train_none_novpv` / `train_apply_pv` / `train_wiener_mmap` |
-| `--mode train / predict` (+ `--reload`) | `train_*` / `predict_*` |
-| `--predicts_value` on (a*vol+b) / off (voxel values) | `predict_pv` / `predict_novpv` |
-| `--vol` (required) / `--mask` | all |
-| `--load_images_to_ram` (on) / mmap (off) + `--ssd_scratch_folder` | most / `train_wiener_mmap` |
-| `--lat_dim`, `--batch_size`, `--learning_rate`, `--dataset_split_fraction` | varied |
-| outputs `volumeAdjustment`; `adjusted_volume.mrc` | train / predict |
-
-Both programs share two pre-existing, **unpatched** quirks (worked around by the
-suites): the end-of-training `rmtree(..._CHECKPOINT)` is unconditional (but a
-checkpoint is written at `i==1`, so `epochs >= 2` is safe), and `predict` /
-no-`--mask` training do not create `--output_path`. `volume_gray_scale_adjustment`
-additionally has a resume-only copy-paste typo (reads `imageAdjustment_CHECKPOINT`),
-not exercised here.
+| `--ctf_type apply / precorrect / None` | `adjust_apply` / `adjust_offset_mask` / `adjust_none` |
+| `--fit_offset`, `--mask` | `adjust_offset_mask` |
+| `--batch_size`, `--threads`, `--ssd_scratch_folder` | `adjust_scratch` |
+| outputs `adjusted_volume.mrc` + `gray_scale.txt` | all |
 
 ### display_metrics coverage (`test_display_metrics.py`, headless)
 

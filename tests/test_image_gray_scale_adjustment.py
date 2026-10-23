@@ -2,26 +2,20 @@
 """
 image_gray_scale_adjustment CLI test scenarios.
 
-Learns a per-image gray-level adjustment (scale/offset) that matches projections
-of a reference volume (``--vol``) to the experimental images in ``--md``. Train
-saves an ``imageAdjustment`` model; predict writes ``adjusted_images.mrcs`` + a
-metadata file.
+Fits, in closed form, the gray scale (and optionally an offset) of every image in
+``--md`` against the projection of a reference map (``--vol``) at its pose, and
+writes the rescaled images. Single pass, no network: no train/predict modes.
 
 Coverage:
 
-* ``--ctf_type``     : None, apply, wiener
-* ``--mode``         : train, predict (+ ``--reload``)
-* ``--predict_value``: on and off (per-image scalar vs per-pixel adjustment)
-* ``--vol`` (required) / ``--mask`` provided vs auto-generated
-* ``--load_images_to_ram`` (on) and the mmap path (off) + ``--ssd_scratch_folder``
-* ``--lat_dim`` / ``--batch_size`` / ``--learning_rate`` / ``--dataset_split_fraction``
-* outputs: ``imageAdjustment`` model; ``adjusted_images.mrcs`` + ``adjusted_images.xmd``
+* ``--ctf_type``           : apply, wiener, None
+* ``--per_image_contrast`` : relative (default), absolute
+* ``--fit_offset``         : on / off
+* ``--mask``               : provided / not provided
+* ``--batch_size`` / ``--threads`` (several chunks) and ``--ssd_scratch_folder``
+* outputs: ``adjusted_images.mrcs`` + ``adjusted_images.xmd``
 
-Notes (pre-existing, unpatched): the end-of-training ``rmtree(imageAdjustment_CHECKPOINT)``
-is unconditional, but a checkpoint is written at ``i==1`` (epoch 2), so
-``epochs >= 2`` is safe (the suite uses 3). ``predict`` and no-``--mask`` training do
-not create ``--output_path`` (it is written into before the metrics writer makes
-it), so the suite pre-creates it where needed.
+The program creates its own ``--output_path``.
 """
 
 import os
@@ -32,7 +26,6 @@ from common import Scenario
 N_PARTICLES = 96
 BOX = 40
 SR = 2.0
-EPOCHS = 3
 
 
 def prepare_data(workdir):
@@ -40,87 +33,69 @@ def prepare_data(workdir):
     ctf = phantom.write_dataset(
         os.path.join(data_dir, "ctf"),
         phantom.generate_dataset(N_PARTICLES, BOX, SR, apply_ctf=True, seed=1))
-    return {"ctf": ctf}
+    no_ctf = phantom.write_dataset(
+        os.path.join(data_dir, "no_ctf"),
+        phantom.generate_dataset(N_PARTICLES, BOX, SR, apply_ctf=False, seed=2))
+    return {"ctf": ctf, "no_ctf": no_ctf}
 
 
 def scenarios(workdir, data):
     runs = os.path.join(workdir, "runs")
     ctf = data["ctf"]
-    md, vol, mask = ctf["md"], ctf["vol"], ctf["mask"]
+    no_ctf = data["no_ctf"]
 
     def out(name):
         return os.path.join(runs, name)
 
-    def mkdirp(path):
-        return lambda: os.makedirs(path, exist_ok=True)
+    def adjusted(name):
+        return [os.path.join(out(name), "adjusted_images.mrcs"),
+                os.path.join(out(name), "adjusted_images.xmd")]
 
-    def model(name):
-        return os.path.join(out(name), "imageAdjustment")
-
-    base = ["--md", md, "--vol", vol, "--sr", str(SR), "--epochs", str(EPOCHS),
-            "--batch_size", "16", "--load_images_to_ram"]
+    base = ["--md", ctf["md"], "--vol", ctf["vol"], "--sr", str(SR)]
     scn = []
 
-    # 1) train | ctf=apply | --mask | --predict_value
+    # 1) defaults: relative contrast, scale only, whole image
     scn.append(Scenario(
-        name="train_apply_pv",
-        description="train | ctf=apply | --mask | --predict_value",
+        name="adjust_apply",
+        description="adjust | ctf=apply | relative contrast (defaults)",
         program="image_gray_scale_adjustment",
-        args=base + ["--mask", mask, "--ctf_type", "apply", "--mode", "train",
-                     "--predict_value", "--output_path", out("train_apply_pv")],
-        expect_files=[model("train_apply_pv")],
+        args=base + ["--ctf_type", "apply", "--output_path", out("adjust_apply")],
+        expect_files=adjusted("adjust_apply"),
         timeout=600))
 
-    # 2) predict | reload (1) -> adjusted images + metadata
+    # 2) absolute contrast + per-image offset + mask
     scn.append(Scenario(
-        name="predict_pv",
-        description="predict | --reload train_apply_pv -> adjusted_images.mrcs + .xmd",
+        name="adjust_absolute_offset_mask",
+        description="adjust | ctf=apply | --per_image_contrast absolute --fit_offset --mask",
         program="image_gray_scale_adjustment",
-        args=["--md", md, "--vol", vol, "--mask", mask, "--sr", str(SR),
-              "--ctf_type", "apply", "--mode", "predict", "--predict_value",
-              "--batch_size", "16", "--reload", out("train_apply_pv"),
-              "--load_images_to_ram", "--output_path", out("predict_pv")],
-        expect_files=[os.path.join(out("predict_pv"), "adjusted_images.mrcs"),
-                      os.path.join(out("predict_pv"), "adjusted_images.xmd")],
-        pre=mkdirp(out("predict_pv")),
+        args=base + ["--ctf_type", "apply", "--per_image_contrast", "absolute", "--fit_offset",
+                     "--mask", ctf["mask"], "--output_path", out("adjust_absolute_offset_mask")],
+        expect_files=adjusted("adjust_absolute_offset_mask"),
         timeout=600))
 
-    # 3) train | ctf=None | no predict_value | custom lr/split/batch
+    # 3) CTF-free images
     scn.append(Scenario(
-        name="train_none",
-        description="train | ctf=None | per-pixel adjustment | lr=1e-4 split=0.7,0.3",
+        name="adjust_none",
+        description="adjust | ctf=None | CTF-free phantom",
         program="image_gray_scale_adjustment",
-        args=["--md", md, "--vol", vol, "--mask", mask, "--sr", str(SR),
-              "--ctf_type", "None", "--mode", "train", "--epochs", str(EPOCHS),
-              "--batch_size", "8", "--learning_rate", "1e-4",
-              "--dataset_split_fraction", "0.7,0.3", "--lat_dim", "4",
-              "--load_images_to_ram", "--output_path", out("train_none")],
-        expect_files=[model("train_none")],
+        args=["--md", no_ctf["md"], "--vol", no_ctf["vol"], "--sr", str(SR), "--ctf_type", "None",
+              "--output_path", out("adjust_none")],
+        expect_files=adjusted("adjust_none"),
         timeout=600))
 
-    # 4) train | ctf=wiener | mmap (no RAM) + ssd scratch
+    # 4) wiener, chunked streaming and the SSD cache
     scn.append(Scenario(
-        name="train_wiener_mmap",
-        description="train | ctf=wiener | mmap + ssd_scratch",
+        name="adjust_wiener_scratch",
+        description="adjust | ctf=wiener | --batch_size 32 --threads 2 --ssd_scratch_folder",
         program="image_gray_scale_adjustment",
-        args=["--md", md, "--vol", vol, "--mask", mask, "--sr", str(SR),
-              "--ctf_type", "wiener", "--mode", "train", "--epochs", str(EPOCHS),
-              "--batch_size", "16", "--predict_value",
-              "--ssd_scratch_folder", out("train_wiener_mmap_scratch"),
-              "--output_path", out("train_wiener_mmap")],
-        expect_files=[model("train_wiener_mmap")],
-        timeout=600))
-
-    # 5) train | ctf=apply | NO --mask -> auto-generated mask (writes mask.mrc)
-    scn.append(Scenario(
-        name="train_automask",
-        description="train | ctf=apply | auto-generated mask (no --mask)",
-        program="image_gray_scale_adjustment",
-        args=base + ["--ctf_type", "apply", "--mode", "train", "--predict_value",
-                     "--output_path", out("train_automask")],
-        expect_files=[model("train_automask"),
-                      os.path.join(out("train_automask"), "mask.mrc")],
-        pre=mkdirp(out("train_automask")),
+        args=base + ["--ctf_type", "wiener", "--batch_size", "32", "--threads", "2",
+                     "--ssd_scratch_folder", out("adjust_wiener_scratch_cache"),
+                     "--output_path", out("adjust_wiener_scratch")],
+        expect_files=adjusted("adjust_wiener_scratch"),
         timeout=600))
 
     return scn
+
+
+# Every scenario is a single streaming pass over 96 particles: nothing here is slow.
+SLOW = set()
