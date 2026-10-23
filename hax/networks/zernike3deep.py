@@ -51,11 +51,9 @@ class Encoder(nnx.Module):
             hidden_layers = [nnx.Linear(self.input_dim * self.input_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
             for _ in range(n_layers):
                 hidden_layers.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-            hidden_layers.append(nnx.Linear(1024, 256, rngs=rngs, dtype=jnp.bfloat16))
-            for _ in range(2):
-                hidden_layers.append(nnx.Linear(256, 256, rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
             self.hidden_layers = nnx.List(hidden_layers)
-            self.latent = nnx.Linear(256, lat_dim, rngs=rngs)
+            self.latent = nnx.Linear(1024, lat_dim, rngs=rngs)
 
         elif self.architecture == "convnn":
             hidden_layers_conv = [nnx.Linear(self.input_dim * self.input_dim, self.input_conv_dim * self.input_conv_dim, rngs=rngs, dtype=jnp.bfloat16)]
@@ -414,6 +412,7 @@ class Zernike3Deep(nnx.Module):
         self.isTomo = isTomo
         self.isVae = isVae
         self.sigma = nnx.Param(sigma)
+        self.lat_dim = lat_dim
         self.encoder = MultiEncoder(self.xsize, lat_dim, n_layers=3, isVae=isVae, rngs=rngs, isTomo=isTomo) if decoupling or isTomo else Encoder(self.xsize, lat_dim, isVae=isVae, rngs=rngs)
         self.flow_decoder = FlowDecoder(lat_dim, coords.shape[0], self.coords, factor, L1=L1, L2=L2, values=values,
                                         rigid_gauge=rigid_gauge, rigid_gauge_irls=rigid_gauge_irls,
