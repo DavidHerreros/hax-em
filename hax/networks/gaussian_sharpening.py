@@ -57,7 +57,7 @@ def sharp_volume(target_vol, mask=None, fourier_weight=None, ratio_grad=None, ra
     intensity_scale = float(np.percentile(np.asarray(target_vol)[inside], 99))
     if not intensity_scale > 0:
         intensity_scale = float(np.max(np.abs(np.asarray(target_vol)))) or 1.0
-    #target_vol = target_vol / intensity_scale
+    target_vol = target_vol / intensity_scale
 
     if mask is not None:
         manual_init, optimal_sigma = estimate_init_gauss(target_vol, mask, max_gaussians)
@@ -181,7 +181,7 @@ def sharp_volume(target_vol, mask=None, fourier_weight=None, ratio_grad=None, ra
     keep_mask = (actual_weights > weight_floor) & inside_mask(means, active_mask, grid_size)
 
     filtered_means = means[keep_mask]
-    filtered_weights = weights[keep_mask]
+    filtered_weights = weights[keep_mask] * intensity_scale
 
     final_means, final_weights = filtered_means, filtered_weights
 
@@ -240,7 +240,6 @@ def adapt_merge_gaussians(model, grads, key, target_max, mask, max_gaussians=500
     merged_grad_means = jax.ops.segment_sum(grad_means, inverse_indices, num_segments=unique_ids.shape[0])
     grad_norms = jnp.linalg.norm(merged_grad_means, axis=-1)
     normalized_grads = grad_norms / (target_max + 1e-8)
-    print("grad", grad_norms, normalized_grads)
 
     peak_density = merged_weights_actual * kernel_peak
     is_density_exploding = peak_density > (target_max * peak_ratio)
