@@ -29,8 +29,9 @@ def estimate_init_gauss(volume, mask, max_gaussians):
     indices = np.random.choice(n_active, size=k_init, replace=False, p=p_weights)
     sampled_coords = coords[indices]
 
-    weights = volume[sampled_coords[:, 0], sampled_coords[:, 1], sampled_coords[:, 2]]
-    weights = weights * (sum_weights / max(float(np.sum(weights)), 1e-12))
+    #weights = volume[sampled_coords[:, 0], sampled_coords[:, 1], sampled_coords[:, 2]]
+    #weights = weights * (sum_weights / max(float(np.sum(weights)), 1e-12))
+    weights = np.full(k_init, sum_weights / k_init, dtype=np.float32)
 
     factor = 0.5 * volume.shape[0]
     means_norm = (np.stack([sampled_coords[:, 2], sampled_coords[:, 1], sampled_coords[:, 0]], axis=1).astype(
@@ -48,7 +49,7 @@ def inside_mask(means, mask, grid_size):
 
 def sharp_volume(target_vol, mask=None, fourier_weight=None, ratio_grad=None, ratio_lap=None, ratio_tv=None,
                ratio_spars=None, ratio_bound=None, ratio_sigma=None, l1_weight=0.2,
-               n_iterations=1000, max_iterations=5000, learning_rate=0.01, max_gaussians=50000):
+               n_iterations=1000, max_iterations=5000, learning_rate=0.01, max_gaussians=50000, peak_ratio=1.0):
     # Grid size
     grid_size = target_vol.shape[0]
 
@@ -56,7 +57,7 @@ def sharp_volume(target_vol, mask=None, fourier_weight=None, ratio_grad=None, ra
     intensity_scale = float(np.percentile(np.asarray(target_vol)[inside], 99))
     if not intensity_scale > 0:
         intensity_scale = float(np.max(np.abs(np.asarray(target_vol)))) or 1.0
-    target_vol = target_vol / intensity_scale
+    #target_vol = target_vol / intensity_scale
 
     if mask is not None:
         manual_init, optimal_sigma = estimate_init_gauss(target_vol, mask, max_gaussians)
@@ -69,7 +70,7 @@ def sharp_volume(target_vol, mask=None, fourier_weight=None, ratio_grad=None, ra
         # Init Model
         rngs = nnx.Rngs(42)
         model = GaussianSplatModel(n_init=1000, sigma=1.0, grid_size=grid_size, rngs=rngs)
-        active_mask = jnp.zeros_like(target_vol, dtype=jnp.float32)
+        active_mask = jnp.ones_like(target_vol, dtype=jnp.float32)
 
     # Init Optimizer (nnx.Optimizer automatically tracks model params)
     optimizer = nnx.Optimizer(model, optax.adamw(learning_rate), wrt=nnx.Param)
@@ -81,7 +82,11 @@ def sharp_volume(target_vol, mask=None, fourier_weight=None, ratio_grad=None, ra
     pbar = tqdm(range(max_iterations), desc="Fitting volume", file=sys.stdout, ascii=" >=", colour="green",
                 bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
 
+    if fourier_weight is None:
+        fourier_weight = jnp.ones((grid_size, grid_size, grid_size // 2 + 1), dtype=jnp.float32)
+
     target_max = jnp.max(target_vol)
+
     ratios_dict = {
         "grad": ratio_grad,
         "lap": ratio_lap,
@@ -95,21 +100,27 @@ def sharp_volume(target_vol, mask=None, fourier_weight=None, ratio_grad=None, ra
     def recalibrate_weights(current_recon, raw_vals):
         new_weights = {}
         EPS = 1e-8
+
+        effective_recon = max(current_recon - recon_noise_floor, current_recon * 0.05, EPS)
         for key_name, ratio in ratios_dict.items():
             weight_fixed = 1.0 if ratio is None else ratio
-
             raw_v = raw_vals[key_name]
             if key_name in ['bound', 'sigma']:
                 safe_val = raw_v if raw_v > EPS else 0.1
-                new_weights[key_name] = jnp.array(current_recon * weight_fixed / safe_val, dtype=jnp.float32)
             else:
                 safe_val = raw_v if raw_v > EPS else EPS
-                new_weights[key_name] = jnp.array(current_recon * weight_fixed / safe_val, dtype=jnp.float32)
-
+            new_weights[key_name] = jnp.array(effective_recon * weight_fixed / safe_val, dtype=jnp.float32)
         return new_weights
 
-    if fourier_weight is None:
-        fourier_weight = jnp.ones((grid_size, grid_size, grid_size // 2 + 1), dtype=jnp.float32)
+    target_ft_init = np.fft.rfftn(np.asarray(target_vol) * np.asarray(inside))
+    irreducible_ft = target_ft_init * np.sqrt(np.clip(1.0 - np.asarray(fourier_weight), 0.0, 1.0))
+    irreducible_diff = np.fft.irfftn(irreducible_ft, s=target_vol.shape) * np.asarray(inside)
+
+    active_voxels_np = max(1.0, np.sum(inside))
+    noise_floor_l1 = np.sum(np.abs(irreducible_diff)) / active_voxels_np
+    noise_floor_l2 = np.sum(irreducible_diff ** 2) / active_voxels_np
+    recon_noise_floor = float(l1_weight * noise_floor_l1 + (1.0 - l1_weight) * noise_floor_l2)
+    print(f"{bcolors.OKGREEN}[Noise Floor] Irreducible Baseline: {recon_noise_floor:.5f}{bcolors.ENDC}")
 
     key = jax.random.PRNGKey(42)
     with pbar:
@@ -123,7 +134,7 @@ def sharp_volume(target_vol, mask=None, fourier_weight=None, ratio_grad=None, ra
 
                 model, optimizer = nnx.merge(graphdef, state)
                 optimizer = adapt_merge_gaussians(model, grads, subkey, target_max=target_max, mask=active_mask,
-                                                  max_gaussians=max_gaussians, lr=current_lr)
+                                                  max_gaussians=max_gaussians, peak_ratio=peak_ratio, lr=current_lr)
                 graphdef, state = nnx.split((model, optimizer))
 
             if i == 0 or is_densification_step:
@@ -166,14 +177,13 @@ def sharp_volume(target_vol, mask=None, fourier_weight=None, ratio_grad=None, ra
     weights = model.weights.get_value()
     actual_weights = nnx.relu(weights)
 
-    weight_floor = jnp.max(actual_weights) * 0.005
-    keep_mask = actual_weights > weight_floor
+    weight_floor = jnp.max(actual_weights) * 0.01
+    keep_mask = (actual_weights > weight_floor) & inside_mask(means, active_mask, grid_size)
 
     filtered_means = means[keep_mask]
     filtered_weights = weights[keep_mask]
 
     final_means, final_weights = filtered_means, filtered_weights
-    final_weights = final_weights * intensity_scale
 
     model.means = nnx.Param(final_means)
     model.weights = nnx.Param(final_weights)
@@ -181,12 +191,11 @@ def sharp_volume(target_vol, mask=None, fourier_weight=None, ratio_grad=None, ra
 
     return model, k_history
 
-def adapt_merge_gaussians(model, grads, key, target_max, mask, max_gaussians=50000, lr=None, optimizer=None):
+def adapt_merge_gaussians(model, grads, key, target_max, mask, max_gaussians=50000, peak_ratio=1.0, lr=None, optimizer=None):
     means = model.means.get_value()
-    weights_param = model.weights.get_value()
-    actual_weights = nnx.relu(weights_param)
+    actual_weights = nnx.relu(model.weights.get_value())
 
-    prune_threshold = jnp.max(actual_weights) * 0.005
+    prune_threshold = jnp.max(actual_weights) * 0.01
     keep_mask = (actual_weights > prune_threshold) & inside_mask(means, mask, model.grid_size)
 
     means = means[keep_mask]
@@ -209,7 +218,17 @@ def adapt_merge_gaussians(model, grads, key, target_max, mask, max_gaussians=500
     safe_ids = (grid_size_hash[0] * grid_size_hash[1] * grid_size_hash[2]) + jnp.arange(means.shape[0])
     voxel_ids = jnp.where(is_stable, voxel_ids_grid, safe_ids)
 
+    t = jnp.arange(model.grid_size) - model.grid_size // 2
+    sigma_vox = jax.nn.softplus(model.sigma_param.get_value())[0]
+    kernel_peak = (1.0 / jnp.sum(jnp.exp(-0.5 * t ** 2 / sigma_vox ** 2))) ** 3
+
+    _, pre_inverse = jnp.unique(voxel_ids, return_inverse=True)
+    pre_mass = jax.ops.segment_sum(actual_weights, pre_inverse, num_segments=means.shape[0])
+    too_bright = pre_mass[pre_inverse] * kernel_peak > (target_max * peak_ratio)
+    voxel_ids = jnp.where(too_bright, safe_ids, voxel_ids)
+
     unique_ids, inverse_indices = jnp.unique(voxel_ids, return_inverse=True)
+    n_groups = unique_ids.shape[0]
 
     weighted_means = means * actual_weights[:, None]
     sum_weighted_means = jax.ops.segment_sum(weighted_means, inverse_indices, num_segments=unique_ids.shape[0])
@@ -219,21 +238,17 @@ def adapt_merge_gaussians(model, grads, key, target_max, mask, max_gaussians=500
     merged_means = sum_weighted_means / safe_merged_weights[:, None]
 
     merged_grad_means = jax.ops.segment_sum(grad_means, inverse_indices, num_segments=unique_ids.shape[0])
-    merged_weights_param = merged_weights_actual
-
     grad_norms = jnp.linalg.norm(merged_grad_means, axis=-1)
     normalized_grads = grad_norms / (target_max + 1e-8)
     print("grad", grad_norms, normalized_grads)
 
-    base_split_mask = normalized_grads > 0.0002
-    is_noise_chasing = normalized_grads > 0.010
-    sigma_vox = jax.nn.softplus(model.sigma_param.get_value())[0]
-    peak_density = merged_weights_param / ((2.0 * jnp.pi) ** 1.5 * sigma_vox ** 3)
-    is_density_exploding = peak_density > (target_max * 4.0)
-    overfit_mask = is_noise_chasing | is_density_exploding
-    split_mask = base_split_mask & overfit_mask
+    peak_density = merged_weights_actual * kernel_peak
+    is_density_exploding = peak_density > (target_max * peak_ratio)
+    is_signal_region = merged_weights_actual > (target_max * 0.02)
+    base_split_mask = (normalized_grads >= jnp.percentile(normalized_grads, 95.0)) & is_signal_region
+    split_mask = base_split_mask | is_density_exploding
 
-    budget = max(int(max_gaussians) - int(merged_means.shape[0]), 0)
+    budget = max(int(max_gaussians) - int(n_groups), 0)
     if int(jnp.sum(split_mask)) > budget:
         split_score = jnp.where(split_mask, normalized_grads, -jnp.inf)
         best = jnp.argsort(-split_score)[:budget]
@@ -241,12 +256,12 @@ def adapt_merge_gaussians(model, grads, key, target_max, mask, max_gaussians=500
 
     do_not_touch_mask = ~split_mask
     new_means_list = [merged_means[do_not_touch_mask]]
-    new_weights_list = [merged_weights_param[do_not_touch_mask]]
+    new_weights_list = [merged_weights_actual[do_not_touch_mask]]
 
-    n_split = jnp.sum(split_mask)
+    n_split = int(jnp.sum(split_mask))
     if n_split > 0:
         s_means = merged_means[split_mask]
-        s_weights = merged_weights_param[split_mask]
+        s_weights = merged_weights_actual[split_mask]
 
         noise = jax.random.normal(key, s_means.shape) * (1.0 / model.grid_size)
 
@@ -256,11 +271,8 @@ def adapt_merge_gaussians(model, grads, key, target_max, mask, max_gaussians=500
     final_means = jnp.concatenate(new_means_list, axis=0)
     final_actual_weights = jnp.concatenate(new_weights_list, axis=0)
 
-    current_k = final_means.shape[0]
-    if current_k > max_gaussians:
-        top_indices = jnp.argsort(-final_actual_weights)[:max_gaussians]
-        final_means = final_means[top_indices]
-        final_actual_weights = final_actual_weights[top_indices]
+    print(f"\n[Densify] K {int(keep_mask.shape[0])} -> {int(final_means.shape[0])} | pruned {int(jnp.sum(~keep_mask))} "
+          f"merged {int(means.shape[0] - n_groups)} split {n_split} (exploding {int(jnp.sum(is_density_exploding))}) ", flush=True)
 
     model.means = nnx.Param(final_means)
     model.weights = nnx.Param(final_actual_weights)
@@ -274,7 +286,8 @@ def adapt_merge_gaussians(model, grads, key, target_max, mask, max_gaussians=500
 
 # Define Loss Function for NNX
 @partial(jax.jit, static_argnames=("update",))
-def sharpening_step_volume(graphdef, state, target_vol, mask, loss_weights, l1_weight, fourier_weight=None, update=True):
+def sharpening_step_volume(graphdef, state, target_vol, mask, loss_weights, l1_weight, fourier_weight,
+                           update=True):
     model, optimizer = nnx.merge(graphdef, state)
 
     def loss_fn(model, target_vol, mask):
@@ -282,30 +295,26 @@ def sharpening_step_volume(graphdef, state, target_vol, mask, loss_weights, l1_w
         N_voxels = recon.size
         active_voxels = jnp.maximum(1.0, jnp.sum(mask))
 
-        recon_masked = recon * mask
-        if fourier_weight is not None:
-            recon_ft = jnp.fft.rfftn(recon_masked)
-            target_ft = jnp.fft.rfftn(target_vol)
-            recon_blur_ft = recon_ft * fourier_weight
-            diff_ft = recon_blur_ft - target_ft
-            diff = jnp.fft.irfftn(diff_ft, s=recon.shape)
+        recon_ft = jnp.fft.rfftn(recon)
+        recon_blur_ft = recon_ft * fourier_weight
+        recon_blur = jnp.fft.irfftn(recon_blur_ft, s=recon.shape) * mask
+        diff = recon_blur - target_vol
+        diff_ft = jnp.fft.rfftn(diff)
 
-            d = recon.shape[0]
-            fz = jnp.fft.fftfreq(d)[:, None, None]
-            fy = jnp.fft.fftfreq(d)[None, :, None]
-            fx = jnp.fft.rfftfreq(d)[None, None, :]
-            k_norm_sq = fz ** 2 + fy ** 2 + fx ** 2
-            k_sq = k_norm_sq * (2.0 * jnp.pi) ** 2
+        d = recon.shape[0]
+        fz = jnp.fft.fftfreq(d)[:, None, None]
+        fy = jnp.fft.fftfreq(d)[None, :, None]
+        fx = jnp.fft.rfftfreq(d)[None, None, :]
+        k_norm_sq = fz ** 2 + fy ** 2 + fx ** 2
+        k_sq = k_norm_sq * (2.0 * jnp.pi) ** 2
 
-            mult = hermitian_multiplicity(d)
-            power = mult * (diff_ft.real ** 2 + diff_ft.imag ** 2)
+        mult = hermitian_multiplicity(d)
+        power = mult * (diff_ft.real ** 2 + diff_ft.imag ** 2)
 
-            norm_factor_ft = active_voxels * N_voxels
-            raw_grad = jnp.sum(k_sq * power) / norm_factor_ft
-            raw_lap = jnp.sum((k_sq ** 2) * power) / norm_factor_ft
-        else:
-            diff = recon_masked - target_vol
-            raw_grad, raw_lap = 0.0, 0.0
+        norm_factor_ft = active_voxels * N_voxels
+        factor_w = fourier_weight ** 2
+        raw_grad = jnp.sum(factor_w * k_sq * power) / norm_factor_ft
+        raw_lap = jnp.sum(factor_w * (k_sq ** 2) * power) / norm_factor_ft
 
         l1_loss = jnp.sum(jnp.abs(diff)) / active_voxels
         l2_loss = jnp.sum(diff ** 2) / active_voxels
@@ -313,6 +322,7 @@ def sharpening_step_volume(graphdef, state, target_vol, mask, loss_weights, l1_w
         recon_loss = raw_recon_loss
 
         tv_weight_map = jnp.clip(1.0 - target_vol, 0.0, 1.0)
+        recon_masked = recon * mask
         diff_x = (recon_masked[1:, :, :] - recon_masked[:-1, :, :]) * tv_weight_map[:-1, :, :]
         diff_y = (recon_masked[:, 1:, :] - recon_masked[:, :-1, :]) * tv_weight_map[:, :-1, :]
         diff_z = (recon_masked[:, :, 1:] - recon_masked[:, :, :-1]) * tv_weight_map[:, :, :-1]
@@ -337,8 +347,8 @@ def sharpening_step_volume(graphdef, state, target_vol, mask, loss_weights, l1_w
 
         total_loss = (recon_loss + boundary_loss + sigma_loss + grad_loss + laplacian_loss + tv_loss + sparsity_loss)
 
-        return total_loss, (raw_recon_loss, recon_loss, grad_loss, laplacian_loss, tv_loss, sparsity_loss, boundary_loss, sigma_loss,
-                            raw_grad, raw_lap, raw_tv, raw_spars, raw_boundary, raw_sigma)
+        return total_loss, (raw_recon_loss, recon_loss, grad_loss, laplacian_loss, tv_loss, sparsity_loss,
+                            boundary_loss, sigma_loss, raw_grad, raw_lap, raw_tv, raw_spars, raw_boundary, raw_sigma)
 
     (loss_val, aux), grads = nnx.value_and_grad(loss_fn, has_aux=True)(model, target_vol, mask)
 
@@ -364,12 +374,11 @@ def save_fourier_3dfsc(fourier_weight, grid_size, output_path="fourier_psf.mrc")
 
 def main():
     import argparse
-    from scipy.ndimage import gaussian_filter
+    from scipy.ndimage import gaussian_filter, distance_transform_edt
     from hax.generators import MetaDataGenerator
     from hax.utils.fsc import compute_fsc_weight
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--particles", type=str, required=True)
     parser.add_argument("--vol", type=str, required=True)
     parser.add_argument("--mask", type=str, required=True)
     parser.add_argument("--half_map_1", type=str, required=True)
@@ -382,10 +391,11 @@ def main():
     parser.add_argument("--ratio_spars", required=False, type=float)
     parser.add_argument("--ratio_bound", required=False, type=float)
     parser.add_argument("--ratio_sigma", required=False, type=float)
-    parser.add_argument("--l1_weight", required=False, type=float, default=0.8)
-    parser.add_argument("--max_iterations", required=False, type=int, default=100000,
+    parser.add_argument("--l1_weight", required=False, type=float, default=0.2)
+    parser.add_argument("--peak_ratio", required=False, type=float, default=1.0)
+    parser.add_argument("--max_iterations", required=False, type=int, default=10000,
                         help='Total number of iterations to compute in gaussian fitting.')
-    parser.add_argument("--max_gaussians", required=False, type=int, default=20000,
+    parser.add_argument("--max_gaussians", required=False, type=int, default=100000,
                         help='Maximum number of gaussians allowed in gaussian fitting when network tends to overfit.')
     parser.add_argument("--load_images_to_ram", action='store_true',
                         help=f"If provided, images will be loaded to RAM. This is recommended if you want the best performance "
@@ -404,8 +414,9 @@ def main():
     vol = ImageHandler(args.vol).getData()
     mask_data = ImageHandler(args.mask).getData()
 
-    mask_fsc = gaussian_filter(mask_data, sigma=2.0)
-    fourier_weight, _ = compute_fsc_weight(half1=args.half_map_1, half2=args.half_map_2, mask=mask_fsc, mode='wiener',
+    grown = distance_transform_edt(mask_data <= 0) * args.sr <= 6.0
+    mask_fsc = gaussian_filter(grown.astype(np.float32), sigma=3.0 / args.sr)
+    fourier_weight, _ = compute_fsc_weight(half1=args.half_map_1, half2=args.half_map_2, mask=mask_fsc, mode='fsc',
                                                n_cones=250, cone_angle=20.0, phase_randomize=True, hard_cones=True,
                                                sr=args.sr)
     save_fourier_3dfsc(fourier_weight, mask_data.shape[0], "3dfsc.mrc")
@@ -413,7 +424,8 @@ def main():
     model, _ = sharp_volume(vol * mask_data, mask=mask_data, fourier_weight=fourier_weight, ratio_lap=args.ratio_lap,
                           ratio_grad=args.ratio_grad, ratio_tv=args.ratio_tv, ratio_spars=args.ratio_spars,
                           ratio_bound=args.ratio_bound, ratio_sigma=args.ratio_sigma, l1_weight=args.l1_weight,
-                          max_iterations=args.max_iterations, learning_rate=0.01, max_gaussians=args.max_gaussians)
+                          max_iterations=args.max_iterations, learning_rate=0.01, max_gaussians=args.max_gaussians,
+                          peak_ratio=args.peak_ratio)
 
     vol_splatted = np.array(model(no_ringing=True))
     ImageHandler().write(vol_splatted, os.path.join(args.output_path, "consensus_volume.mrc"), overwrite=True, sr=args.sr)

@@ -779,7 +779,7 @@ def main():
 
     downfactor_bio = 2.0 * (topo.mass_kda / 50.0) ** (1 / 3)
     downfactor_comp = (np.prod(vol_orig.shape) / 4_000_000.0) ** (1 / 3)
-    downfactor = float(np.max([downfactor_bio, downfactor_comp]))
+    downfactor = float(np.max([downfactor_bio / apix, downfactor_comp]))
     downfactor = float(np.clip(downfactor, 2.0, 4.0))
     print(f"[INFO] Auto-Configured Downsample Factor: {downfactor:.2f}")
 
