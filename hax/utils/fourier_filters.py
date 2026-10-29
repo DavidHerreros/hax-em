@@ -338,7 +338,7 @@ def wiener2DFilter(images, ctf, pad_factor=2, epsilon=None, reg_frac=1e-2,
         pad_diff = xsize * (pad_factor - 1) // pad_factor
         images = jnp.pad(images, ((0, 0), (pad_diff, pad_diff), (pad_diff, pad_diff)), mode="constant")
 
-    ft_images = jnp.fft.fftshift(jnp.fft.rfft2(images))
+    ft_images = jnp.fft.fftshift(jnp.fft.rfft2(images), axes=(-2, -1))
 
     if epsilon is None:
         # The regularizer is a per-batch noise-model *statistic* (built from
@@ -356,7 +356,7 @@ def wiener2DFilter(images, ctf, pad_factor=2, epsilon=None, reg_frac=1e-2,
     ft_ctf_images_real = ft_images.real * wiener_gain
     ft_ctf_images_imag = ft_images.imag * wiener_gain
     ft_ctf_images = jlx.complex(ft_ctf_images_real, ft_ctf_images_imag)
-    images = jnp.fft.irfft2(jnp.fft.ifftshift(ft_ctf_images))
+    images = jnp.fft.irfft2(jnp.fft.ifftshift(ft_ctf_images, axes=(-2, -1)))
 
     if pad_factor > 1:
         images = images[:, pad_diff:-pad_diff, pad_diff:-pad_diff]
@@ -370,11 +370,11 @@ def ctfFilter(images, ctf, pad_factor=2):
         pad_diff = xsize * (pad_factor - 1) // pad_factor
         images = jnp.pad(images, ((0, 0), (pad_diff, pad_diff), (pad_diff, pad_diff)), mode="constant")
 
-    ft_images = jnp.fft.fftshift(jnp.fft.rfft2(images))
+    ft_images = jnp.fft.fftshift(jnp.fft.rfft2(images), axes=(-2, -1))
     ft_ctf_images_real = ft_images.real * ctf
     ft_ctf_images_imag = ft_images.imag * ctf
     ft_ctf_images = jlx.complex(ft_ctf_images_real, ft_ctf_images_imag)
-    images = jnp.fft.irfft2(jnp.fft.ifftshift(ft_ctf_images))
+    images = jnp.fft.irfft2(jnp.fft.ifftshift(ft_ctf_images, axes=(-2, -1)))
 
     if pad_factor > 1:
         images = images[:, pad_diff:-pad_diff, pad_diff:-pad_diff]
@@ -438,7 +438,7 @@ def gaussianCTFFilter(images, sigma=None, ctf=None, pad_factor=2):
         pad_diff = xsize * (pad_factor - 1) // pad_factor
         images = jnp.pad(images, ((0, 0), (pad_diff, pad_diff), (pad_diff, pad_diff)), mode="constant")
 
-    ft_images = jnp.fft.fftshift(jnp.fft.rfft2(images))
+    ft_images = jnp.fft.fftshift(jnp.fft.rfft2(images), axes=(-2, -1))
 
     if sigma is None:
         filter_2d = ctf
@@ -450,7 +450,7 @@ def gaussianCTFFilter(images, sigma=None, ctf=None, pad_factor=2):
     ft_filtered_real = ft_images.real * filter_2d
     ft_filtered_imag = ft_images.imag * filter_2d
     ft_filtered = jlx.complex(ft_filtered_real, ft_filtered_imag)
-    images = jnp.fft.irfft2(jnp.fft.ifftshift(ft_filtered))
+    images = jnp.fft.irfft2(jnp.fft.ifftshift(ft_filtered, axes=(-2, -1)))
 
     if pad_factor > 1:
         images = images[:, pad_diff:-pad_diff, pad_diff:-pad_diff]
@@ -471,14 +471,14 @@ def rfft2_padded(images, pad_factor=2):
     else:
         images = jnp.pad(images, ((pad_diff, pad_diff), (pad_diff, pad_diff)), mode="constant")
 
-    return jnp.fft.fftshift(jnp.fft.rfft2(images))
+    return jnp.fft.fftshift(jnp.fft.rfft2(images), axes=(-2, -1))
 
 def irfft2_padded(ft_images, pad_factor=2):
     pad_factor_inv = 1. / pad_factor
     xsize = ft_images.shape[1] if ft_images.ndim > 2 else ft_images.shape[0]
     pad_diff = int(xsize * (1. - pad_factor_inv) // 2)
 
-    images = jnp.fft.irfft2(jnp.fft.ifftshift(ft_images))
+    images = jnp.fft.irfft2(jnp.fft.ifftshift(ft_images, axes=(-2, -1)))
     if images.ndim > 2:
         images = images[:, pad_diff:-pad_diff, pad_diff:-pad_diff]
     else:

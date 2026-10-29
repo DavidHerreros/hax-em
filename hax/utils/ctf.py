@@ -70,7 +70,7 @@ def computeCTF(defocusU, defocusV, defocusAngle, cs, kv, sr, img_shape, batch_si
         # ctf = ctf * jnp.sqrt(w)
         ctf = ctf * w
 
-        ctf = jnp.fft.fftshift(ctf[:, :, :img_shape[1]])
+        ctf = jnp.fft.fftshift(ctf[:, :, :img_shape[1]], axes=(-2, -1))
         return ctf
     else:
         return jnp.ones([batch_size, img_shape[0], img_shape[1]], dtype=jnp.float32)
