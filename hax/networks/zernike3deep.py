@@ -33,6 +33,30 @@ def calculate_bounded_strain_loss(positions, radius_graph, consensus_distances, 
     return jnp.sum(edge_weights * penalty) / (jnp.sum(edge_weights) + eps), strain
 
 
+def patch_weights(coords, centres, width=0.4):
+    """Normalized Gaussian blending weights (N, patches) and local coordinates (x - c) / rho"""
+    d_centres = jnp.linalg.norm(centres[:, None] - centres[None], axis=-1) + jnp.diag(jnp.full(centres.shape[0], jnp.inf))
+    rho = width * jnp.mean(jnp.min(d_centres, axis=1))
+    u = (coords[:, None] - centres[None]) / rho
+    return jax.nn.softmax(-0.5 * jnp.sum(u ** 2, axis=-1), axis=1), u
+
+
+def patch_basis(coords, centres, width=0.4):
+    """Blended local affine basis (4 * patches, N): normalized Gaussian patch weights times 1 and (x - c) / rho"""
+    w, u = patch_weights(coords, centres, width)
+    basis = jnp.concatenate([w[..., None], w[..., None] * u], axis=-1).reshape(coords.shape[0], -1).T
+    return basis / jnp.sqrt(jnp.mean(basis ** 2, axis=1, keepdims=True))
+
+
+def patch_rigidity_loss(positions, rest, weights, cxx_inv, knee=0.05):
+    """Huber penalty on the Green strain of each patch's weighted affine fit (rest -> deformed positions)"""
+    my = weights.T @ positions
+    cyx = (weights.T @ (positions[:, :, None] * rest[:, None, :]).reshape(-1, 9)).reshape(-1, 3, 3) - my[:, :, None] * (weights.T @ rest)[:, None, :]
+    F = cyx @ cxx_inv
+    E = jnp.sqrt(jnp.sum(jnp.square(0.5 * (jnp.swapaxes(F, -1, -2) @ F - jnp.eye(3))), axis=(-1, -2)) + 1e-12)
+    return jnp.mean(jnp.where(E < knee, 0.5 * E ** 2, knee * (E - 0.5 * knee)))
+
+
 def logstd_head(in_features, out_features, *, rngs):
     # Posterior log-sigma starts small and input-independent
     return nnx.Linear(in_features, out_features, rngs=rngs, kernel_init=nnx.initializers.zeros_init(),
@@ -40,7 +64,7 @@ def logstd_head(in_features, out_features, *, rngs):
 
 
 class Encoder(nnx.Module):
-    def __init__(self, input_dim, lat_dim=10, n_layers=3, architecture="convnn", isVae=False, *, rngs: nnx.Rngs):
+    def __init__(self, input_dim, lat_dim=10, n_layers=3, architecture="mlpnn", isVae=False, *, rngs: nnx.Rngs):
         self.input_dim = input_dim
         self.input_conv_dim = 32  # Original was 64
         self.out_conv_dim = int(self.input_conv_dim / (2 ** 4))
@@ -51,7 +75,7 @@ class Encoder(nnx.Module):
             hidden_layers = [nnx.Linear(self.input_dim * self.input_dim, 1024, rngs=rngs, dtype=jnp.bfloat16)]
             for _ in range(n_layers):
                 hidden_layers.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
-            hidden_layers.append(nnx.Linear(1024, 1024, rngs=rngs, dtype=jnp.bfloat16))
+            hidden_layers.append(nnx.Linear(1024, 256, rngs=rngs, dtype=jnp.bfloat16))
             self.hidden_layers = nnx.List(hidden_layers)
             self.latent = nnx.Linear(1024, lat_dim, rngs=rngs)
 
@@ -94,10 +118,11 @@ class Encoder(nnx.Module):
             x = rearrange(x, 'b h w c -> b (h w c)')
 
             for layer in self.hidden_layers:
-                if layer.in_features != layer.out_features:
-                    x = nnx.relu(layer(x))
-                else:
-                    x = nnx.relu(x + layer(x))
+                # if layer.in_features != layer.out_features:
+                #     x = nnx.leaky_relu(layer(x))
+                # else:
+                #     x = nnx.leaky_relu(x + layer(x))
+                x = nnx.leaky_relu(layer(x))
 
         elif self.architecture == "convnn":
             x = rearrange(x, 'b h w c -> b (h w c)')
@@ -226,7 +251,8 @@ class MultiEncoder(nnx.Module):
             shifts_rigid = self.rigid_shifts(x_ref)
 
         for layer in self.hidden_layers_latent:
-            x = nnx.relu(x + layer(x))
+            x = nnx.leaky_relu(x + layer(x))
+            # x = nnx.leaky_relu(layer(x))
 
         if self.isVae:
             mean = self.mean_x(x)
@@ -258,8 +284,9 @@ class MultiEncoder(nnx.Module):
 
 class FlowDecoder(nnx.Module):
     def __init__(self, latent_dim, total_voxels, coords, factor, L1=7, L2=7, values=None, rigid_gauge=False,
-                 rigid_gauge_irls=3, basis_radius=1.0, *, rngs: nnx.Rngs):
+                 rigid_gauge_irls=3, basis_radius=1.0, patch_centres=None, patch_width=0.4, patch_rigidity=0.0, *, rngs: nnx.Rngs):
         self.coords = coords
+        self.patch_rigidity = float(patch_rigidity) if patch_centres is not None else 0.0
         self.factor = factor
         self.basis_radius = basis_radius
         self.total_voxels = total_voxels
@@ -274,6 +301,17 @@ class FlowDecoder(nnx.Module):
             coords64 = jnp.asarray(coords, jnp.float64)
             self.basis = jnp.concatenate([computeBasis(coords64, r=basis_radius, sph_coeffs=sph_coeffs, zernike_coeffs=zernike_coeffs,
                                                        degrees=degrees[s:s + 256]) for s in range(0, len(degrees), 256)]).astype(jnp.float32)
+            if patch_centres is not None:
+                # Same overall scale as the Zernike basis, so the coefficient heads behave alike
+                scale = jnp.sqrt(jnp.mean(jnp.square(self.basis)))
+                self.basis = (scale * patch_basis(coords64, jnp.asarray(patch_centres, jnp.float64), patch_width)).astype(jnp.float32)
+                if self.patch_rigidity > 0.0:
+                    # Per-patch weights (each column sums to one) and the inverse rest covariance of the affine fits
+                    w = patch_weights(coords64, jnp.asarray(patch_centres, jnp.float64), patch_width)[0]
+                    w = w / jnp.sum(w, axis=0, keepdims=True)
+                    mx = w.T @ coords64
+                    cxx = jnp.einsum("np,ni,nj->pij", w, coords64, coords64) - mx[:, :, None] * mx[:, None, :]
+                    self.patch_weights, self.patch_cxx_inv = w.astype(jnp.float32), jnp.linalg.inv(cxx).astype(jnp.float32)
 
         # Graph from coordinates
         self.edge_index, self.edge_weights, self.consensus_distances, self.tau, _, _ = build_graph_from_coordinates(self.coords, k_spacing=4, k_knn=6, radius_factor=1.5)
@@ -394,8 +432,8 @@ class Zernike3Deep(nnx.Module):
     @save_config
     def __init__(self, lat_dim, coords, values, xsize, sr, bank_size=1024, ctf_type="apply",
                  sigma=1.0, decoupling=False, isVae=False, L1=7, L2=7, isTomo=False, rigid_gauge=False,
-                 rigid_gauge_irls=3, normalize_images=False, particle_radius=None, basis_radius=1.0, model_version=None,
-                 *, rngs: nnx.Rngs):
+                 rigid_gauge_irls=3, normalize_images=False, particle_radius=None, basis_radius=1.0, patch_centres=None,
+                 patch_width=0.4, patch_rigidity=0.0, model_version=None, *, rngs: nnx.Rngs):
         super(Zernike3Deep, self).__init__()
         if model_version != ZERNIKE3DEEP_MODEL_VERSION:
             raise ValueError(f"This Zernike3Deep model was trained with an older, incompatible version "
@@ -416,7 +454,8 @@ class Zernike3Deep(nnx.Module):
         self.encoder = MultiEncoder(self.xsize, lat_dim, n_layers=3, isVae=isVae, rngs=rngs, isTomo=isTomo) if decoupling or isTomo else Encoder(self.xsize, lat_dim, isVae=isVae, rngs=rngs)
         self.flow_decoder = FlowDecoder(lat_dim, coords.shape[0], self.coords, factor, L1=L1, L2=L2, values=values,
                                         rigid_gauge=rigid_gauge, rigid_gauge_irls=rigid_gauge_irls,
-                                        basis_radius=basis_radius, rngs=rngs)
+                                        basis_radius=basis_radius, patch_centres=patch_centres, patch_width=patch_width,
+                                        patch_rigidity=patch_rigidity, rngs=rngs)
         self.phys_decoder = PhysDecoder(self.xsize, lat_dim=lat_dim, rngs=rngs)
 
         #### Memory bank for latent spaces ####
@@ -706,6 +745,9 @@ def train_step_zernike3deep(graphdef, state, x, labels, md, key, do_update=True,
         # Repulsion is per edge: it starts below half the consensus distance
         loss_repulsion = calculate_repulsion_loss_batch(deformed_positions, radius_graph, consensus_distances)
         loss_graph = (loss_strain + 0.01 * loss_repulsion).mean()
+        if model.flow_decoder.patch_rigidity > 0.0:
+            loss_graph += model.flow_decoder.patch_rigidity * jax.vmap(patch_rigidity_loss, in_axes=(0, None, None, None))(
+                deformed_positions, model.coords, model.flow_decoder.patch_weights, model.flow_decoder.patch_cxx_inv).mean()
         strain_p95 = jax.lax.stop_gradient(jnp.percentile(strain, 95.0))
 
         # Centering loss
@@ -899,6 +941,16 @@ def main():
                         help="Degree of Zernike3D radial component (increasing this value might help finding more localized motions at the expense of higher memory consumption)")
     parser.add_argument("--L2", required=False, type=int, default=7,
                         help="Degree of Zernike3D angular component (increasing this value might help finding more localized motions at the expense of higher memory consumption)")
+    parser.add_argument("--basis", required=False, type=str, default="zernike", choices=["zernike", "patches"],
+                        help=f"Deformation basis. {bcolors.ITALIC}zernike{bcolors.ENDC}: global Zernike3D polynomials ({bcolors.ITALIC}--L1{bcolors.ENDC}, {bcolors.ITALIC}--L2{bcolors.ENDC}); "
+                             f"{bcolors.ITALIC}patches{bcolors.ENDC}: blended local affine patches over the Gaussians, more local motion per coefficient (e.g. domain motions around hinges).")
+    parser.add_argument("--num_patches", required=False, type=int, default=30,
+                        help=f"Number of patches of {bcolors.ITALIC}--basis patches{bcolors.ENDC} (4 coefficients per patch and axis).")
+    parser.add_argument("--patch_width", required=False, type=float, default=0.4,
+                        help=f"Width of the patch blending weights of {bcolors.ITALIC}--basis patches{bcolors.ENDC}, as a fraction of the mean spacing between patch centres.")
+    parser.add_argument("--patch_rigidity", required=False, type=float, default=0.0,
+                        help=f"Weight, relative to the edge strain, of a penalty on the stretch and shear of each patch of {bcolors.ITALIC}--basis patches{bcolors.ENDC} "
+                             f"(Green strain of its local affine fit), so patches move rigidly. Part of the deformation prior scaled by {bcolors.ITALIC}--deformation_strength{bcolors.ENDC}; 0 disables it.")
     ca.add_mode(parser)
     parser.add_argument("--num_gaussians", required=False, type=int,
                         help=f"Number of Gaussians fitted to the reference volume before training. By default it is grown until the fit reaches FSC >= 0.5 on every populated shell (see {bcolors.ITALIC}--fit_resolution{bcolors.ENDC}).")
@@ -952,6 +1004,9 @@ def main():
                   help=f"Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data - "
                        f"{bcolors.WARNING}NOTE{bcolors.ENDC}: Since Zernike3Deep also learns a gray level adjustment, reload must be the path to a folder containing two additional "
                        f"folders called: {bcolors.UNDERLINE}Zernike3Deep{bcolors.ENDC} and {bcolors.UNDERLINE}Gaussian_volume_fitting{bcolors.ENDC})")
+    parser.add_argument("--refit_reference", action='store_true',
+                        help=f"With {bcolors.ITALIC}--reload{bcolors.ENDC} in train mode: fit the Gaussians to {bcolors.ITALIC}--vol{bcolors.ENDC} (e.g. a MoDART map) and fine tune the reloaded "
+                             f"network on them.")
     ca.add_ssd_scratch_folder(parser)
     args = ca.parse_with_config(parser)
 
@@ -1006,9 +1061,11 @@ def main():
     rng = jax.random.PRNGKey(random.randint(0, 2 ** 32 - 1))
     rng, choice_key, model_key = jax.random.split(rng, 3)
 
-    # Reload network
+    # Reload network (with --refit_reference it is rebuilt below on the Gaussians of --vol)
     if args.reload is not None:
-        zernike3deep = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "Zernike3Deep"))
+        reloaded = NeuralNetworkCheckpointer.load(os.path.join(args.reload, "Zernike3Deep"))
+        if not (args.refit_reference and args.mode == "train"):
+            zernike3deep = reloaded
 
     # Train network
     if args.mode == "train":
@@ -1064,17 +1121,38 @@ def main():
             # Zernike3D ball fitted to the Gaussians (normalized units), one sigma of margin
             basis_radius = float(np.linalg.norm((coords - factor) / factor, axis=1).max() + np.max(sigma) / factor)
             print(f"{bcolors.OKCYAN}Zernike3D basis radius: {basis_radius * factor * args.sr:.1f} A{bcolors.ENDC}")
+            patch_centres = None
+            if args.basis == "patches" and args.reload is None:
+                patch_centres = KMeans(n_clusters=args.num_patches, n_init=10, random_state=0).fit(
+                    (coords - factor) / factor, sample_weight=np.maximum(values, 1e-6)).cluster_centers_
+                print(f"{bcolors.OKCYAN}Patch basis: {args.num_patches} patches ({4 * args.num_patches} coefficients per axis){bcolors.ENDC}")
             use_vae = args.kl_lambda != 0
             if not use_vae:
                 print(f"\n{bcolors.WARNING}--kl_lambda is 0: disabling the VAE (using a deterministic latent).{bcolors.ENDC}")
-            zernike3deep = Zernike3Deep(args.lat_dim, coords, values, vol.shape[0], args.sr,
-                                        ctf_type=args.ctf_type, decoupling=True, isVae=use_vae, sigma=sigma,
-                                        L1=args.L1, L2=args.L2, bank_size=1024, isTomo=isTomo,
-                                        rigid_gauge=args.rigid_gauge != "off",
-                                        rigid_gauge_irls=3 if args.rigid_gauge == "core" else 0,
-                                        normalize_images=args.normalize_images, particle_radius=particle_radius,
-                                        basis_radius=basis_radius, model_version=ZERNIKE3DEEP_MODEL_VERSION,
-                                        rngs=nnx.Rngs(model_key))
+            if args.reload is not None:
+                # Architecture of the reloaded network, new reference, reloaded weights. The basis keeps its patch centres and
+                # its ball (grown only if a new Gaussian falls outside it), so the reloaded coefficients keep their meaning
+                config = {k: v for k, v in reloaded.config.items() if k != "_target_"}
+                config.update(coords=coords, values=values, sigma=sigma, basis_radius=max(basis_radius, config.get("basis_radius", 1.0)))
+                zernike3deep = Zernike3Deep(**config, rngs=nnx.Rngs(model_key))
+                weights = nnx.Any(nnx.Param, nnx.BatchStat)
+                source = dict(nnx.to_flat_state(nnx.state(reloaded, weights)))
+                target = nnx.to_flat_state(nnx.state(zernike3deep, weights))
+                # The Gaussian width belongs to the new fit
+                kept = [p for p, v in target if p in source and source[p].shape == v.shape and p != ("sigma",)]
+                nnx.update(zernike3deep, nnx.from_flat_state([(p, source[p] if p in kept else v) for p, v in target]))
+                print(f"{bcolors.OKGREEN}Reference refitted ({coords.shape[0]} Gaussians); {len(kept)}/{len(target)} reloaded weight arrays kept{bcolors.ENDC}")
+                del reloaded
+            else:
+                zernike3deep = Zernike3Deep(args.lat_dim, coords, values, vol.shape[0], args.sr,
+                                            ctf_type=args.ctf_type, decoupling=True, isVae=use_vae, sigma=sigma,
+                                            L1=args.L1, L2=args.L2, bank_size=1024, isTomo=isTomo,
+                                            rigid_gauge=args.rigid_gauge != "off",
+                                            rigid_gauge_irls=3 if args.rigid_gauge == "core" else 0,
+                                            normalize_images=args.normalize_images, particle_radius=particle_radius,
+                                            basis_radius=basis_radius, patch_centres=patch_centres, patch_width=args.patch_width,
+                                            patch_rigidity=args.patch_rigidity, model_version=ZERNIKE3DEEP_MODEL_VERSION,
+                                            rngs=nnx.Rngs(model_key))
 
         zernike3deep.train()
 
