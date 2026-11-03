@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 
-import random
 from functools import partial
 
 import jax
@@ -10,8 +9,8 @@ from jax import random as jnr, numpy as jnp
 from hax.utils import *
 
 
-@partial(jax.jit, static_argnames=["model",])
-def estimate_latent_covariances(model, x, labels, md):
+@partial(jax.jit, static_argnames=["model", "n_samples"])
+def estimate_latent_covariances(model, x, labels, md, key, n_samples=20):
     # Decode clean projection
     x_clean, latent = model.decode_image(x, labels, md, ctf_type=None, return_latent=True)
     x_clean = x_clean[..., None]
@@ -54,13 +53,12 @@ def estimate_latent_covariances(model, x, labels, md):
 
     # Covariance
     z_rnd = []
-    for _ in range(20):
-        key = jnr.PRNGKey(random.randint(0, 2 ** 32 - 1))
-        # noise = jax.random.normal(key, x_clean.shape) * jnp.sqrt(var_map)
-        noise = jax.random.normal(key, x_clean.shape)
+    for sample_key in jnr.split(key, n_samples):
+        # noise = jax.random.normal(sample_key, x_clean.shape) * jnp.sqrt(var_map)
+        noise = jax.random.normal(sample_key, x_clean.shape)
         noise = ctfFilter(noise[..., 0], amp_map[..., 0], pad_factor=2)[..., None]
         x_noisy = x_clean_ctf + noise
-        z_rnd.append(model(x_noisy))
+        z_rnd.append(model(x_noisy, return_alignment_refinement=False))
     return jnp.stack(z_rnd, axis=1), latent
 
 
@@ -77,28 +75,20 @@ def main():
     from hax.generators import MetaDataGenerator, extract_columns
     from hax.programs import estimate_latent_covariances
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--md", required=True, type=str,
-                        help="Xmipp metadata file with the images (+ alignments / CTF) needde to predict the covariances")
-    parser.add_argument("--pickled_nn", required=False, type=str,
-                        help=f"Path to folder containing a pickled neural network (generated from {bcolors.UNDERLINE}mode send_to_pickle{bcolors.ENDC}")
-    parser.add_argument("--batch_size", required=False, type=int, default=64,
-                        help="Determines how many images will be load in the GPU at any moment during training (set by default to 8 - "
-                             f"you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like {bcolors.UNDERLINE}nvidia-smi{bcolors.ENDC} "
-                             f"to monitor and/or measure memory usage and adjust this value")
-    parser.add_argument("--output_path", required=True, type=str,
-                        help="Path to save the estimated covariances")
-    parser.add_argument("--load_images_to_ram", action='store_true',
-                        help=f"If provided, images will be loaded to RAM. This is recommended if you want the best performance and your dataset fits in your RAM memory. If this flag is not provided, "
-                             f"images will be memory mapped. When this happens, the program will trade disk space for performance. Thus, during the execution additional disk space will be used and the performance "
-                             f"will be slightly lower compared to loading the images to RAM. Disk usage will be back to normal once the execution has finished.")
-    parser.add_argument("--ssd_scratch_folder", required=False, type=str,
-                        help=f"When the parameter {bcolors.UNDERLINE}load_images_to_ram{bcolors.ENDC} is not provided, we strongly recommend to provide here a path to a folder in a SSD disk to read faster the data. If not given, the data will be loaded from "
-                             f"the default disk.")
-    args, _ = parser.parse_known_args()
+    from hax.cli import common_args as ca
 
-    # Load neural network (note it MUST be saved in pickle mode to make this script general)
-    model = NeuralNetworkCheckpointer.load(args.pickled_nn)
+    parser = argparse.ArgumentParser()
+    ca.add_md(parser, help="Xmipp metadata file with the images (+ alignments / CTF) needed to predict the covariances")
+    parser.add_argument("--nn_path", required=False, type=str,
+                        help=f"Path to folder containing a saved neural network (HetSIREN, Zernike3Deep...)")
+    ca.add_batch_size(parser, default=64, help=ca.BATCH_SIZE_HELP_ADJUST)
+    ca.add_output_path(parser, help="Path to save the estimated covariances")
+    ca.add_load_images_to_ram(parser)
+    ca.add_ssd_scratch_folder(parser)
+    args = ca.parse_with_config(parser)
+
+    # Load neural network
+    model = NeuralNetworkCheckpointer.load(args.nn_path)
 
     # Prepare metadata
     generator = MetaDataGenerator(args.md)
@@ -121,8 +111,10 @@ def main():
                 bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
     covariances = []
     latents = []
-    for (x, labels) in pbar:
-        z_rnd, z = estimate_latent_covariances(model, x, labels, md_columns)
+    key = jnr.PRNGKey(0)
+    for batch_idx, (x, labels) in enumerate(pbar):
+        batch_key = jnr.fold_in(key, batch_idx)
+        z_rnd, z = estimate_latent_covariances(model, x, labels, md_columns, batch_key)
         latents.append(z)
         diff = z_rnd - z_rnd.mean(axis=1)[:, None, :]
         for d in diff:

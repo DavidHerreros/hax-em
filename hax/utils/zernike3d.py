@@ -31,7 +31,6 @@ from jax import numpy as jnp
 from jax.scipy.special import factorial
 import numpy as np
 import sympy as sp
-import math
 
 
 def precompute_legendre_Q(L2_MAX):
@@ -39,7 +38,7 @@ def precompute_legendre_Q(L2_MAX):
     max_deg = L2_MAX
 
     # will fill into a numpy array first
-    legQ = np.zeros((L2_MAX+1, L2_MAX+1, max_deg+1), dtype=np.float32)
+    legQ = np.zeros((L2_MAX+1, L2_MAX+1, max_deg+1), dtype=np.float64)
 
     for l2 in range(L2_MAX+1):
         for m in range(l2+1):
@@ -54,12 +53,9 @@ def precompute_legendre_Q(L2_MAX):
             coeffs = Qpoly.all_coeffs()    # list: [a_d, a_{d-1}, …, a_0]
 
             # 4) pack into fixed-length, highest-first array
-            arr = np.array(coeffs, dtype=np.float32)
+            arr = np.array(coeffs, dtype=np.float64)
             pad = max_deg + 1 - arr.shape[0]
             arr_padded = np.pad(arr, (pad, 0), mode='constant')
-
-            ratio = math.sqrt(math.factorial(2 * m) / (2 ** m * math.factorial(m)))
-            arr_padded /= ratio
 
             legQ[l2, m, :] = arr_padded
 
@@ -69,17 +65,17 @@ def precompute_legendre_Q(L2_MAX):
 def precompute_chebyshev_TU(M_MAX):
     x = sp.symbols('x')
     max_deg = M_MAX
-    Tcoefs = np.zeros((M_MAX+1, max_deg+1), np.float32)
-    Ucoefs = np.zeros((M_MAX+1, max_deg+1), np.float32)
+    Tcoefs = np.zeros((M_MAX+1, max_deg+1), np.float64)
+    Ucoefs = np.zeros((M_MAX+1, max_deg+1), np.float64)
 
     for m in range(M_MAX+1):
         Tpoly = sp.Poly(sp.chebyshevt(m, x).expand(), x, domain='QQ')
-        Tp    = np.array(Tpoly.all_coeffs(), np.float32)
+        Tp    = np.array(Tpoly.all_coeffs(), np.float64)
         padT  = max_deg+1 - Tp.shape[0]
         Tcoefs[m,:] = np.pad(Tp, (padT,0))
 
         Upoly = sp.Poly(sp.chebyshevu(m, x).expand(), x, domain='QQ')
-        Up    = np.array(Upoly.all_coeffs(), np.float32)
+        Up    = np.array(Upoly.all_coeffs(), np.float64)
         padU  = max_deg+1 - Up.shape[0]
         Ucoefs[m,:] = np.pad(Up, (padU,0))
 
@@ -95,7 +91,7 @@ def precomputePolynomialsSph(l2_max):
 def precomputePolynomialsZernike(l_max, n_max):
     # 1) prepare Sympy
     r = sp.symbols('r')
-    radial_np = np.zeros((n_max+1, l_max+1, n_max+1), dtype=np.float32)
+    radial_np = np.zeros((n_max+1, l_max+1, n_max+1), dtype=np.float64)
 
     # 2) for each (n,l) with same parity
     for n in range(n_max+1):
@@ -107,11 +103,11 @@ def precomputePolynomialsZernike(l_max, n_max):
             # 2a) build the raw (unnormalized) radial expr
             #    Jacobi P_k^(alpha, l+1/2) at x = 2r^2 - 1
             Pk = sp.jacobi(k, 0, l + sp.Rational(1,2), sp.Symbol('x'))
-            expr = ((-1) ** n) * (r ** l) * Pk.subs('x', 1 - 2 * r ** 2)
+            expr = ((-1) ** n) * (r ** l) * Pk.subs('x', 2 * r ** 2 - 1)
 
             # 2b) expand to a polynomial in r
             poly = sp.Poly(sp.expand(expr), r, domain='QQ')
-            coeffs = np.array(poly.all_coeffs(), dtype=np.float32)  # highest-first
+            coeffs = np.array(poly.all_coeffs(), dtype=np.float64)  # highest-first
 
             # 2c) pad to length n_max+1
             pad = n_max + 1 - coeffs.shape[0]
@@ -134,9 +130,10 @@ def computeZernikes3D(l1, n, l2, m, pos, r_max, legendre_Q_coefs, T_coefs, U_coe
     r2_safe = xr * xr + yr * yr + zr * zr + eps * eps
     r_safe = jnp.sqrt(r2_safe)
 
-    R_coefs = zernike_coeffs[n.astype(jnp.int32), l1.astype(jnp.int32)]
+    # Table is indexed [total degree, angular degree]
+    R_coefs = zernike_coeffs[l1.astype(jnp.int32), n.astype(jnp.int32)]
     R_vals = jnp.polyval(R_coefs, r_safe)
-    R = jnp.sqrt(2) * jnp.sqrt(2. * n + l1 + 0.5 + 1) * R_vals
+    R = jnp.sqrt(2. * l1 + 3.) * R_vals
 
     # Spherical Harmonics
     eps = 1e-6

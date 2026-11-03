@@ -1,62 +1,62 @@
 import os
 import sys
+import json
 import struct
+import hashlib
 from glob import glob
 
 import numpy as np
 import random
-from concurrent.futures import ProcessPoolExecutor, as_completed, ThreadPoolExecutor
-from multiprocessing import get_context
+import threading
+from concurrent.futures import as_completed, ThreadPoolExecutor
 from tqdm import tqdm
 from jax import numpy as jnp
 from jax.tree_util import tree_map
-from xmipp_metadata.metadata import XmippMetaData
+from xmipp_metadata.metadata import XmippMetaData, tilt_rotation_matrices
 from hax.utils.loggers import bcolors
 
 
-def _write_one_shard_array_record(path, image_indices, getImage_fn, dtype=np.float16):
+def _write_one_shard_array_record(path, image_indices, getImage_fn, dtype=np.float16,
+                                  group_size=1, chunk_size=1024, on_written=None):
     """
     Worker: loads images for a shard and writes a single ArrayRecord file.
+
+    The shard is streamed in chunks instead of being materialised whole, so peak memory
+    tracks ``chunk_size`` rather than the shard size, and the reads of one chunk overlap
+    the writes of the previous one.
     """
     from array_record.python.array_record_module import ArrayRecordWriter
 
-    # Load images for this shard
-    imgs = getImage_fn(image_indices)
-    imgs = np.ascontiguousarray(imgs.astype(dtype, copy=False))
-
-    # Precompute dtype bytes once per shard
-    dtype_str = imgs.dtype.str.encode("utf-8")
     label_struct = struct.Struct("<I")  # unsigned int label prefix
+    writer = ArrayRecordWriter(path, f"group_size:{group_size},uncompressed")
 
-    # If all images share shape (typical), precompute header too
-    first_shape = imgs[0].shape
-    same_shape = True
-    for k in range(1, len(imgs)):
-        if imgs[k].shape != first_shape:
-            same_shape = False
-            break
-
-    if same_shape:
-        shape = first_shape
-        header = struct.pack(
-            f"<I{len(dtype_str)}sI{len(shape)}I",
-            len(dtype_str), dtype_str, len(shape), *shape
-        )
-
-    writer = ArrayRecordWriter(path, "group_size:1,uncompressed")
+    header, header_shape = None, None
     try:
-        for img, label in zip(imgs, image_indices):
-            raw = img.tobytes()
+        for start in range(0, len(image_indices), chunk_size):
+            idxs = image_indices[start:start + chunk_size]
 
-            if not same_shape:
-                shape = img.shape
-                header = struct.pack(
-                    f"<I{len(dtype_str)}sI{len(shape)}I",
-                    len(dtype_str), dtype_str, len(shape), *shape
-                )
+            # dtype= casts the images as they are read, so the full precision batch is
+            # never materialised alongside the converted one
+            imgs = np.ascontiguousarray(getImage_fn(idxs, dtype=dtype))
+            if imgs.ndim == 2:  # a chunk holding a single image comes back squeezed
+                imgs = imgs[None, ...]
 
-            record_bytes = label_struct.pack(int(label)) + header + raw
-            writer.write(record_bytes)
+            dtype_str = imgs.dtype.str.encode("utf-8")
+
+            for img, label in zip(imgs, idxs):
+                # Images in a stack share a shape, so the header is only rebuilt if one
+                # actually differs
+                if img.shape != header_shape:
+                    header_shape = img.shape
+                    header = struct.pack(
+                        f"<I{len(dtype_str)}sI{len(header_shape)}I",
+                        len(dtype_str), dtype_str, len(header_shape), *header_shape
+                    )
+
+                writer.write(label_struct.pack(int(label)) + header + img.tobytes())
+
+            if on_written is not None:
+                on_written(len(idxs))
     finally:
         writer.close()
 
@@ -78,12 +78,131 @@ def parse_and_decompress(record_bytes):
     return image.astype(np.float32, copy=False)[..., None], label
 
 
+class _RecordRangeSource:
+    """A contiguous record-index view over a random-access grain source.
+
+    Lets a dataset be split into train/val at the *record* level (so even a
+    single-shard dataset can be split) while still exposing a random-access
+    source object for ``grain.DataLoader``.
+    """
+    def __init__(self, source, start, stop):
+        self._source = source
+        self._start = start
+        self._stop = stop
+
+    def __len__(self):
+        return self._stop - self._start
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            start, stop, step = idx.indices(len(self))
+            return [self[i] for i in range(start, stop, step)]
+        if idx < 0:
+            idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+        return self._source[self._start + idx]
+
+
+class _TomoStackSource:
+    """One item per particle: the (T, H, W, 1) stack of its tilt images, zero-padded to T_max with label -1."""
+    def __init__(self, source, groups, decode=None, row_to_record=None):
+        self._source = source
+        self._groups = groups
+        self._t_max = max(len(g) for g in groups)
+        self._decode = decode
+        self._row_to_record = row_to_record  # None when records are stored in metadata-row order
+
+    def __len__(self):
+        return len(self._groups)
+
+    def _fetch(self, rows):
+        """One coalesced read when the backend offers it, instead of len(rows) seeks."""
+        if self._row_to_record is not None:
+            rows = [int(r) for r in self._row_to_record[rows]]
+        batched = getattr(self._source, "__getitems__", None)
+        if batched is not None:
+            return list(batched(rows))
+        return [self._source[r] for r in rows]
+
+    def _stack(self, rows, items):
+        images, labels = [], []
+        for r, item in zip(rows, items):
+            if self._decode is not None:
+                item = self._decode(item)
+            image, label = item[0], item[1]
+            if int(label) != r:
+                raise ValueError(f"record/row mismatch: requested row {r}, got label {label} (stale cache without order.npy?)")
+            images.append(image)
+            labels.append(label)
+        images, labels = np.stack(images, 0), np.asarray(labels)
+        pad = self._t_max - len(rows)
+        if pad:
+            images = np.concatenate([images, np.zeros((pad,) + images.shape[1:], images.dtype)])
+            labels = np.concatenate([labels, np.full(pad, -1, labels.dtype)])
+        return images, labels
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            start, stop, step = idx.indices(len(self))
+            return [self[i] for i in range(start, stop, step)]
+        if idx < 0:
+            idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+
+        rows = [int(r) for r in self._groups[idx]]
+        return self._stack(rows, self._fetch(rows))
+
+    def __getitems__(self, indices):
+        """Every tilt of every requested particle in a single backend read."""
+        groups = [[int(r) for r in self._groups[int(i)]] for i in indices]
+        items = self._fetch([r for group in groups for r in group])
+        out, pos = [], 0
+        for group in groups:
+            out.append(self._stack(group, items[pos:pos + len(group)]))
+            pos += len(group)
+        return out
+
+
+
+class _RecordParitySource:
+    """Every other record: the even (``parity=0``) or odd (``parity=1``) half of a source.
+
+    For half-map reconstruction the two halves must be *statistically equivalent*, and a
+    contiguous split (``_RecordRangeSource``) is not: particle stacks are written in
+    micrograph order, so the first half and the second half differ in defocus, ice thickness
+    and acquisition time, and the FSC between them reports that difference as if it were
+    resolution. Interleaving by parity gives both halves the same pose and defocus
+    distribution -- and it is the same split
+    ``hax.utils.reconstruction.reconstruct_consensus_volume`` uses (``labels % 2 == half``),
+    so a half-map FSC measured here is directly comparable to the consensus's own.
+    """
+    def __init__(self, source, parity):
+        self._source = source
+        self._parity = int(parity)
+        self._len = (len(source) - self._parity + 1) // 2
+
+    def __len__(self):
+        return self._len
+
+    def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            start, stop, step = idx.indices(len(self))
+            return [self[i] for i in range(start, stop, step)]
+        if idx < 0:
+            idx += len(self)
+        if idx < 0 or idx >= len(self):
+            raise IndexError(idx)
+        return self._source[2 * idx + self._parity]
+
+
 def _write_one_shard_mmap(path, image_indices, getImage_fn, dtype=np.float16):
     from mmap_ninja import numpy as np_ninja
 
     def getImage_dtype():
         for idx in image_indices:
-            yield getImage_fn(idx).astype(dtype)
+            yield getImage_fn(idx, dtype=dtype)
 
     np_ninja.from_generator(
         out_dir=path,
@@ -96,7 +215,7 @@ def _write_one_shard_mmap(path, image_indices, getImage_fn, dtype=np.float16):
 class MetaDataGenerator:
     def __init__(self, file, mode=None):
         self.file = file
-        self.md = XmippMetaData(file)
+        self.md = XmippMetaData(file, tomo=True if mode == "tomo" else None)
         self.mode = mode
 
         # Generator mode
@@ -152,37 +271,18 @@ class MetaDataGenerator:
         existing = glob(os.path.join(mmap_output_dir, "dataset-*.arrayrecord"))
         if not existing:
             print(f"{bcolors.OKCYAN}\n###### Creating Array Record from images... ######")
+            np.save(os.path.join(mmap_output_dir, "order.npy"), images_order)  # record position -> metadata row
 
             if not multiple_files:
                 # Single file.
                 shard_name = "dataset-00000.arrayrecord"
                 path = os.path.join(mmap_output_dir, shard_name)
-                from array_record.python.array_record_module import ArrayRecordWriter
-                import struct
 
-                writer = ArrayRecordWriter(path, f"group_size:{group_size},uncompressed")
-                try:
-                    label_struct = struct.Struct("<I")
-                    with tqdm(total=len(images_order), file=sys.stdout, ascii=" >=", colour="green") as pbar:
-                        for i in range(0, len(images_order), batch_reading_size):
-                            idxs = images_order[i:i + batch_reading_size]
-                            imgs = self.md.getMetaDataImage(idxs)
-                            imgs = np.ascontiguousarray(imgs.astype(precision, copy=False))
+                chunk_size = min(batch_reading_size, self._read_chunk_size(len(images_order)))
 
-                            dtype_str = imgs.dtype.str.encode("utf-8")
-                            # assume same shape in batch; recompute header per batch
-                            shape = imgs[0].shape
-                            header = struct.pack(
-                                f"<I{len(dtype_str)}sI{len(shape)}I",
-                                len(dtype_str), dtype_str, len(shape), *shape
-                            )
-
-                            for img, label in zip(imgs, idxs):
-                                record_bytes = label_struct.pack(int(label)) + header + img.tobytes()
-                                writer.write(record_bytes)
-                                pbar.update(1)
-                finally:
-                    writer.close()
+                with tqdm(total=len(images_order), file=sys.stdout, ascii=" >=", colour="green") as pbar:
+                    _write_one_shard_array_record(path, images_order, self.md.getMetaDataImage,
+                                                  precision, group_size, chunk_size, pbar.update)
 
             else:
                 # Multiple files: write shards in parallel
@@ -201,18 +301,30 @@ class MetaDataGenerator:
                     shards.append((path, idxs))
                     shard_idx += 1
 
-                # Submit processes
+                chunk_size = self._read_chunk_size(shard_size)
+
+                # Threads, not processes: the shard writer spends nearly all of its time
+                # inside mrcfile, numpy and the ArrayRecord C++ writer, which all release
+                # the GIL. A process pool would instead re-import this module -- and so
+                # the whole of JAX -- in every worker, which costs seconds per worker and
+                # dwarfs the work itself.
+                lock = threading.Lock()
                 with tqdm(total=n, file=sys.stdout, ascii=" >=", colour="green") as pbar:
-                    with ProcessPoolExecutor(max_workers=num_workers, mp_context=get_context('forkserver')) as ex:
+
+                    def on_written(written):
+                        with lock:
+                            pbar.update(written)
+
+                    with ThreadPoolExecutor(max_workers=num_workers) as ex:
                         futures = [
-                            ex.submit(_write_one_shard_array_record, path, idxs, self.md.getMetaDataImage)
+                            ex.submit(_write_one_shard_array_record, path, idxs,
+                                      self.md.getMetaDataImage, precision, group_size,
+                                      chunk_size, on_written)
                             for (path, idxs) in shards
                         ]
 
-                        # Update progress by shard completion (exact per-record progress would require IPC)
-                        for fut, (_, idxs) in zip(as_completed(futures), shards):
+                        for fut in as_completed(futures):
                             fut.result()  # raise if any error
-                            pbar.update(len(idxs))
 
     def load_images_to_mmap(self, mmap_output_dir=None, images_order=None, shard_size=10000, num_workers=None,
                             precision=np.float16, multiple_files=True):
@@ -240,18 +352,20 @@ class MetaDataGenerator:
                     shards.append((path, idxs))
                     shard_idx += 1
 
-                # Submit processes
+                # Threads, not processes: see load_images_to_array_record -- a process pool
+                # re-imports this module (and so JAX) in every worker
                 with tqdm(total=n, file=sys.stdout, ascii=" >=", colour="green") as pbar:
-                    with ProcessPoolExecutor(max_workers=num_workers) as ex:
-                        futures = [
-                            ex.submit(_write_one_shard_mmap, path, idxs, self.md.getMetaDataImage, precision)
+                    with ThreadPoolExecutor(max_workers=num_workers) as ex:
+                        futures = {
+                            ex.submit(_write_one_shard_mmap, path, idxs,
+                                      self.md.getMetaDataImage, precision): idxs
                             for (path, idxs) in shards
-                        ]
+                        }
 
-                        # Update progress by shard completion (exact per-record progress would require IPC)
-                        for fut, (_, idxs) in zip(as_completed(futures), shards):
+                        # Progress by shard completion (mmap_ninja writes the shard whole)
+                        for fut in as_completed(futures):
                             fut.result()  # raise if any error
-                            pbar.update(len(idxs))
+                            pbar.update(len(futures[fut]))
 
             else:
                 if not os.path.isdir(mmap_output_dir):
@@ -372,16 +486,42 @@ class MetaDataGenerator:
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=16, collate_fn=numpy_collate, persistent_workers=True,
                           pin_memory=True)
 
+    def _read_chunk_size(self, shard_size, budget_bytes=128 << 20):
+        """How many images a shard worker should read at a time.
+
+        A whole shard is far too big to hold: at box 256 a 10k-image shard is 2.6 GB of
+        float32 per worker. Sizing the chunk on the *source* dtype (the stack is read at
+        full precision before the cast lands) keeps peak memory at roughly
+        ``num_workers x budget_bytes`` regardless of box size and shard size.
+        """
+        box = self.md.getMetaDataImage(0).shape
+        bytes_per_image = max(int(np.prod(box)) * np.dtype(np.float32).itemsize, 1)
+        return int(max(1, min(shard_size, budget_bytes // bytes_per_image)))
+
+    def _cache_dir(self, root, prefix, precision):
+        """Name the on-disk image cache after the *dataset* it holds, not just the folder.
+
+        A ``manifest.json`` is written alongside so a cache directory says what it holds.
+        """
+        box = int(self.md.getMetaDataImage(0).shape[0])
+        identity = {"md": os.path.abspath(str(self.file)), "n": int(len(self.md)),
+                    "box": box, "precision": np.dtype(precision).name}
+        digest = hashlib.sha1("|".join(f"{k}={v}" for k, v in identity.items()).encode()).hexdigest()[:10]
+        path = os.path.join(root, f"{prefix}_{digest}")
+        os.makedirs(path, exist_ok=True)
+        manifest = os.path.join(path, "manifest.json")
+        if not os.path.exists(manifest):
+            with open(manifest, "w") as fh:
+                json.dump(identity, fh, indent=2)
+        return path
+
     def prepare_grain_array_record(self, mmap_output_dir=None, preShuffle=False, num_workers=16, precision=np.float16, group_size=1,
                                    shard_size=10000):
         self.grain_dataset_type = "ArrayRecord"
 
         # Prepare folder to save data
-        if mmap_output_dir is None:
-            self.mmap_output_dir = os.path.join(os.path.dirname(self.file), "images_mmap_grain")
-        else:
-            self.mmap_output_dir = os.path.join(mmap_output_dir, "images_mmap_grain")
-        os.makedirs(self.mmap_output_dir, exist_ok=True)
+        root = os.path.dirname(self.file) if mmap_output_dir is None else mmap_output_dir
+        self.mmap_output_dir = self._cache_dir(root, "images_mmap_grain", precision)
 
         # Pre shuffle data before writing
         file_idx = np.arange(len(self.md))
@@ -396,11 +536,8 @@ class MetaDataGenerator:
         self.grain_dataset_type = "MMAP"
 
         # Prepare folder to save data
-        if mmap_output_dir is None:
-            self.mmap_output_dir = os.path.join(os.path.dirname(self.file), "images_mmap")
-        else:
-            self.mmap_output_dir = os.path.join(mmap_output_dir, "images_mmap")
-        os.makedirs(self.mmap_output_dir, exist_ok=True)
+        root = os.path.dirname(self.file) if mmap_output_dir is None else mmap_output_dir
+        self.mmap_output_dir = self._cache_dir(root, "images_mmap", precision)
 
         # Pre shuffle data before writing
         images_order = np.arange(len(self.md))
@@ -411,25 +548,59 @@ class MetaDataGenerator:
                                  shard_size=shard_size, precision=precision, multiple_files=multiple_files)
 
     def return_grain_dataset(self, shuffle="global", batch_size=8, num_epochs=1, num_threads=1, num_workers=16,
-                             split_fraction=None, load_to_ram=False):
+                             split_fraction=None, load_to_ram=False, split_mode="contiguous", stack_tomo=False):
+        """``split_mode`` selects how ``split_fraction`` cuts the dataset in two.
+
+        ``"contiguous"`` (default, unchanged) takes a leading and a trailing record range --
+        right for a train/validation split, where the validation set only has to be held out.
+        ``"parity"`` interleaves instead (even records / odd records), ignoring the actual
+        fractions, which is what half-map reconstruction needs: a contiguous cut of a stack
+        written in micrograph order gives two halves with different defocus and ice, and their
+        FSC reports that as resolution. See ``_RecordParitySource``.
+
+        ``stack_tomo`` (tomo mode only) yields one particle per item -- the full (T, H, W, 1)
+        stack of its tilt images -- instead of one tilt image per item. ``batch_size`` then
+        counts particles, not tilt images. Particles with fewer tilts are zero-padded to the
+        largest tilt count, with label ``-1`` marking the padded rows.
+        """
         import grain
         from array_record.python.array_record_data_source import ArrayRecordDataSource
 
         self.grain_dataset_type = "RAM" if load_to_ram else self.grain_dataset_type
+        needs_parse = self.grain_dataset_type == "ArrayRecord" and not stack_tomo
+
+        groups = None
+        if stack_tomo:
+            if self.mode != "tomo":
+                raise ValueError("stack_tomo requires tomo mode (a subtomo_labels column)")
+            labels = np.asarray(self.md[:, "subtomo_labels"]).astype(int).ravel()
+            order = np.argsort(labels, kind="stable")
+            _, counts = np.unique(labels, return_counts=True)
+            groups = np.split(order, np.cumsum(counts)[:-1])  # ragged: tilt count may vary (excluded views)
+
+        def _split_sources(sources):
+            if split_mode == "parity":
+                return _RecordParitySource(sources, 0), _RecordParitySource(sources, 1)
+            split_point = int(split_fraction[0] * len(sources))
+            return (_RecordRangeSource(sources, 0, split_point),
+                    _RecordRangeSource(sources, split_point, len(sources)))
 
         # Get sources
         if self.grain_dataset_type == "ArrayRecord":
             shard_files = glob(os.path.join(self.mmap_output_dir, "dataset-*.arrayrecord"))
             shard_files.sort()
 
+            sources = ArrayRecordDataSource(shard_files, reader_options={"index_storage_option": "in_memory"})
+            if stack_tomo:
+                order_file = os.path.join(self.mmap_output_dir, "order.npy")
+                row_to_record = np.argsort(np.load(order_file)) if os.path.exists(order_file) else None
+                sources = _TomoStackSource(sources, groups, decode=parse_and_decompress, row_to_record=row_to_record)
             if split_fraction is not None:
-                split_point = int(split_fraction[0] * len(shard_files))
-                sources_train = ArrayRecordDataSource(shard_files[:split_point], reader_options={"index_storage_option": "in_memory"})
-                sources_val = ArrayRecordDataSource(shard_files[split_point:], reader_options={"index_storage_option": "in_memory"})
+                sources_train, sources_val = _split_sources(sources)
                 dataset_train = grain.MapDataset.source(sources_train)
                 dataset_val = grain.MapDataset.source(sources_val)
             else:
-                sources_train = ArrayRecordDataSource(shard_files, reader_options={"index_storage_option": "in_memory"})
+                sources_train = sources
                 dataset_train = grain.MapDataset.source(sources_train)
 
         elif self.grain_dataset_type == "MMAP":  # TODO: Add labels to LazyNinjaGrainSource
@@ -476,14 +647,15 @@ class MetaDataGenerator:
             shard_paths = glob(os.path.join(self.mmap_output_dir, "dataset-*"))
             shard_paths.sort()
 
+            sources = LazyNinjaGrainSource(shard_paths)
+            if stack_tomo:
+                sources = _TomoStackSource(sources, groups)
             if split_fraction is not None:
-                split_point = int(split_fraction[0] * len(shard_paths))
-                sources_train = LazyNinjaGrainSource(shard_paths[split_point:])
-                sources_val = LazyNinjaGrainSource(shard_paths[:split_point])
+                sources_train, sources_val = _split_sources(sources)
                 dataset_train = grain.MapDataset.source(sources_train)
                 dataset_val = grain.MapDataset.source(sources_val)
             else:
-                sources_train = LazyNinjaGrainSource(shard_paths)
+                sources_train = sources
                 dataset_train = grain.MapDataset.source(sources_train)
 
         elif self.grain_dataset_type == "RAM":
@@ -502,23 +674,19 @@ class MetaDataGenerator:
                 def __getitem__(self, idx):
                     return self._data[idx], self._labels[idx]
 
+            sources = NumpyDataSource(images, labels)
+            if stack_tomo:
+                sources = _TomoStackSource(sources, groups)
             if split_fraction is not None:
-                split_point = int(split_fraction[0] * len(images))
-                sources_train = NumpyDataSource(images[split_point:], labels[split_point:])
-                sources_val = NumpyDataSource(images[:split_point], labels[:split_point])
+                sources_train, sources_val = _split_sources(sources)
                 dataset_train = grain.MapDataset.source(sources_train)
                 dataset_val = grain.MapDataset.source(sources_val)
             else:
-                sources_train = NumpyDataSource(images, labels)
+                sources_train = sources
                 dataset_train = grain.MapDataset.source(sources_train)
 
         else:
             raise ValueError("Unknown grain dataset type")
-
-        if split_fraction is not None:
-            split_point = int(split_fraction[0] * len(self.md))
-            dataset_train = dataset_train[:split_point]
-            dataset_val = dataset_val[split_point:]
 
         # Shuffling type
         if shuffle == "global":
@@ -527,7 +695,7 @@ class MetaDataGenerator:
             if split_fraction is not None:
                 dataset_val = dataset_val.shuffle(seed=seed)
 
-            if self.grain_dataset_type == "ArrayRecord":
+            if needs_parse:
                 dataset_train = dataset_train.map(parse_and_decompress)
                 if split_fraction is not None:
                     dataset_val = dataset_val.map(parse_and_decompress)
@@ -563,7 +731,7 @@ class MetaDataGenerator:
         elif shuffle == "global_data_loader":
             # Operations
             operations = []
-            if self.grain_dataset_type == "ArrayRecord":
+            if needs_parse:
                 class ParseAndDecompress(grain.transforms.Map):
                     def map(self, x):
                         return parse_and_decompress(x)
@@ -622,7 +790,7 @@ class MetaDataGenerator:
             if split_fraction is not None:
                 dataset_val = grain.experimental.WindowShuffleMapDataset(dataset_val, window_size=2048, seed=seed) 
 
-            if self.grain_dataset_type == "ArrayRecord":
+            if needs_parse:
                 dataset_train = dataset_train.map(parse_and_decompress)
                 if split_fraction is not None:
                     dataset_val = dataset_val.map(parse_and_decompress)
@@ -649,7 +817,7 @@ class MetaDataGenerator:
         else:
             # Operations
             operations = []
-            if self.grain_dataset_type == "ArrayRecord":
+            if needs_parse:
                 class ParseAndDecompress(grain.transforms.Map):
                     def map(self, x):
                         return parse_and_decompress(x)
@@ -713,7 +881,16 @@ def extract_columns(md, hasCTF=None, isTomo=None):
         columns["ctfSphericalAberration"] = jnp.array(md.getMetaDataColumns("ctfSphericalAberration").astype(jnp.float32))
         columns["ctfVoltage"] = jnp.array(md.getMetaDataColumns("ctfVoltage").astype(jnp.float32))
     if isTomo:
-        columns["subtomo_labels"] = jnp.array(md.getMetaDataColumns("subtomo_labels").astype(jnp.float32))
+        columns["subtomo_labels"] = md.getMetaDataColumns("subtomo_labels").astype(jnp.int32)
+        columns["rotationsTilt"] = tilt_rotation_matrices(md.table)
+    # Tilt-series weighting: the accumulated dose of each tilt image and the tilt amplitude
+    # scale. Both are optional -- older tomo metadata may carry neither -- and absent from
+    # every single-particle data set, so they are looked up rather than required.
+    for label in ("preExposure", "ctfScaleFactor"):
+        if md.isMetaDataLabel(label):
+            columns[label] = jnp.array(md.getMetaDataColumns(label).astype(jnp.float32))
+    if md.isMetaDataLabel("randomSubset"):
+        columns["randomSubset"] = md.getMetaDataColumns("randomSubset").astype(jnp.int32)
     return columns
 
 

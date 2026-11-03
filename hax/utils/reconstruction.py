@@ -1,128 +1,904 @@
+"""Consensus reconstruction from posed particles (Wiener-filtered Fourier gridding).
 
+The images already carry poses, so a consensus map can be recovered directly, without
+any iterative refinement: each particle contributes a central slice of the 3D Fourier
+transform (the projection-slice theorem), so the map is obtained by inserting every
+CTF-weighted slice at its posed orientation and dividing by the accumulated CTF power::
 
+    V(k) = sum_i CTF_i(k) F_i(k)  /  ( sum_i CTF_i(k)^2 + tau )
+
+This is the standard gridding reconstruction: one streaming pass, no iteration, and it
+reaches whatever resolution the data supports.
+
+Three properties are deliberately engineered here.
+
+**It respects the line integral.** The discrete projection-slice identity carries no
+scale factor -- ``fft2(sum_z V)[f0, f1] == fftn(V)[0, f0, f1]`` exactly -- and the Wiener
+quotient above is the least-squares fit of the map to the very images it was built from.
+So summing the reconstruction along an axis reproduces a real projection, and re-projecting
+it reproduces the contrast and value range of the input images. A small residual shrinkage
+(from ``tau`` and from trilinear interpolation) is removed by an explicit global gray-scale
+calibration, computed in closed form from the accumulators at no extra cost.
+
+**It knows its own resolution.** The particles are split into two independent halves and
+reconstructed separately, and the FSC between the half-maps gives the spectral
+signal-to-noise as a function of frequency. That is a gold-standard estimate: it assumes
+nothing about the noise, it is simply measured.
+
+**It denoises optimally.** The half-map FSC is turned into the MMSE filter
+``C(k) = sqrt(2 FSC / (1 + FSC))`` and applied to the combined map. Shells where the
+signal is real (FSC -> 1) pass untouched, so no resolution is thrown away; shells that are
+noise (FSC -> 0) are driven to zero, so none is kept. This is what makes the map usable as
+a reference: noise in it would otherwise propagate straight into the mask, the fitted point
+cloud, and the density gauge's gradients.
+
+Geometry (matching ``PhysDecoder`` / ``tests.phantom._project_batch``):
+
+* real space ``p = R c`` for a 3D point ``c`` in component order ``(x, y, z)``;
+  ``image[row, col] = image[p_y, p_x]`` and the projection runs along ``p_z``;
+  the volume array is indexed ``[z, y, x]``.
+* hence a 2D Fourier coefficient at image frequency ``(f0, f1) = (f_row, f_col)`` lies on
+  the central slice at ``R^T (f1, f0, 0)`` in component order, whose index in the
+  ``[z, y, x]``-ordered volume transform is that vector **reversed**.
+
+``ifftshift`` before every FFT is not cosmetic. The object is centred at ``box // 2``, so
+an un-shifted transform carries a ``(-1)^k`` phase ramp. It cancels for the identity pose
+but *not* for a rotated one (the rotated ``k`` is not integral), which silently destroys
+every rotated slice while leaving the identity case looking perfect.
+"""
+
+import os
 import sys
+from collections import deque
 from functools import partial
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
 from tqdm import tqdm
+
+import jax
 import jax.numpy as jnp
-from jax import random, vmap, jit
-from jax.scipy.ndimage import map_coordinates
+
+from .ctf import eval_ctf
+from .euler import euler_matrix_batch
+from .loggers import bcolors
+
+__all__ = ["reconstruct_consensus_volume", "consensus_mask", "projection_contrast", "contrast_from_sums",
+           "global_contrast_from_sums"]
 
 
-# ---------- Helpers ----------
+def _slice_geometry(box, sr):
+    """Centred frequency grids and the identity-pose central slice, in index units."""
+    g = (np.fft.fftshift(np.fft.fftfreq(box)) * box).astype(np.float32)
+    f0, f1 = np.meshgrid(g, g, indexing="ij")                     # f0 <-> row, f1 <-> col
+    s = np.sqrt((f0 / box) ** 2 + (f1 / box) ** 2) / sr           # spatial frequency, 1/A
+    a = np.arctan2(f0, f1)                                        # azimuth, for astigmatism
+    k_rot = np.stack([f1, f0, np.zeros_like(f0)], 0)              # component order (x, y, z)
+    return (jnp.asarray(s), jnp.asarray(a), jnp.asarray(k_rot),
+            jnp.asarray(f0), jnp.asarray(f1))
 
-def _rand_rot(key):
-    """Random SO(3) via QR; ensures det=+1."""
-    A = random.normal(key, (3, 3))
-    Q, R = jnp.linalg.qr(A)
-    # Make det(Q)=+1
-    sign = jnp.sign(jnp.linalg.det(Q))
-    Q = Q.at[:, 2].set(Q[:, 2] * sign)
-    return Q  # 3x3
 
-def _make_grid(nz, ny, nx):
-    """World grid coordinates in [-1, 1]^3, shaped (3, nz, ny, nx)."""
-    z = jnp.linspace(-1.0, 1.0, nz)
-    y = jnp.linspace(-1.0, 1.0, ny)
-    x = jnp.linspace(-1.0, 1.0, nx)
-    Z, Y, X = jnp.meshgrid(z, y, x, indexing="ij")
-    return jnp.stack([X, Y, Z], axis=0)  # (3, Z, Y, X)
+# Grant & Grigorieff (2015) critical-dose parameterisation, the same one Warp and RELION
+# use to dose-weight tilt series.
+_DOSE_A, _DOSE_B, _DOSE_C = 0.24499, 1.6649, 2.8141
 
-def _world_to_stack_coords(R, grid, nz, ny, nx, ih, iw):
+
+def _critical_dose_reciprocal(s):
+    """``1 / (2 N_c(k))`` on the slice frequency grid -- the exponent of the dose weight.
+
+    ``N_c`` diverges at DC, so the weight there is 1 and nothing is attenuated; the clamp
+    only keeps the power law finite at ``k = 0``.
     """
-    Map world coords to stack coords for sampling a (D,H,W) stack built from image.
-    stack axes order: (depth, v, u) = (z, y, x)
+    k = np.maximum(np.asarray(s, np.float64), 1e-6)
+    return jnp.asarray(1.0 / (2.0 * (_DOSE_A * k ** -_DOSE_B + _DOSE_C)), jnp.float32)
+
+
+def _rows(values, rows, default):
+    """``values[rows]`` on device, or a constant when that column is not in the metadata."""
+    if values is None:
+        return jnp.full((len(rows),), default, jnp.float32)
+    return jnp.asarray(np.asarray(values, np.float32)[rows])
+
+
+def _dose_weight(inv2nc, dose, scale):
+    """The per-tilt weight already folded into a tomography particle image.
+
+    ``exp(-dose / 2 N_c(k))`` is the radiation-damage weighting; ``scale``
+    (``rlnCtfScalefactor``, ~``cos(tilt)``) is the amplitude term that goes with the longer
+    path length at high tilt. Both multiply the CTF, so as far as the reconstruction is
+    concerned they are one weight ``W`` and the total premultiplier is ``CTF * W``.
     """
-    # world -> camera/stack space: s = R^T * w
-    X, Y, Z = grid[0], grid[1], grid[2]  # (Z,Y,X)
-    w = jnp.stack([X, Y, Z], axis=0)     # (3, Z,Y,X)
-    s = jnp.einsum("ij,jxyz->ixyz", R.T, w)                       # (3, Z,Y,X)
+    return jnp.exp(-dose[:, None, None] * inv2nc[None]) * scale[:, None, None]
 
-    xs, ys, zs = s[0], s[1], s[2]  # in [-1,1]
 
-    # Scale from [-1,1] to index space [0..N-1]
-    def to_idx(a, N):
-        return (a + 1.0) * 0.5 * (N - 1.0)
+@partial(jax.jit, static_argnums=(7, 10), donate_argnums=(0, 1))
+def _insert_slices(num, den, images, rotations, shifts, ctf, k_rot, box, f0, f1,
+                   premultiplied=False, dose_w=None, valid=None):
+    """Accumulate one batch of CTF-weighted central slices into the 3D transform.
 
-    u = to_idx(xs, iw)  # width
-    v = to_idx(ys, ih)  # height
-    d = to_idx(zs, nz)  # depth
-    return d, v, u  # each (Z,Y,X)
+    ``premultiplied`` says whether the stored images have already been multiplied by their
+    CTF by whatever extracted them. See the ``data``/``weight`` lines below.
 
-@partial(jit, static_argnums=[3,])
-def _accumulate_one_image(image, R, grid, vol_shape):
+    ``dose_w`` is that image's dose/tilt weight ``W``, broadcast over the slice. Tomography
+    extractions premultiply by ``CTF * W``, not by ``CTF`` alone, so ``W`` belongs in the
+    denominator with it -- see the ``weight`` line.
+
+    The accumulators are **donated**, so the scatter lands in place. Without that, XLA has to
+    preserve the caller's buffers: every call allocates a fresh ``num`` (262 MB at box 320) and
+    ``den`` (131 MB), copies the running totals in, and frees the old pair afterwards. The copy
+    is wasted bandwidth, but the free is worse -- with preallocation disabled it is a
+    ``cudaFree``, which *synchronizes the device*, so the GPU drains and idles once per batch
+    instead of staying fed. Donation means the caller's ``num``/``den`` are invalid after the
+    call, which is exactly how the streaming loop uses them (it rebinds the result).
     """
-    Back-project one image into the volume by repeating it across depth,
-    rotating coords back into the stack, sampling, and accumulating.
+    ft = jnp.fft.fftshift(jnp.fft.fft2(jnp.fft.ifftshift(images, axes=(-2, -1))), axes=(-2, -1))
+
+    # Re-centre each particle: the projector places its content at
+    # (row, col) = (p_y - shift_y, p_x - shift_x), so divide the corresponding phase out.
+    phase = jnp.exp(-2j * jnp.pi * (shifts[:, 1, None, None] * f0[None]
+                                    + shifts[:, 0, None, None] * f1[None]) / box)
+    ft = ft * phase
+
+    # The image as stored is CTF*W*O, so the matched filter is CTF*W and the Wiener
+    # denominator is sum((CTF*W)^2). Leaving W out of the denominator does not cancel: it
+    # leaves the map multiplied by the CTF^2-weighted mean of W, which for a 40-tilt series
+    # is a ~450 A^2 B-factor -- a real, avoidable loss of everything past ~20 A.
+    w = ctf if dose_w is None else ctf * dose_w
+    data = ft if premultiplied else ft * w
+    weight = w ** 2
+    if valid is not None:
+        data = data * valid[:, None, None]
+        weight = weight * valid[:, None, None]
+
+    k = jnp.einsum("bji,jhw->bihw", rotations, k_rot)             # R^T @ (f1, f0, 0), components
+    k = jnp.stack([k[:, 2], k[:, 1], k[:, 0]], 1)                 # reversed -> volume array order
+
+    def scatter(num, den, coords, value, weight):
+        pos = coords + box // 2
+        base = jnp.floor(pos).astype(jnp.int32)
+        frac = pos - base
+        for dz in (0, 1):
+            for dy in (0, 1):
+                for dx in (0, 1):
+                    idx = base + jnp.array([dz, dy, dx], jnp.int32)[None, :, None, None]
+                    w = ((frac[:, 0] if dz else 1.0 - frac[:, 0]) *
+                         (frac[:, 1] if dy else 1.0 - frac[:, 1]) *
+                         (frac[:, 2] if dx else 1.0 - frac[:, 2]))
+                    w = w * jnp.all((idx >= 0) & (idx <= box - 1), axis=1)
+                    z, y, x = [jnp.clip(idx[:, i], 0, box - 1) for i in range(3)]
+                    num = num.at[z, y, x].add(value * w)
+                    den = den.at[z, y, x].add(weight * w)
+        return num, den
+
+    # Only the slice itself is scattered here; its Friedel mate is added once at the end of
+    # the pass by ``_hermitian_symmetrize``, which is the same thing for half the atomics.
+    return scatter(num, den, k, data, weight)
+
+
+def _symmetrize_accumulators(num, den, matrices):
+    """Average the accumulators over a point group, in Fourier space"""
+    from jax.scipy.ndimage import map_coordinates
+
+    matrices = np.asarray(matrices, np.float64)
+    box = num.shape[0]
+    g = np.arange(box, dtype=np.float32) - box // 2
+    z, y, x = np.meshgrid(g, g, g, indexing="ij")
+    k = jnp.asarray(np.stack([x.ravel(), y.ravel(), z.ravel()], 0))       # (3, N), (x, y, z)
+
+    def resample(vol, coords):
+        vol_re = map_coordinates(jnp.real(vol), coords, order=1, mode="constant", cval=0.0)
+        if not jnp.iscomplexobj(vol):
+            return vol_re.reshape(vol.shape)
+        vol_im = map_coordinates(jnp.imag(vol), coords, order=1, mode="constant", cval=0.0)
+        return (vol_re + 1j * vol_im).reshape(vol.shape)
+
+    num_sym, den_sym = jnp.zeros_like(num), jnp.zeros_like(den)
+    for S in matrices:
+        ks = jnp.asarray(S, jnp.float32) @ k                                # rotated (x, y, z)
+        coords = jnp.stack([ks[2], ks[1], ks[0]], 0) + box // 2            # -> [z, y, x] index
+        num_sym = num_sym + resample(num, coords)
+        den_sym = den_sym + resample(den, coords)
+    return num_sym / len(matrices), den_sym / len(matrices)
+
+
+def _hermitian_symmetrize(num, den):
+    """Add the Friedel mate F(-k) = conj(F(k)) of everything accumulated so far.
+
+    Inserting each slice's mate as it streams by (the obvious way) doubles the scatter work
+    of every single particle, and the scatter is what this reconstruction spends its GPU time
+    on. It is also unnecessary: the trilinear neighbourhood of ``-k`` is the exact mirror of
+    the neighbourhood of ``+k``, with mirrored weights -- for a sample at ``pos = k + c``,
+    ``floor(2c - pos) = 2c - floor(pos) - 1``, so the two corner sets mirror into each other
+    and the interpolation weight ``1 - frac`` mirrors ``frac``. Mirroring the accumulators
+    once at the end therefore reproduces the double insertion exactly, at the cost of one pass
+    over the grid instead of doubling the cost of one pass over the *data*.
+
+    ``roll(flip(A), 1)`` maps voxel ``i`` to its mate ``box - i``. The wrap at ``i = 0`` is
+    not an accident: that plane is Nyquist, which under the DFT's periodicity is its own
+    Friedel mate and must come out real -- and ``A[0] + conj(A[0])`` is exactly what makes it so.
     """
-    nz, ny, nx = vol_shape
-    ih, iw = image.shape
+    def mirror(a):
+        return jnp.roll(jnp.flip(a, axis=(0, 1, 2)), shift=(1, 1, 1), axis=(0, 1, 2))
+    return num + jnp.conj(mirror(num)), den + mirror(den)
 
-    # Build the stack (depth, v, u) by repeating the image along depth
-    # shape: (nz, ih, iw)
-    stack = jnp.broadcast_to(image, (nz, ih, iw))
 
-    # Map world-grid coordinates to this stack's index coordinates
-    d, v, u = _world_to_stack_coords(R, grid, nz, ny, nx, ih, iw)
+def _gridding_correction(box):
+    """Trilinear insertion convolves the transform with a triangle kernel, which multiplies
+    the real-space volume by sinc^2. Divide it back out."""
+    r = np.fft.fftshift(np.fft.fftfreq(box))
+    z, y, x = np.meshgrid(r, r, r, indexing="ij")
+    return np.maximum((np.sinc(x) * np.sinc(y) * np.sinc(z)) ** 2, 1e-2)
 
-    # Sample stack at (d, v, u) with trilinear interpolation
-    # map_coordinates expects coords shaped (ndim, ...)
-    coords = jnp.stack([d, v, u], axis=0)  # (3, Z,Y,X)
-    sampled = map_coordinates(stack, coords, order=1, mode="constant", cval=0.0)
 
-    # Also accumulate a weight mask for simple normalization
-    in_bounds = (
-        (d >= 0) & (d <= nz - 1) &
-        (v >= 0) & (v <= ih - 1) &
-        (u >= 0) & (u <= iw - 1)
-    )
-    weight = in_bounds.astype(sampled.dtype)
-    return sampled, weight  # (Z,Y,X), (Z,Y,X)
+def _shell_index(box):
+    """Radial shell index of every voxel of the centred 3D transform."""
+    g = np.fft.fftshift(np.fft.fftfreq(box)) * box
+    z, y, x = np.meshgrid(g, g, g, indexing="ij")
+    return np.clip(np.rint(np.sqrt(x ** 2 + y ** 2 + z ** 2)).astype(int), 0, box // 2)
 
-# Vectorize over a batch of images/rotations
-_batch_accumulate = vmap(_accumulate_one_image, in_axes=(0, 0, None, None))
 
-# ---------- Public API ----------
+def _invert(num, den, tau, box):
+    """Wiener quotient -> real volume, with the gridding envelope removed."""
+    shells = _shell_index(box)
+    low = jnp.asarray((shells >= 1) & (shells <= max(2, box // 16)), jnp.float32)
+    floor = tau * jnp.sum(den * low) / jnp.sum(low)
+    volume_ft = num / (den + floor)
+    volume = jnp.real(jnp.fft.fftshift(jnp.fft.ifftn(jnp.fft.ifftshift(volume_ft))))
+    return np.asarray(volume) / _gridding_correction(box)
 
-# @partial(jit, static_argnames=["vol_shape", "data_loader"])
-def reconstruct_volume_streaming(key, vol_shape, data_loader):
+
+def _soft_sphere(box, radius_px, edge_px=5.0):
+    """Spherical mask with a cosine edge ``edge_px`` wide, centred in the box."""
+    g = np.arange(box) - box // 2
+    z, y, x = np.meshgrid(g, g, g, indexing="ij")
+    r = np.sqrt(x ** 2 + y ** 2 + z ** 2)
+    t = np.clip((r - radius_px) / edge_px, 0.0, 1.0)
+    return (0.5 * (1.0 + np.cos(np.pi * t))).astype(np.float32)
+
+
+def _half_assignment(columns, n):
+    if "randomSubset" in columns:
+        subset = np.asarray(columns["randomSubset"]).ravel().astype(np.int64)
+        if subset.shape[0] == n and np.unique(subset).size == 2:
+            return (subset != subset.min()).astype(np.int64), "rlnRandomSubset"
+    if "subtomo_labels" in columns:
+        particle = np.asarray(columns["subtomo_labels"]).ravel().astype(np.int64)
+        if particle.shape[0] == n:
+            return particle % 2, "particle parity (tilt-series rows grouped by particle)"
+    return np.arange(n, dtype=np.int64) % 2, "row parity"
+
+
+def _half_map_fsc(vol_a, vol_b, shells, n_shells):
+    """FSC between two independently reconstructed half-maps."""
+    fa = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(vol_a)))
+    fb = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(vol_b)))
+    fsc = np.zeros(n_shells, np.float64)
+    for i in range(n_shells):
+        m = shells == i
+        if not m.any():
+            continue
+        cross = np.sum(fa[m] * np.conj(fb[m])).real
+        norm = np.sqrt(np.sum(np.abs(fa[m]) ** 2) * np.sum(np.abs(fb[m]) ** 2))
+        fsc[i] = cross / norm if norm > 0 else 0.0
+    return np.clip(fsc, 0.0, 1.0)
+
+
+def _radial_shells(box):
+    """Radial shell index of every voxel of the centred 3D transform"""
+    g = (np.fft.fftshift(np.fft.fftfreq(box)) * box).astype(np.float32)
+    r2 = g[:, None, None] ** 2 + g[None, :, None] ** 2 + g[None, None, :] ** 2
+    return np.clip(np.rint(np.sqrt(r2)).astype(np.int32), 0, box // 2)
+
+
+def volume_fsc(vol_a, vol_b, mask=None):
+    """Shell-by-shell Fourier correlation between two maps of the same box"""
+    a = np.asarray(vol_a, np.float64)
+    b = np.asarray(vol_b, np.float64)
+    if mask is not None:
+        m = np.asarray(mask, np.float64)
+        a = a * m
+        b = b * m
+
+    box = a.shape[0]
+    n_shells = box // 2 + 1
+    shells = _radial_shells(box).ravel()
+
+    fa = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(a))).ravel()
+    fb = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(b))).ravel()
+
+    cross = np.bincount(shells, weights=(fa * np.conj(fb)).real, minlength=n_shells)
+    power_a = np.bincount(shells, weights=np.abs(fa) ** 2, minlength=n_shells)
+    power_b = np.bincount(shells, weights=np.abs(fb) ** 2, minlength=n_shells)
+
+    norm = np.sqrt(power_a[:n_shells] * power_b[:n_shells])
+    fsc = np.where(norm > 0, cross[:n_shells] / np.where(norm > 0, norm, 1.0), 0.0)
+    return np.clip(fsc, -1.0, 1.0), power_a[:n_shells]
+
+
+def shell_relative_error(vol_fit, vol_ref, mask=None):
+    """Per-shell relative error of an approximation against a reference"""
+    a = np.asarray(vol_ref, np.float64)
+    b = np.asarray(vol_fit, np.float64)
+    if mask is not None:
+        m = np.asarray(mask, np.float64)
+        a = a * m
+        b = b * m
+
+    box = a.shape[0]
+    n_shells = box // 2 + 1
+    shells = _radial_shells(box).ravel()
+
+    fa = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(a))).ravel()
+    fb = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(b))).ravel()
+
+    resid = np.bincount(shells, weights=np.abs(fa - fb) ** 2, minlength=n_shells)[:n_shells]
+    power_a = np.bincount(shells, weights=np.abs(fa) ** 2, minlength=n_shells)[:n_shells]
+    error = np.sqrt(np.where(power_a > 0, resid / np.where(power_a > 0, power_a, 1.0), 0.0))
+    return error, power_a
+
+
+def shell_resolution(curve, power_ref, box, sr, threshold, ascending_is_bad=True,
+                     power_floor=1e-4):
+    """Resolution (A) out to which a per-shell quality curve stays acceptable"""
+    curve = np.asarray(curve, np.float64)
+    power_ref = np.asarray(power_ref, np.float64)
+    live = (power_ref > power_floor * power_ref[1:].max()) if power_ref[1:].size else power_ref > 0
+
+    last = 0
+    for i in range(1, len(curve)):
+        if not live[i]:
+            continue
+        failed = curve[i] > threshold if ascending_is_bad else curve[i] < threshold
+        if failed:
+            break
+        last = i
+    return ((box * sr) / last if last > 0 else float("inf")), last
+
+
+def live_shell_limit(power_ref, box, sr, power_floor=1e-4):
+    """Resolution (A) of the outermost shell the reference actually populates."""
+    power_ref = np.asarray(power_ref, np.float64)
+    if power_ref[1:].size == 0:
+        return 2.0 * sr, 0
+    live = np.flatnonzero(power_ref > power_floor * power_ref[1:].max())
+    last = int(live[-1]) if live.size else 0
+    return ((box * sr) / last if last > 0 else 2.0 * sr), last
+
+
+def _fsc_filter(fsc):
+    """MMSE filter for the combined map given the half-map FSC.
+
+    ``C = sqrt(2 FSC / (1 + FSC))`` is the standard relation between the half-map FSC and
+    the optimal filter for the full map (which has twice the particles, hence twice the
+    SSNR). Everything past the first shell that drops to zero correlation is truncated:
+    beyond it there is nothing but noise, and letting an upward FSC fluctuation resurrect a
+    shell is how noise gets back into a "denoised" map.
     """
-    Args:
-      batches: iterable (Python) of JAX arrays shaped (B, H, W).
-               You can pass e.g. a list/tuple of DeviceArrays.
-      key: jax.random.PRNGKey.
-      vol_shape: (Z, Y, X) tuple for the output volume grid.
+    fsc = np.asarray(fsc, np.float64).copy()
+    dead = np.flatnonzero(fsc <= 0.0)
+    if dead.size:
+        fsc[dead[0]:] = 0.0
+    return np.sqrt(np.maximum(2.0 * fsc / (1.0 + fsc), 0.0))
 
-    Returns:
-      volume: (Z, Y, X) reconstruction from all batches.
-      rotations_per_batch: list of arrays, each (B, 3, 3) rotations used.
+
+def _resolution(fsc, box, sr, threshold=0.143):
+    """Resolution (A) at which the half-map FSC first falls below ``threshold``."""
+    for i in range(1, len(fsc)):
+        if fsc[i] < threshold:
+            return (box * sr) / i if i > 0 else float("inf")
+    return 2.0 * sr
+
+
+@partial(jax.jit, static_argnums=(5,))
+def _project(volume_ft, rotations, shifts, ctf, k_rot, box, f0, f1):
+    """Forward-project the map: the exact adjoint of ``_insert_slices``.
+
+    Extract each central slice, re-apply that particle's CTF and in-plane shift, and invert.
+    The result is what the map predicts the particle should look like.
     """
-    nz, ny, nx = vol_shape
-    grid = _make_grid(nz, ny, nx)
+    k = jnp.einsum("bji,jhw->bihw", rotations, k_rot)
+    k = jnp.stack([k[:, 2], k[:, 1], k[:, 0]], 1) + box // 2
 
-    vol = jnp.zeros(vol_shape, dtype=jnp.float32)
-    wsum = jnp.zeros(vol_shape, dtype=jnp.float32)
+    def one(coords):
+        re = jax.scipy.ndimage.map_coordinates(volume_ft.real, coords, order=1, mode="constant")
+        im = jax.scipy.ndimage.map_coordinates(volume_ft.imag, coords, order=1, mode="constant")
+        return re + 1j * im
 
-    rotations_per_batch = []
+    ft = jax.vmap(one)(k) * ctf
+    phase = jnp.exp(2j * jnp.pi * (shifts[:, 1, None, None] * f0[None]
+                                   + shifts[:, 0, None, None] * f1[None]) / box)
+    ft = ft * phase
+    return jnp.real(jnp.fft.fftshift(jnp.fft.ifft2(jnp.fft.ifftshift(ft, axes=(-2, -1))), axes=(-2, -1)))
 
-    # Note: Python loop is fine — inner math is JIT/Vmapped.
-    pbar = tqdm(data_loader, desc=f"Progress", file=sys.stdout, ascii=" >=", colour="green")
-    for (batch, _) in pbar:
-        # batch: (B, H, W)
-        B = batch.shape[0]
 
-        # random rotations for this batch
-        subkeys = random.split(key, B + 1)
-        key = subkeys[0]
-        Rs = vmap(_rand_rot)(subkeys[1:])  # (B, 3, 3)
-        rotations_per_batch.append(Rs)
+def _gray_scale(volume, reader, columns, sr, box, has_ctf, k_rot, f0, f1, s, a, n_probe=2000,
+                batch_size=256, premultiplied=False, dose=None, scalefactor=None, inv2nc=None):
+    """Global scale putting the map's projections on the gray scale of the input images.
 
-        # accumulate for the whole batch
-        sampled_b, weight_b = _batch_accumulate(batch[..., 0], Rs, grid, vol_shape)  # (B, Z,Y,X) each
+    Measured, not derived: forward-project the finished map at a subset of the real poses,
+    re-apply each CTF and shift, and take the least-squares scale against the actual images.
+    A closed form in terms of the accumulators looks tempting but is wrong -- the insertion
+    and extraction kernels are adjoint rather than identical, and the shells with almost no
+    CTF power dominate the sum while carrying no reliable scale information.
 
-        # sum over batch and add
-        vol = vol + sampled_b.sum(axis=0)
-        wsum = wsum + weight_b.sum(axis=0)
+    The residual it removes (a few per cent to ~15%) comes from the Wiener floor and from
+    the interpolation, and it matters: the reference's projections are compared directly
+    against the images during training, where a systematic amplitude error cannot be undone.
+    """
+    n = min(int(n_probe), reader.n)
+    if n < 8:
+        return 1.0
 
-    # avoid divide-by-zero
-    volume = jnp.where(wsum > 0, vol / jnp.clip(wsum, a_min=1e-6), 0.0)
-    return volume, rotations_per_batch
+    idx = np.linspace(0, reader.n - 1, n).astype(np.int64)
+    volume_ft = jnp.asarray(np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(np.asarray(volume)))))
+    angles = np.asarray(columns["euler_angles"], np.float32)
+    shifts = np.asarray(columns["shifts"], np.float32)
+    kv = float(np.asarray(columns["ctfVoltage"]).ravel()[0]) if has_ctf else 0.0
+
+    cross = 0.0
+    energy = 0.0
+    for start in range(0, n, batch_size):
+        chunk = idx[start:start + batch_size]
+        images = reader.read(chunk)
+
+        ang = jnp.asarray(angles[chunk])
+        rotations = euler_matrix_batch(ang[:, 0], ang[:, 1], ang[:, 2])
+        if has_ctf:
+            ctf = eval_ctf(s[None], a[None],
+                           jnp.asarray(np.asarray(columns["ctfDefocusU"])[chunk]),
+                           jnp.asarray(np.asarray(columns["ctfDefocusV"])[chunk]),
+                           angast=jnp.asarray(np.asarray(columns["ctfDefocusAngle"])[chunk]),
+                           cs=jnp.asarray(np.asarray(columns["ctfSphericalAberration"])[chunk]),
+                           kv=kv)
+        else:
+            ctf = jnp.ones((chunk.shape[0], box, box), jnp.float32)
+
+        if inv2nc is not None:
+            ctf = ctf * _dose_weight(inv2nc, _rows(dose, chunk, 0.0), _rows(scalefactor, chunk, 1.0))
+
+        # Predict the image as *stored*: pre-multiplied data carries (CTF*W)^2 * P(V), so the
+        # forward model has to square the weight too or the scale comes out biased.
+        predicted = _project(volume_ft, rotations, jnp.asarray(shifts[chunk]),
+                             ctf ** 2 if premultiplied else ctf,
+                             k_rot, box, f0, f1)
+        cross += float(jnp.sum(predicted * jnp.asarray(images)))
+        energy += float(jnp.sum(predicted ** 2))
+
+    return cross / energy if energy > 0 else 1.0
+
+
+class _StackReader:
+    """Where the particle images are read from: the original stack, or an SSD cache of it.
+
+    The reconstruction touches every image exactly once, so on a fast disk reading the stack
+    directly is optimal and the cache is pure overhead. On a slow one (an HDD sustains ~150
+    MB/s, and this program has to move ``n * box^2 * 4`` bytes -- 410 GB for 1M particles at
+    box 320) the read *is* the run, and it is worth paying once for a local float16 copy that
+    every later pass, and every other hax program pointed at the same scratch folder, reads
+    instead. That copy is exactly the ``images_mmap_grain`` array-record HetSIREN/MoDART already
+    build, so it is shared rather than duplicated -- whoever runs first pays for it.
+
+    Both back-ends expose the same two operations: read an arbitrary set of rows (for the
+    gray-scale probe) and stream the whole set in order (for the insertion pass).
+    """
+
+    def __init__(self, md, scratch_dir=None):
+        self.md = md
+        self.n = len(md)
+        self.source = None
+        if scratch_dir is not None:
+            from array_record.python.array_record_data_source import ArrayRecordDataSource
+            from glob import glob
+            shards = sorted(glob(os.path.join(scratch_dir, "dataset-*.arrayrecord")))
+            if shards:
+                self.source = ArrayRecordDataSource(
+                    shards, reader_options={"index_storage_option": "in_memory"})
+
+    @property
+    def cached(self):
+        return self.source is not None
+
+    def read(self, idx):
+        """Images for the metadata rows ``idx`` (arbitrary order), as float32."""
+        if self.source is None:
+            return np.asarray(self.md.getMetaDataImage(np.asarray(idx, np.int64)), np.float32)
+        from hax.generators.generator_metadata import parse_and_decompress
+        # __getitems__ (plural) is the batched read; __getitem__ takes a single key.
+        records = self.source.__getitems__([int(i) for i in np.asarray(idx, np.int64)])
+        return np.stack([parse_and_decompress(r)[0][..., 0] for r in records]).astype(np.float32)
+
+    def _read_chunk(self, start, stop):
+        """A contiguous run of rows -- plus the row ids, which the cache carries per record."""
+        idx = np.arange(start, stop, dtype=np.int64)
+        if self.source is None:
+            return idx, np.asarray(self.md.getMetaDataImage(idx), np.float32)
+        from hax.generators.generator_metadata import parse_and_decompress
+        records = self.source.__getitems__([int(i) for i in idx])
+        decoded = [parse_and_decompress(r) for r in records]
+        # The record's own label is the metadata row it came from: trust it rather than the
+        # record position, so a cache written in a shuffled order still lines up with the poses.
+        labels = np.asarray([lab for _, lab in decoded], np.int64)
+        images = np.stack([img[..., 0] for img, _ in decoded]).astype(np.float32)
+        return labels, images
+
+
+def _stream_chunks(reader, n, batch_size, threads):
+    """Yield ``(labels, images)`` chunks, reading ahead on a thread pool.
+
+    The read-ahead is deliberately *bounded*. Submitting every chunk up front and walking the
+    resulting list of futures looks equivalent, but a ``Future`` owns its result until it is
+    garbage collected, and the list keeps every future alive for the whole run -- so each
+    chunk that has been read stays resident even after it has been inserted, and peak RAM
+    grows to the size of the entire stack (400+ GB for 1M particles at box 320). There is also
+    no back-pressure: the readers race ahead of the GPU as fast as the disk allows.
+
+    Here at most ``2 * threads`` chunks are ever in flight, and each is dropped as soon as it
+    has been consumed, so peak RAM tracks the window, not the particle count.
+    """
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        starts = iter(range(0, n, batch_size))
+        window = deque()
+
+        def submit_next():
+            start = next(starts, None)
+            if start is not None:
+                window.append(pool.submit(reader._read_chunk, start, min(start + batch_size, n)))
+
+        for _ in range(2 * threads):
+            submit_next()
+
+        while window:
+            future = window.popleft()
+            labels, images = future.result()
+            submit_next()          # refill only now, so the window stays bounded
+            yield labels, images
+            del labels, images     # drop the chunk before waiting on the next one
+
+
+def reconstruct_consensus_volume(md, columns, sr, tau=0.05, batch_size=1024, threads=8,
+                                 use_ctf=True, denoise=True, calibrate_gray_scale=True,
+                                 scratch_dir=None, quiet=False, premultiplied=False,
+                                 dose_weighting=True, fsc_mask_diameter=None, symmetry="c1",
+                                 return_half_maps=False,
+                                 fsc_output=None):
+    """Reconstruct a consensus volume from posed particles in a single streaming pass.
+
+    ``md`` is an ``XmippMetaData``; ``columns`` the dict from ``extract_columns`` (it
+    supplies ``euler_angles``, ``shifts`` and, when present, the CTF parameters).
+    ``use_ctf`` must reflect the data: weighting CTF-free images by a CTF is not a harmless
+    no-op, it reweights the slices and degrades the map.
+
+    ``premultiplied`` says the images were already multiplied by their CTF when they were
+    extracted, which is what RELION's 2D stacks and Warp's ``ts_export_particles`` particle
+    series contain by default. The slices are then inserted as they are and only the
+    denominator uses the CTF; multiplying again would leave the map modulated by one extra
+    CTF. It has no effect unless ``use_ctf``, since without a CTF there is nothing to undo.
+
+    ``return_half_maps`` additionally returns the two unfiltered half maps as
+    ``(volume, (half1, half2))``.
+
+    ``dose_weighting`` handles the other half of what those extractions fold in. A tilt image
+    is premultiplied by ``CTF * W``, where ``W`` is the radiation-damage weight and the tilt
+    amplitude scale, so the denominator has to be ``sum((CTF*W)^2)``. Leaving ``W`` out does
+    not cancel -- it leaves the map multiplied by the CTF^2-weighted mean of ``W``, which for
+    a 40-tilt, 120 e/A2 series is 0.78 at 40 A but 0.19 at 8 A: a ~450 A^2 B-factor, and the
+    difference between a map with mid-resolution detail and a smooth blob. ``W`` is rebuilt
+    from ``preExposure`` and ``ctfScaleFactor``; the flag is ignored when the metadata has
+    neither, which is every single-particle data set, so nothing changes for those.
+
+    ``tau`` is only a numerical floor for the Wiener quotient -- the resolution is set by
+    the data, not by this. With ``denoise`` the particles are split into two halves, the
+    FSC between the half-maps measures the spectral signal-to-noise, and the combined map
+    is filtered so that shells carrying signal pass untouched and shells that are noise are
+    removed.
+
+    ``scratch_dir`` is an ``images_mmap_grain`` folder (see ``_StackReader``): when it holds a
+    cached copy of the stack the images are streamed from there instead of from ``md``, which is
+    what makes this bearable when the particles live on a spinning disk.
+
+    Returns the volume; when ``denoise`` it also prints the measured resolution.
+    Images are read in chunks on a thread pool while the GPU accumulates, so peak RAM
+    tracks ``batch_size`` rather than the particle count.
+    """
+    n = len(md)
+    box = int(md.getMetaDataImage(0).shape[0])
+    reader = _StackReader(md, scratch_dir)
+
+    s, a, k_rot, f0, f1 = _slice_geometry(box, sr)
+    # Two independent half-sets: same total insertion work, but the FSC between them is what
+    # tells us how far the data actually goes. Each half gets its OWN accumulator: sharing one
+    # zeros array between them would be fine without donation and fatal with it (the first
+    # insert would consume the buffer the second half still expects to read).
+    num = [jnp.zeros((box,) * 3, jnp.complex64) for _ in range(2)]
+    den = [jnp.zeros((box,) * 3, jnp.float32) for _ in range(2)]
+
+    angles = np.asarray(columns["euler_angles"], np.float32)
+    shifts = np.asarray(columns["shifts"], np.float32)
+    has_ctf = use_ctf and "ctfDefocusU" in columns
+    half_of_row, split_rule = _half_assignment(columns, n)
+
+    # The dose/tilt weight only exists for tilt-series data. Without a CTF there is no
+    # premultiplier to correct at all, so the weight has nothing to attach to either.
+    dose = np.asarray(columns["preExposure"], np.float32).ravel() if "preExposure" in columns else None
+    scalefactor = (np.asarray(columns["ctfScaleFactor"], np.float32).ravel()
+                   if "ctfScaleFactor" in columns else None)
+    inv2nc = (_critical_dose_reciprocal(s)
+              if dose_weighting and has_ctf and (dose is not None or scalefactor is not None)
+              else None)
+    # Without a CTF there is no pre-multiplication to undo, so the flag cannot mean anything
+    premultiplied = bool(premultiplied) and has_ctf
+    if has_ctf:
+        kv = float(np.asarray(columns["ctfVoltage"]).ravel()[0])
+
+    if not quiet:
+        print(f"{bcolors.OKCYAN}\n###### Reconstructing consensus volume from {n} posed particles... ######{bcolors.ENDC}")
+        if inv2nc is not None:
+            have = ", ".join(x for x, present in (("dose", dose is not None),
+                                                  ("tilt scale", scalefactor is not None)) if present)
+            print(f"{bcolors.OKCYAN}Dose weighting is ON ({have} found in the metadata); "
+                  f"the Wiener denominator uses sum((CTF*W)^2).{bcolors.ENDC}")
+        elif dose_weighting and has_ctf and "subtomo_labels" in columns:
+            # Only worth saying for tilt-series data: single-particle metadata has no dose
+            # column and never will, so the same message there would be pure noise.
+            print(f"{bcolors.WARNING}No preExposure / ctfScaleFactor column: dose weighting "
+                  f"is off. For tilt-series data that leaves a large B-factor in the "
+                  f"map.{bcolors.ENDC}")
+
+    if not quiet:
+        print(f"{bcolors.OKCYAN}Half maps split by {split_rule}: "
+              f"{int((half_of_row == 0).sum())} / {int((half_of_row == 1).sum())} rows.{bcolors.ENDC}")
+
+    n_chunks = (n + batch_size - 1) // batch_size
+    for labels, images in tqdm(_stream_chunks(reader, n, batch_size, threads), total=n_chunks,
+                               file=sys.stdout, ascii=" >=", colour="green", disable=quiet):
+        # One host->device transfer for the whole chunk. The halves are then selected on the
+        # device: `images[sel]` would fancy-index a fresh copy of half the chunk in
+        # single-threaded numpy (100+ MB per half at box 320) while the GPU sits idle, and then
+        # transfer each half separately.
+        images_dev = jnp.asarray(images)
+
+        for half in (0, 1):
+            # The split is keyed off the metadata row (see ``_half_assignment``), so it is the
+            # same one no matter what order the images arrived in.
+            pos = np.flatnonzero(half_of_row[labels] == half)
+            if pos.size == 0:
+                continue
+            # ``_insert_slices`` is compiled per batch shape. The halves of a chunk are not of a
+            # fixed size (a per-particle split puts whole tilt series on one side), so pad each
+            # to the next multiple of 64 rows with zero-weight copies of the first row: a few
+            # shapes compiled once, instead of one compile (seconds) per chunk.
+            n_pad = (-pos.size) % 64
+            valid = jnp.asarray(np.concatenate([np.ones(pos.size, np.float32), np.zeros(n_pad, np.float32)]))
+            pos = np.concatenate([pos, np.full(n_pad, pos[0], pos.dtype)])
+            idx = labels[pos]
+
+            ang = jnp.asarray(angles[idx])
+            rotations = euler_matrix_batch(ang[:, 0], ang[:, 1], ang[:, 2])
+
+            if has_ctf:
+                # eval_ctf indexes the per-particle parameters as [:, None, None], so the two
+                # frequency grids broadcast from (1, box, box). Tiling them to (b, box, box)
+                # first would materialize two copies per batch -- 840 MB at batch_size=1024,
+                # box=320 -- for values that are identical across the batch.
+                ctf = eval_ctf(s[None], a[None],
+                               jnp.asarray(np.asarray(columns["ctfDefocusU"])[idx]),
+                               jnp.asarray(np.asarray(columns["ctfDefocusV"])[idx]),
+                               angast=jnp.asarray(np.asarray(columns["ctfDefocusAngle"])[idx]),
+                               cs=jnp.asarray(np.asarray(columns["ctfSphericalAberration"])[idx]),
+                               kv=kv)
+            else:
+                ctf = jnp.ones((idx.shape[0], box, box), jnp.float32)
+
+            dose_w = None if inv2nc is None else _dose_weight(
+                inv2nc, _rows(dose, idx, 0.0), _rows(scalefactor, idx, 1.0))
+
+            num[half], den[half] = _insert_slices(
+                num[half], den[half], images_dev[jnp.asarray(pos)], rotations,
+                jnp.asarray(shifts[idx]), ctf, k_rot, box, f0, f1, premultiplied, dose_w, valid)
+
+    # The Friedel mates of every slice, added in one pass rather than during the streaming.
+    num[0], den[0] = _hermitian_symmetrize(num[0], den[0])
+    num[1], den[1] = _hermitian_symmetrize(num[1], den[1])
+
+    # Point-group symmetry, imposed on the accumulators of each half so that the half-map
+    # FSC measures the symmetrised maps
+    if symmetry is not None and symmetry.strip().lower() != "c1":
+        from .symmetry_groups import symmetry_matrices
+        matrices = symmetry_matrices(symmetry)
+        num[0], den[0] = _symmetrize_accumulators(num[0], den[0], matrices)
+        num[1], den[1] = _symmetrize_accumulators(num[1], den[1], matrices)
+        if not quiet:
+            print(f"{bcolors.OKCYAN}{symmetry.upper()} symmetry imposed ({len(matrices)} operators).{bcolors.ENDC}")
+
+    total_num, total_den = num[0] + num[1], den[0] + den[1]
+    volume = _invert(total_num, total_den, tau, box)
+
+    half_maps = None
+    if denoise or return_half_maps:
+        half_a, half_b = _invert(num[0], den[0], tau, box), _invert(num[1], den[1], tau, box)
+        if return_half_maps:
+            half_maps = (np.asarray(half_a, np.float32), np.asarray(half_b, np.float32))
+    if denoise:
+        shells = _shell_index(box)
+        n_shells = box // 2 + 1
+        if fsc_mask_diameter is not None:
+            mask = _soft_sphere(box, 0.5 * fsc_mask_diameter / sr)
+            half_a, half_b = half_a * mask, half_b * mask
+        fsc = _half_map_fsc(half_a, half_b, shells, n_shells)
+        resolution = _resolution(fsc, box, sr)
+        if fsc_output is not None:
+            freq = np.arange(n_shells) / (box * sr)
+            np.savetxt(fsc_output, np.c_[freq, np.where(freq > 0, 1.0 / np.maximum(freq, 1e-12), np.inf), fsc],
+                       header="1/A  A  FSC" + ("" if fsc_mask_diameter is None else
+                                               f"  (soft {fsc_mask_diameter:g} A spherical mask)"), fmt="%.6g")
+
+        # Apply the MMSE filter shell by shell, in Fourier space.
+        curve = _fsc_filter(fsc)
+        v_ft = np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(volume)))
+        volume = np.real(np.fft.fftshift(np.fft.ifftn(np.fft.ifftshift(v_ft * curve[shells]))))
+
+        if not quiet:
+            what = ("Half-map FSC" if fsc_mask_diameter is None
+                    else f"Half-map FSC (soft {fsc_mask_diameter:g} A spherical mask)")
+            print(f"{bcolors.OKGREEN}{what} = 0.143 at {resolution:.1f} A "
+                  f"(Nyquist {2.0 * sr:.1f} A); the map is filtered to that limit.{bcolors.ENDC}")
+
+    if calibrate_gray_scale:
+        scale = _gray_scale(volume, reader, columns, sr, box, has_ctf, k_rot, f0, f1, s, a,
+                            premultiplied=premultiplied, dose=dose,
+                            scalefactor=scalefactor, inv2nc=inv2nc)
+        volume = volume * scale
+        if not quiet:
+            print(f"{bcolors.OKGREEN}Gray-scale calibrated to the input images (x{scale:.3f}); "
+                  f"projecting the map reproduces their contrast.{bcolors.ENDC}")
+
+    volume = np.asarray(volume, np.float32)
+    return (volume, half_maps) if return_half_maps else volume
+
+
+def consensus_mask(volume, threshold=0.02, dilate=2, keep_largest=True):
+    """A binary mask of the protein region of a reconstructed consensus volume.
+
+    ``threshold`` is a fraction of the volume's maximum, applied after a light blur so the
+    mask is connected rather than speckled; ``dilate`` grows it by that many voxels so the
+    deformation has somewhere to move into.
+
+    ``keep_largest`` keeps only the single largest connected region. A gridding
+    reconstruction leaves faint fragments of mass away from the molecule -- most visibly in
+    the corners and along the edges of the box, where the CTF power is low and the
+    interpolation is least constrained. They sit above the intensity threshold, so thresholding
+    alone cannot remove them; but they are *disconnected* from the protein, which is one
+    contiguous blob, so a connected-component filter can. This runs before the dilation, so
+    growing the mask cannot reconnect a fragment that was just discarded.
+    """
+    from scipy.ndimage import gaussian_filter, binary_dilation, label
+
+    smooth = gaussian_filter(np.asarray(volume, np.float32), 1.5)
+    mask = smooth > threshold * smooth.max()
+
+    if keep_largest and mask.any():
+        # 6-connectivity (faces only): a fragment touching the protein at a single corner is
+        # not really attached, so it should not keep the fragment alive.
+        labels, n_components = label(mask)
+        if n_components > 1:
+            counts = np.bincount(labels.ravel())
+            counts[0] = 0                       # background label
+            mask = labels == counts.argmax()
+
+    if dilate and dilate > 0:
+        mask = binary_dilation(mask, iterations=int(dilate))
+    return mask.astype(np.float32)
+
+
+def _padded_transform(volume, pad):
+    """Centred transform of the volume zero-padded ``pad`` times and gridding corrected, so that
+    ``_project`` extracts accurate slices from it."""
+    box = volume.shape[0]
+    size = pad * box
+    lo = size // 2 - box // 2
+    padded = np.zeros((size,) * 3, np.float32)
+    padded[lo:lo + box, lo:lo + box, lo:lo + box] = volume
+    padded /= _gridding_correction(size)
+    return jnp.asarray(np.fft.fftshift(np.fft.fftn(np.fft.ifftshift(padded))).astype(np.complex64))
+
+
+@partial(jax.jit, static_argnums=(9, 10, 11))
+def _contrast_sums(volume_ft, mask_ft, images, rotations, shifts, ctf, k_rot, f0, f1, size, lo, box):
+    crop = (slice(None), slice(lo, lo + box), slice(lo, lo + box))
+    p = _project(volume_ft, rotations, shifts, ctf, k_rot, size, f0, f1)[crop]
+    if mask_ft is None:
+        w = jnp.ones_like(p)
+    else:
+        # Footprint of the mask: where its projection crosses at least half a voxel
+        footprint = _project(mask_ft, rotations, shifts, jnp.ones_like(ctf), k_rot, size, f0, f1)[crop]
+        w = (footprint > 0.5).astype(p.dtype)
+    axes = (1, 2)
+    return jnp.stack([jnp.sum(w * p * p, axes), jnp.sum(w * p * images, axes), jnp.sum(w * p, axes),
+                      jnp.sum(w * images, axes), jnp.sum(w, axes)], axis=1)
+
+
+def projection_contrast(volume, md, columns, sr, mask=None, use_ctf=True, premultiplied=False,
+                        dose_weighting=True, batch_size=256, threads=8, scratch_dir=None, quiet=False):
+    """Least-squares sums between every image and the map projected at its pose.
+
+    The projection ``p`` carries the particle's shift and CTF (squared when the images are
+    ``premultiplied``), so it predicts the image ``y`` as stored. Returns an ``(n, 5)`` array with
+    the sums of ``p*p``, ``p*y``, ``p``, ``y`` and of the weights, restricted to the footprint of
+    the projected ``mask`` when one is given. ``contrast_from_sums`` and
+    ``global_contrast_from_sums`` turn them into gray scales.
+    """
+    n = len(md)
+    box = int(volume.shape[0])
+    # 2x oversampled transform for accurate slices, up to box 256 to bound the memory
+    pad = 2 if box <= 256 else 1
+    size = pad * box
+    lo = size // 2 - box // 2
+    reader = _StackReader(md, scratch_dir)
+    s, a, k_rot, f0, f1 = _slice_geometry(size, sr)
+
+    volume_ft = _padded_transform(np.asarray(volume, np.float32), pad)
+    mask_ft = None if mask is None else _padded_transform((np.asarray(mask) > 0).astype(np.float32), pad)
+
+    angles = np.asarray(columns["euler_angles"], np.float32)
+    shifts = np.asarray(columns["shifts"], np.float32)
+    has_ctf = use_ctf and "ctfDefocusU" in columns
+    premultiplied = bool(premultiplied) and has_ctf
+    dose = np.asarray(columns["preExposure"], np.float32).ravel() if "preExposure" in columns else None
+    scalefactor = (np.asarray(columns["ctfScaleFactor"], np.float32).ravel()
+                   if "ctfScaleFactor" in columns else None)
+    inv2nc = (_critical_dose_reciprocal(s)
+              if dose_weighting and has_ctf and (dose is not None or scalefactor is not None)
+              else None)
+    if has_ctf:
+        kv = float(np.asarray(columns["ctfVoltage"]).ravel()[0])
+
+    sums = np.zeros((n, 5), np.float64)
+    n_chunks = (n + batch_size - 1) // batch_size
+    for labels, images in tqdm(_stream_chunks(reader, n, batch_size, threads), total=n_chunks,
+                               file=sys.stdout, ascii=" >=", colour="green", disable=quiet):
+        ang = jnp.asarray(angles[labels])
+        rotations = euler_matrix_batch(ang[:, 0], ang[:, 1], ang[:, 2])
+
+        if has_ctf:
+            ctf = eval_ctf(s[None], a[None],
+                           jnp.asarray(np.asarray(columns["ctfDefocusU"])[labels]),
+                           jnp.asarray(np.asarray(columns["ctfDefocusV"])[labels]),
+                           angast=jnp.asarray(np.asarray(columns["ctfDefocusAngle"])[labels]),
+                           cs=jnp.asarray(np.asarray(columns["ctfSphericalAberration"])[labels]),
+                           kv=kv)
+        else:
+            ctf = jnp.ones((labels.shape[0], size, size), jnp.float32)
+        if inv2nc is not None:
+            ctf = ctf * _dose_weight(inv2nc, _rows(dose, labels, 0.0), _rows(scalefactor, labels, 1.0))
+
+        sums[labels] = np.asarray(_contrast_sums(volume_ft, mask_ft, jnp.asarray(images), rotations,
+                                                 jnp.asarray(shifts[labels]), ctf ** 2 if premultiplied else ctf,
+                                                 k_rot, f0, f1, size, lo, box), np.float64)
+    return sums
+
+
+def _centred(sums, offset):
+    pp, py, p, y, w = np.asarray(sums, np.float64).T
+    w = np.maximum(w, 1.0)
+    if offset:
+        return pp - p * p / w, py - p * y / w, p, y, w
+    return pp, py, p, y, w
+
+
+def contrast_from_sums(sums, offset=False):
+    """Per image ``y ~ a p`` (or ``y ~ a p + b`` with ``offset``) in closed form.
+
+    Returns ``(a, b)``; ``a`` is NaN where the projection is flat and carries no scale.
+    """
+    var, cov, p, y, w = _centred(sums, offset)
+    ok = var > 1e-12 * max(float(var.max()), 1e-30)
+    a = np.where(ok, cov / np.where(ok, var, 1.0), np.nan)
+    b = (y - a * p) / w if offset else np.zeros_like(a)
+    return a, b
+
+
+def global_contrast_from_sums(sums, offset=False):
+    """One scale for the whole set, ``y ~ a p`` (or ``y ~ a p + b_i`` with ``offset``, one offset
+    per image)."""
+    var, cov, _, _, _ = _centred(sums, offset)
+    return float(cov.sum() / var.sum()) if var.sum() > 0 else float("nan")

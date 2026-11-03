@@ -5,14 +5,15 @@ import jax
 from jax import random as jnr, numpy as jnp
 from flax import nnx
 
-import random
 from functools import partial
 
 from hax.utils.miscellaneous import batched_knn
 from hax.utils.loggers import bcolors
+from hax.utils.decorators import save_config
 
 
 class Deconvolver(nnx.Module):
+    @save_config
     def __init__(self, lat_dim=10, n_layers=3, *, rngs: nnx.Rngs):
         self.lat_dim = lat_dim
 
@@ -39,10 +40,8 @@ class Deconvolver(nnx.Module):
 
 
 @partial(jax.jit, static_argnames=["islog", "fraction", "subsetMode"])
-def train_deconv_step(graphdef, state, x, cov, z_space, islog=False, fraction=None, subsetMode="random"):
+def train_deconv_step(graphdef, state, x, cov, z_space, key, islog=False, fraction=None, subsetMode="random"):
     model, optimizer_deconv = nnx.merge(graphdef, state)
-
-    key = jnr.PRNGKey(random.randint(0, 2 ** 32 - 1))
 
     def density_at(z, mean, cov, islog=False):
         if islog:
@@ -150,37 +149,74 @@ def main():
     import optax
     from contextlib import closing
     from hax.checkpointer import NeuralNetworkCheckpointer
-    from hax.generators import NumpyGenerator
+    from hax.generators import MetaDataGenerator, NumpyGenerator
     from hax.networks import train_deconv_step
 
+    from hax.cli import common_args as ca
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--latents", required=True, type=str,
-                        help="Path to the .npy file with the latent space to be deconvolved")
+    ca.add_md(parser,
+              help="Xmipp metadata file with the images (+ alignments / CTF) whose latent vectors will be "
+                   "recovered on the fly from the provided network and then deconvolved")
+    parser.add_argument("--nn_path", required=True, type=str,
+                    help=f"Path to folder containing a saved neural network (HetSIREN, Zernike3Deep...). Its encoder is "
+                         f"used to recover the latent vectors of the images in {bcolors.UNDERLINE}md{bcolors.ENDC} on the fly")
     parser.add_argument("--covariances", required=True, type=str,
                         help=f"Path to the .npy file with the covariances needed to estimate the deconvolution (output of {bcolors.UNDERLINE}estimate_latent_covariances{bcolors.ENDC} program)")
-    parser.add_argument("--lat_dim", required=False, type=int, default=3,
-                        help="Dimensionality of the latent space of the deconvolution network")
-    parser.add_argument("--mode", required=True, type=str, choices=["train", "predict"],
-                        help=f"{bcolors.BOLD}train{bcolors.ENDC}: train a neural network from scratch or from a previous execution if reload is provided\n"
-                             f"{bcolors.BOLD}predict{bcolors.ENDC}: predict the deconvolved latents from the input latents ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case)")
+    ca.add_lat_dim(parser, default=3, help="Dimensionality of the latent space of the deconvolution network")
+    ca.add_mode(parser, choices=["train", "predict"],
+                help=f"{bcolors.BOLD}train{bcolors.ENDC}: train a neural network from scratch or from a previous execution if reload is provided\n"
+                     f"{bcolors.BOLD}predict{bcolors.ENDC}: predict the deconvolved latents from the input latents ({bcolors.UNDERLINE}reload{bcolors.ENDC} parameter is mandatory in this case)")
     parser.add_argument("--deconvolution_strength", required=False, type=float, default=1.0,
                         help="Determines the deconvolution strength (set to 1.0 by default, meaning that the landscape will be deconvolved as expected from the computed covariances - larger values "
                              "will yield a stronger deconvolution compared to the default value, while smaller values will be more conservative")
-    parser.add_argument("--epochs", required=False, type=int, default=100,
-                        help="Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 100 - "
-                             "as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it")
-    parser.add_argument("--batch_size", required=False, type=int, default=1024,
-                        help = "Determines how many images will be load in the GPU at any moment during training (set by default to 8 - "
-                               f"you can control GPU memory usage easily by tuning this parameter to fit your hardware requirements - we recommend using tools like {bcolors.UNDERLINE}nvidia-smi{bcolors.ENDC} "
-                               f"to monitor and/or measure memory usage and adjust this value")
-    parser.add_argument("--output_path", required=True, type=str,
-                        help="Path to save the results (trained neural network, deconvolved latents...)")
-    parser.add_argument("--reload", required=False, type=str,
-                        help="Path to a folder containing an already saved neural network (useful to fine tune a previous network - predict from new data)")
-    args, _ = parser.parse_known_args()
+    ca.add_epochs(parser, default=100,
+                  help="Number of epochs to train the network (i.e. how many times to loop over the whole dataset of images - set to default to 100 - "
+                       "as a rule of thumb, consider 50 to 100 epochs enough for 100k images / if your dataset is bigger or smaller, scale this value proportionally to it")
+    ca.add_batch_size(parser, default=1024, help=ca.BATCH_SIZE_HELP_ADJUST)
+    ca.add_output_path(parser, help="Path to save the results (trained neural network, deconvolved latents...)")
+    ca.add_reload(parser, help=ca.RELOAD_HELP_BASIC)
+    ca.add_load_images_to_ram(parser)
+    ca.add_ssd_scratch_folder(parser)
+    args = ca.parse_with_config(parser)
 
-    # Prepare data
-    latents = np.load(args.latents)
+    # Ensure the output path exists (the deconvolved latents / model are written into it)
+    os.makedirs(args.output_path, exist_ok=True)
+
+    # Load neural network
+    model = NeuralNetworkCheckpointer.load(args.nn_path)
+    model.eval()
+
+    # Prepare metadata / image data loader
+    generator = MetaDataGenerator(args.md)
+    if not args.load_images_to_ram:
+        mmap_output_dir = args.ssd_scratch_folder if args.ssd_scratch_folder is not None else args.output_path
+        generator.prepare_grain_array_record(mmap_output_dir=mmap_output_dir, preShuffle=False, num_workers=4,
+                                             precision=np.float16, group_size=1, shard_size=10000)
+
+    # No shuffling: the recovered latents stay aligned (by row) with the covariances
+    image_loader = generator.return_grain_dataset(batch_size=args.batch_size, shuffle=False, num_epochs=1,
+                                                  num_workers=-1, load_to_ram=args.load_images_to_ram)
+    steps_per_epoch = int(np.ceil(len(generator.md) / args.batch_size))
+
+    # Recover the latent vectors from the network on the fly (instead of a pre-saved file)
+    print(f"{bcolors.OKCYAN}\n###### Recovering latent vectors from the network... ######")
+
+    @nnx.jit
+    def predict_latents(model, x):
+        # The encoder returns (latent, (rotations, shifts)); only the latent is needed here.
+        return model(x, return_alignment_refinement=False)
+
+    pbar = tqdm(image_loader, desc="Progress", file=sys.stdout, ascii=" >=", colour="green",
+                total=steps_per_epoch, bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
+    latents = []
+    for (x, labels) in pbar:
+        if isinstance(x, tuple):   # Tomo mode returns (image, subtomo_label)
+            x = x[0]
+        latents.append(np.asarray(predict_latents(model, x)))
+    latents = np.concatenate(latents, axis=0)
+
+    # Prepare covariances (output of estimate_latent_covariances, same metadata order)
     covariances = args.deconvolution_strength * np.load(args.covariances)
 
     # Prepare network
@@ -208,7 +244,7 @@ def main():
         # Prepare data loader
         data_loader = NumpyGenerator(latents).return_grain_dataset(batch_size=args.batch_size, shuffle=True,
                                                                    preShuffle=True, num_workers=-1, num_epochs=None)
-        steps_per_epoch = int(int(args.dataset_split_fraction[0] * latents.shape[0]) / args.batch_size)
+        steps_per_epoch = max(1, int(latents.shape[0] / args.batch_size))
 
         # Optimizers
         optimizer = nnx.Optimizer(deconvolver, optax.adam(1e-6), wrt=nnx.Param)
@@ -218,6 +254,8 @@ def main():
         print(f"{bcolors.OKCYAN}\n###### Training deconvolution... ######")
 
         i = 0
+        total_loss = 0
+        step = 1
         pbar = tqdm(range(steps_per_epoch, args.epochs * steps_per_epoch), file=sys.stdout, ascii=" >=",
                     colour="green",
                     bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
@@ -236,7 +274,8 @@ def main():
 
                     i += 1
 
-                loss, state = train_deconv_step(graphdef, state, x, covariances, latents, islog=True,
+                step_key = jnr.fold_in(rng, total_steps)
+                loss, state = train_deconv_step(graphdef, state, x, covariances, latents, step_key, islog=True,
                                                 subsetMode="random", fraction=50000)
                 total_loss += loss
 
@@ -255,7 +294,6 @@ def main():
         # Prepare data loader
         data_loader = NumpyGenerator(latents).return_grain_dataset(batch_size=args.batch_size, shuffle=False,
                                                                    preShuffle=False, num_workers=0, num_epochs=1)
-        steps_per_epoch = int(int(args.dataset_split_fraction[0] * latents.shape[0]) / args.batch_size)
 
         # Jitted prediciton function
         predict_fn = jax.jit(deconvolver.__call__)
@@ -263,16 +301,11 @@ def main():
         # Predict loop
         print(f"{bcolors.OKCYAN}\n###### Predicting deconvolved latents... ######")
 
-        pbar = tqdm(range(steps_per_epoch, args.epochs * steps_per_epoch), file=sys.stdout, ascii=" >=",
-                    colour="green",
-                    bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}")
-
         latents_deconv = []
         with closing(iter(data_loader)) as iter_data_loader:
-            for _ in pbar:
-                (x, labels) = next(iter_data_loader)
-                latents_deconv.append(predict_fn(x))
-        latents_deconv = np.asarray(latents_deconv)
+            for (x, _) in iter_data_loader:
+                latents_deconv.append(np.asarray(predict_fn(x)))
+        latents_deconv = np.concatenate(latents_deconv, axis=0)
 
         # Save new latents
         np.save(os.path.join(args.output_path, "latents_deconvolved.npy"), latents_deconv)
