@@ -18,7 +18,7 @@ Coverage:
 
 * ``--input_space``  : N spaces via the ``NAME:path`` convention
 * ``--lat_dim``      : default (min of input dims) and explicit
-* ``--mode``         : train, predict (+ ``--reload``), send_to_pickle
+* ``--mode``         : train, predict (+ ``--reload``)
 * ``--epochs`` / ``--batch_size`` / ``--learning_rate``
 * outputs: a trained ``FlexConsensus`` model and the per-space
   ``*_consensus.npy`` / ``*_consensus_error.npy`` / ``*_representation_error.npy``
@@ -162,16 +162,5 @@ def scenarios(workdir, data):
                       for i in range(len(NAMES))],
         pre=mkdirp(out("predict_plain")),
         timeout=600))
-
-    # 6) send_to_pickle (currently a no-op for flexconsensus — must still exit cleanly)
-    scn.append(Scenario(
-        name="send_to_pickle",
-        description="send_to_pickle (no-op smoke check)",
-        program="flexconsensus",
-        args=["--input_space", *named, "--mode", "send_to_pickle",
-              "--output_path", out("send_to_pickle")],
-        expect_files=[],
-        pre=mkdirp(out("send_to_pickle")),
-        timeout=300))
 
     return scn

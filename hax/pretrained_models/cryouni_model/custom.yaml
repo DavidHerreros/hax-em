@@ -1,0 +1,30 @@
+DATAMODULE:
+  DATASET:
+    IMAGE_SIZE:
+      SPATIAL: None
+      HARTLEY: None
+    CENTERLIZE_SPATIAL_IMAGE: false
+    IGNORE_GT_POSES: true
+
+MODEL:
+  BACKBONE:
+    NAME: MAEViTLlama
+    PATCH_SIZE: 16
+    IN_CHANS: 1
+    VIT_SCALE: base
+    FINAL_NORM: false
+    DYNAMIC_IMG_SIZE: false
+    DYNAMIC_IMG_PAD: false
+    NUM_REGISTER_TOKENS: 4
+    DROP_PATH_RATE: 0
+    PRETRAINED_PATH: null
+    PRETRAINED_PREFIX: "backbone."
+  HEAD:
+    NAME: ClassPatchTokenHeteroHead
+    EMBED_CHANNELS: 2
+    Z_CHANNELS: 8
+    Z_STD_INIT: 1.0
+    VARIATIONAL: true
+
+  NAME: FoundationModelOnly
+

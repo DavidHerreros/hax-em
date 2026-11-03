@@ -49,12 +49,62 @@ python tests/run_tests.py --gpu 0 --keep hetsiren     # keep the work dir for in
    `zernike3deep`, …) and passes only if it exits 0 **and** produces the expected
    outputs. A `NaN/Inf` loss is treated as a failure.
 
+4. **Semantic verification** *(preprocessing)* — "exit 0 + files exist" cannot see
+   whether a program produced the *right numbers*. Where the contract is exact, a
+   final scenario runs a checker script (`Scenario(script=...)`, the same mechanism
+   the headless GUI tests use) that reads the outputs back and asserts them against
+   independently recomputed references. See `preprocess_checks.py`.
+
+### preprocess_particles coverage (`test_preprocess_particles.py`)
+
+| Option / axis | Covered by |
+|---|---|
+| `--new_box_size` (down / up) | `resize` (48→24), `upsample` (48→64) |
+| `--crop_box_size` (crop / zero-pad) | `crop` (48→32), `pad` (48→64) |
+| both, in the documented crop-then-resize order | `crop_resize` (48 → crop 32 → resize 16) |
+| `--ctf_correction none / wiener / phase_flip` | `resize` / `wiener` / `phase_flip`, plus `ctf_only` (no geometry change) |
+| `--wiener_epsilon` (fixed vs adaptive regularizer) | `wiener_eps` |
+| `--batch_size` fixed and `auto` | `workers` / `batch_auto` |
+| `--device cpu` | `device_cpu` |
+| `--num_read_workers` / `--num_write_workers` | `workers` |
+| `--relative_image_paths` and the absolute default | `relative` / `resize` |
+| `.star` in → `.star` out | `star` |
+
+`verify_outputs` then asserts, for every run above: the output box, the header
+sampling rate (`sr × box_cropped / box_out`), the **rescaled in-plane shifts**, that
+angles and CTF columns are carried over untouched, that the pixel data matches an
+independent NumPy Fourier-resize / centred-crop oracle, that `--batch_size`,
+`--device` and the worker counts do **not** change the result, and that image paths
+resolve (absolute from any cwd; relative from the output folder).
+`verify_guards` asserts the CLI *refuses* an odd box, a no-op run, a zero batch or
+worker count, and CTF correction on metadata with no CTF.
+
+### preprocess_volumes coverage (`test_preprocess_volumes.py`)
+
+| Option / axis | Covered by |
+|---|---|
+| `--new_box_size` (down / up) | `resize` (48→24), `upsample` (48→64) |
+| `--crop_box_size` | `crop` (48→32) |
+| both, crop-then-resize | `crop_resize` |
+| several `--vol` in one call (map + mask) | `pair` |
+| duplicate stems → disambiguated names | `dup` |
+| `--sr` read from the header when omitted | `header_sr` |
+| `--num_workers` | `workers` |
+
+`verify_outputs` asserts the geometry and sampling rate, **gray-level preservation**
+(a Fourier resize keeps the DC term, so the mean density is preserved exactly), the
+centre of mass, an independent NumPy oracle, that `--num_workers` and the header-`sr`
+fallback are result-identical, and that a duplicate-stem run still leaves every output
+on a single `*_preprocessed.mrc` glob — the property the GUI's single-volume connector
+relies on. `verify_guards` asserts the CLI refuses a no-op, a non-cubic Fourier resize,
+and a (header-flagged) particle stack passed as `--vol`.
+
 ### HetSIREN coverage (`test_hetsiren.py`)
 
 | Option / axis | Covered by |
 |---|---|
 | `--ctf_type None / apply / wiener / precorrect` | `train_none_ram` / `train_apply_mmap` / `train_wiener` / `train_precorrect` |
-| `--mode train / predict / send_to_pickle` | `train_*` / `predict_none` / `send_to_pickle_none` |
+| `--mode train / predict` | `train_*` / `predict_none` |
 | `--vol`, `--mask` | `train_vol_transport_implicit`, `train_vol_local_recon` |
 | `--transport_mass`, `--implicit_network`, `--num_gaussians` | `train_vol_transport_implicit` |
 | `--local_reconstruction` | `train_vol_local_recon` |
@@ -73,13 +123,13 @@ scenario exercising the default densify fit.
 | Option / axis | Covered by |
 |---|---|
 | `--ctf_type None / apply / wiener / precorrect` | `train_none` / `train_apply_mmap` / `train_wiener` / `train_precorrect` |
-| `--mode train / predict / send_to_pickle` | `train_*` / `predict_none` / `send_to_pickle_none` |
+| `--mode train / predict` | `train_*` / `predict_none` |
 | `--vol` (required) / `--mask` provided vs auto-generated | all / `train_apply_automask` |
 | `--L1`, `--L2` (incl. defaults) | `train_none`(3,3), `train_apply_mmap`(5,5), `train_default_fit`(7,7) |
 | `--num_gaussians` set vs default densify fit | most / `train_default_fit` |
 | `--lat_dim`, `--batch_size`, `--learning_rate`, `--dataset_split_fraction` | varied across scenarios |
 | `--load_images_to_ram` (on) / mmap (off) + `--ssd_scratch_folder` | most scenarios / `train_apply_mmap` |
-| `--epochs`, `--reload` | all (+ `train_none_short`) / `predict_none`, `send_to_pickle_none` |
+| `--epochs`, `--reload` | all (+ `train_none_short`) / `predict_none` |
 
 Data checks confirm the phantom is genuinely continuous-only: total density is
 conserved across conformations while atom positions change (and the
@@ -151,7 +201,7 @@ region where the first space follows a rotated (disagreeing) trend.
 |---|---|
 | `--input_space` (N spaces, `NAME:path`) | all |
 | `--lat_dim` default (min input dim) vs explicit | `train_default` / `train_custom` |
-| `--mode train / predict / send_to_pickle` | `train_*` / `predict` / `send_to_pickle` |
+| `--mode train / predict` | `train_*` / `predict` |
 | `--epochs`, `--batch_size`, `--learning_rate` | varied |
 | outputs: `FlexConsensus` model; `*_consensus.npy`, `*_consensus_error.npy`, `*_representation_error.npy` | train / predict |
 
@@ -219,42 +269,29 @@ same network path already covered by `decode_states_from_latents`.
 
 ### image_gray_scale_adjustment coverage (`test_image_gray_scale_adjustment.py`)
 
-Learns a per-image gray-level adjustment matching projections of a reference
-volume (`--vol`) to the images in `--md`. Train saves an `imageAdjustment` model;
-predict writes `adjusted_images.mrcs` + a metadata file.
+Fits, in closed form, the gray scale (and optionally an offset) of every image
+against the projection of a reference map (`--vol`) at its pose, and writes the
+rescaled images. Single pass, no network.
 
 | Option / axis | Covered by |
 |---|---|
-| `--ctf_type None / apply / wiener` | `train_none` / `train_apply_pv` / `train_wiener_mmap` |
-| `--mode train / predict` (+ `--reload`) | `train_*` / `predict_pv` |
-| `--predict_value` on / off | `*_pv` / `train_none` |
-| `--vol` (required) / `--mask` provided vs auto-generated | most / `train_automask` |
-| `--load_images_to_ram` (on) / mmap (off) + `--ssd_scratch_folder` | most / `train_wiener_mmap` |
-| `--lat_dim`, `--batch_size`, `--learning_rate`, `--dataset_split_fraction` | varied |
-| outputs `imageAdjustment`; `adjusted_images.mrcs` + `.xmd` | train / predict |
+| `--ctf_type apply / wiener / None` | `adjust_apply` / `adjust_wiener_scratch` / `adjust_none` |
+| `--per_image_contrast relative / absolute` | `adjust_apply` / `adjust_absolute_offset_mask` |
+| `--fit_offset`, `--mask` | `adjust_absolute_offset_mask` |
+| `--batch_size`, `--threads`, `--ssd_scratch_folder` | `adjust_wiener_scratch` |
+| outputs `adjusted_images.mrcs` + `.xmd` | all |
 
 ### volume_gray_scale_adjustment coverage (`test_volume_gray_scale_adjustment.py`)
 
-Learns a gray-level adjustment for a reference volume so its projections match the
-images in `--md`. Train saves a `volumeAdjustment` model; predict writes
-`adjusted_volume.mrc` (predict needs only `--vol` + `--reload`).
+Fits, in closed form, the single gray scale that makes the projections of a map
+match the images, and writes the map times that scale. Single pass, no network.
 
 | Option / axis | Covered by |
 |---|---|
-| `--ctf_type None / apply / wiener` | `train_none_novpv` / `train_apply_pv` / `train_wiener_mmap` |
-| `--mode train / predict` (+ `--reload`) | `train_*` / `predict_*` |
-| `--predicts_value` on (a*vol+b) / off (voxel values) | `predict_pv` / `predict_novpv` |
-| `--vol` (required) / `--mask` | all |
-| `--load_images_to_ram` (on) / mmap (off) + `--ssd_scratch_folder` | most / `train_wiener_mmap` |
-| `--lat_dim`, `--batch_size`, `--learning_rate`, `--dataset_split_fraction` | varied |
-| outputs `volumeAdjustment`; `adjusted_volume.mrc` | train / predict |
-
-Both programs share two pre-existing, **unpatched** quirks (worked around by the
-suites): the end-of-training `rmtree(..._CHECKPOINT)` is unconditional (but a
-checkpoint is written at `i==1`, so `epochs >= 2` is safe), and `predict` /
-no-`--mask` training do not create `--output_path`. `volume_gray_scale_adjustment`
-additionally has a resume-only copy-paste typo (reads `imageAdjustment_CHECKPOINT`),
-not exercised here.
+| `--ctf_type apply / precorrect / None` | `adjust_apply` / `adjust_offset_mask` / `adjust_none` |
+| `--fit_offset`, `--mask` | `adjust_offset_mask` |
+| `--batch_size`, `--threads`, `--ssd_scratch_folder` | `adjust_scratch` |
+| outputs `adjusted_volume.mrc` + `gray_scale.txt` | all |
 
 ### display_metrics coverage (`test_display_metrics.py`, headless)
 
@@ -283,3 +320,10 @@ Create `tests/test_<program>.py` exposing:
 * `SLOW` *(optional)* → set of scenario names to skip under `--quick`.
 
 Then add `"<program>"` to `PROGRAMS` in `run_tests.py`.
+
+If the program has an exact numerical contract (a sampling rate, a rescaled column,
+preserved gray levels), do not stop at "it exited 0": add a checker script and append
+a `Scenario(script=..., args=["--check", ...])` after the runs that produce its inputs.
+Scenarios execute in order, so the checker sees everything written before it.
+`preprocess_checks.py` is the worked example — recompute the expected values with plain
+NumPy rather than by calling the code under test, or the check proves nothing.

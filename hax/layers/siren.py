@@ -72,19 +72,22 @@ def calculate_spectral_centroid_3d(data_grid):
 
 
 class Siren2Linear(nnx.Module):
-    def __init__(self, in_features, out_features, rngs, is_first=False, custom_init=False, is_residual=False, w0=30.0, s=0.0, dtype=jnp.float32, use_bias=True):
+    def __init__(self, in_features, out_features, rngs, is_first=False, custom_init=False, is_residual=False, w0=30.0, s=0.0, c=None, dtype=jnp.float32, use_bias=True):
         self.w0 = w0
         self.is_first = is_first
         self.is_residual = is_residual
 
+        if c is None:
+            c = 1.0 if is_first else 6.0
+
         # Standard SIREN Initialization
         if is_first:
-            kernel_init = siren_init_first(c=1.0)
+            kernel_init = siren_init_first(c=c)
         else:
             if custom_init:
-                kernel_init = siren_init(c=6.0, omega=1.0)
+                kernel_init = siren_init(c=c, omega=1.0)
             else:
-                kernel_init = siren_init_original(c=6.0, omega=1.0)
+                kernel_init = siren_init_original(c=c, omega=1.0)
 
         # Create the base linear layer
         self.linear = nnx.Linear(
@@ -106,8 +109,14 @@ class Siren2Linear(nnx.Module):
             # Perturb the weights
             self.linear.kernel.value += noise
 
-    def __call__(self, x):
+    def __call__(self, x, freq_alpha=1.0):
+        # ``freq_alpha`` in (0, 1] scales the effective frequency (w0) of this
+        # layer. Used for coarse-to-fine (spectral) annealing: start low so the
+        # network can only represent low-frequency structure, then ramp to 1.0.
+        # Default 1.0 leaves the layer unchanged. Only meaningful on the first
+        # SIREN layer (the one that maps input coordinates to frequencies).
+        w0 = self.w0 * freq_alpha
         if self.is_residual:
-            return jnp.sin(self.w0 * (x + self.linear(x)))
+            return jnp.sin(w0 * (x + self.linear(x)))
         else:
-            return jnp.sin(self.w0 * self.linear(x))
+            return jnp.sin(w0 * self.linear(x))

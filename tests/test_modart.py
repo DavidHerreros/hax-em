@@ -11,7 +11,8 @@ early-stopping criterion fires and writes ``modart_map.mrc`` (and half maps).
 Coverage:
 
 * ``--ctf_type``         : None, apply, wiener, precorrect
-* ``--symmetry_group``   : c1 (default) and c2
+* ``--symmetry_group``   : c1 (default) and c2, plus a geometry check of the symmetry copies
+                           (poses and motion fields; ``modart_symmetry_check.py``)
 * ``--reconstruct_halves``: single map vs two half maps
 * ``--vol`` / ``--mask`` : reference-volume refinement (trains a VolumeAdjustment)
 * ``--motion_correction``: reconstruction with motion correction from a trained network
@@ -28,6 +29,7 @@ import os
 import phantom
 from common import Scenario
 
+_SYMMETRY_CHECK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "modart_symmetry_check.py")
 N_PARTICLES = 96
 BOX = 40
 SR = 2.0
@@ -75,6 +77,15 @@ def scenarios(workdir, data):
         args=base + ["--ctf_type", "None", "--symmetry_group", "c2",
                      "--output_path", out("recon_none_c2")],
         expect_files=maps("recon_none_c2"),
+        timeout=600))
+
+    # 2b) geometry of the symmetry copies, with and without a motion field (MoDART's own functions)
+    scn.append(Scenario(
+        name="check_symmetry",
+        description="check | symmetry copies: poses and motion fields (c2, c3, d2)",
+        program="modart",
+        script=_SYMMETRY_CHECK,
+        args=[],
         timeout=600))
 
     # 3) ctf=wiener
