@@ -82,6 +82,27 @@ def build_knn_field_operator(source_coords, target_coords, k=6, h=None):
     return jnp.asarray(idx, jnp.int32), jnp.asarray(w, jnp.float32)
 
 
+def build_field_smoother(points, sigma, max_neighbours=512):
+    """Local-linear Gaussian smoothing of a field on points, as k-NN weights: affine (hence rigid) fields pass unchanged"""
+    import numpy as np
+    from scipy.spatial import cKDTree
+
+    points = np.asarray(points, np.float64)
+    tree = cKDTree(points)
+    k = int(min(max_neighbours, points.shape[0], tree.query_ball_point(points, 2.5 * sigma, return_length=True).max()))
+    dist, idx = tree.query(points, k=k, distance_upper_bound=2.5 * sigma, workers=-1)
+    dist, idx = dist.reshape(-1, k), idx.reshape(-1, k)
+    missing = idx >= points.shape[0]
+    idx = np.where(missing, np.arange(points.shape[0])[:, None], idx)
+    w = np.where(missing, 0.0, np.exp(-0.5 * (dist / sigma) ** 2))
+
+    # Weighted affine fit around each point, evaluated at the point (tiny ridge on the slopes for sparse neighbourhoods)
+    x = np.concatenate([np.ones(idx.shape + (1,)), (points[idx] - points[:, None]) / sigma], axis=-1)
+    gram = np.einsum("nk,nki,nkj->nij", w, x, x) + np.diag([0.0, 1e-6, 1e-6, 1e-6])
+    a = np.linalg.solve(gram, np.broadcast_to(np.eye(4)[0], (points.shape[0], 4))[..., None])[..., 0]
+    return jnp.asarray(idx, jnp.int32), jnp.asarray(w * np.einsum("nj,nkj->nk", a, x), jnp.float32)
+
+
 @jax.jit
 def apply_knn_field(field_source, idx, weights):
     """(B, S, C) source field to (B, T, C) target field"""

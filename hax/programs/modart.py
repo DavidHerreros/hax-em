@@ -190,6 +190,53 @@ def decode_fields(graphdef, state, latents, xsize):
     return 0.5 * xsize * fields, 0.5 * xsize * jnp.reshape(coords, (-1, 3))
 
 
+def refine(args):
+    """Iterative refinement: a MoDART map, then a fine tune of the motion network on it (the parameters of its training, with
+    the map as --vol, --reload and --refit_reference), --refine_iterations times, and a last map from the refined network.
+    Every step runs as its own process, so each one has the whole GPU"""
+    import os
+    import sys
+    import subprocess
+    from hax.cli import common_args as ca
+
+    if args.motion_correction is None or len(args.motion_correction) != 1:
+        raise ValueError("--refine_iterations needs --motion_correction with a single network trained on all the particles.")
+    network = os.path.abspath(args.motion_correction[0].rstrip("/"))
+    programs = {"HetSIREN": "hetsiren", "Zernike3Deep": "zernike3deep"}
+    if os.path.basename(network) not in programs:
+        raise ValueError(f"--refine_iterations needs the network folder written by the training (<output_path>/HetSIREN or "
+                         f"<output_path>/Zernike3Deep), got {network}.")
+    program = programs[os.path.basename(network)]
+    train_config = args.refine_config or os.path.join(os.path.dirname(network), "run_config.json")
+    if not os.path.isfile(train_config):
+        raise ValueError(f"Training parameters of the network not found ({train_config}): give the run_config.json of its "
+                         f"training with --refine_config.")
+    hax = [sys.executable, "-c", "from hax.cli import main; main()"]
+    modart_config = os.path.join(args.output_path, "run_config.json")
+    tune = ((["--learning_rate", str(args.refine_learning_rate)] if args.refine_learning_rate is not None else []) +
+            (["--batch_size", str(args.refine_batch_size)] if args.refine_batch_size is not None else []))
+
+    def modart(net, out):
+        subprocess.run(hax + ["modart", "--config", modart_config, "--refine_iterations", "0", "--motion_correction", net,
+                              "--output_path", out], check=True)
+
+    for it in range(1, args.refine_iterations + 1):
+        out = os.path.join(args.output_path, f"iteration_{it}")
+        print(f"{bcolors.OKCYAN}\n###### Refinement iteration {it}/{args.refine_iterations}: MoDART map ######{bcolors.ENDC}", flush=True)
+        modart(network, os.path.join(out, "modart"))
+        print(f"{bcolors.OKCYAN}\n###### Refinement iteration {it}/{args.refine_iterations}: fine tuning {os.path.basename(network)} "
+              f"on the map ######{bcolors.ENDC}", flush=True)
+        subprocess.run(hax + [program, "--config", train_config, "--mode", "train", "--vol", os.path.join(out, "modart", "modart_map.mrc"),
+                              "--reload", os.path.dirname(network), "--refit_reference", "--output_path", os.path.join(out, program)] + tune,
+                       check=True)
+        network = os.path.join(out, program, os.path.basename(network))
+
+    print(f"{bcolors.OKCYAN}\n###### Final MoDART map from the refined network ######{bcolors.ENDC}", flush=True)
+    modart(network, args.output_path)
+    # The last pass wrote its own run_config.json there
+    ca.save_run_config(args)
+
+
 def main():
     import os
     import sys
@@ -216,20 +263,42 @@ def main():
     ca.add_batch_size(parser)
     parser.add_argument("--reconstruct_halves", action="store_true",
                         help="Also write the two unfiltered half maps (even/odd particles). They are always reconstructed: their FSC filters the final map.")
-    parser.add_argument("--motion_correction", type=str,
+    parser.add_argument("--motion_correction", type=str, nargs="+",
                         help=f"If provided, MoDART will perform a motion correction while reconstructing the volume to reduce motion blurring. Otherwise, a standard reconstruction is performed. "
                              f"{bcolors.WARNING} NOTE {bcolors.ENDC}: When providing this parameter, you MUST give the path to a trained {bcolors.UNDERLINE} HetSIREN (with transport of mass) "
-                             f"{bcolors.ENDC} or {bcolors.UNDERLINE} Zernike3Deep {bcolors.ENDC} neural network.")
+                             f"{bcolors.ENDC} or {bcolors.UNDERLINE} Zernike3Deep {bcolors.ENDC} neural network. Two paths (gold standard): the first network moves the even particles "
+                             f"(first half), the second the odd ones.")
+    parser.add_argument("--field_smoothing", required=False, type=float, default=0.0,
+                        help=f"Width (in {bcolors.UNDERLINE}Angstrom{bcolors.ENDC}) of a local-linear Gaussian smoothing of each particle's motion field: it removes non-rigid jitter "
+                             f"while keeping rigid (and affine) motions exact. 0 disables it (default).")
+    parser.add_argument("--remove_mean_field", action="store_true",
+                        help=f"Subtract each network's particle-average motion field, so the map is reconstructed in the frame of the network's reference. It removes a "
+                             f"static deformation the network may learn (e.g. to sharpen a blurred reference by moving its points), which otherwise distorts the map.")
     parser.add_argument("--iterations", required=False, type=int, default=10,
                         help=f"Conjugate gradient iterations, one pass over the particles each (default {bcolors.ITALIC}10{bcolors.ENDC}). More iterations recover finer detail and also fit more noise.")
     parser.add_argument("--regularization", required=False, type=float, default=0.0,
                         help=f"Tikhonov weight, relative to the mean diagonal of the normal equations (default {bcolors.ITALIC}0{bcolors.ENDC}).")
     parser.add_argument("--chunk_size", required=False, type=int, default=65536,
                         help=f"Voxels projected at a time (default {bcolors.ITALIC}65536{bcolors.ENDC}). Lower it if the GPU runs out of memory; it does not change the result.")
+    parser.add_argument("--refine_iterations", required=False, type=int, default=0,
+                        help=f"Iterative refinement with a single {bcolors.ITALIC}--motion_correction{bcolors.ENDC} network trained on all the particles: each iteration "
+                             f"reconstructs a map and fine tunes the network on it (the parameters of its training, with the map as {bcolors.ITALIC}--vol{bcolors.ENDC}, "
+                             f"{bcolors.ITALIC}--reload{bcolors.ENDC} and {bcolors.ITALIC}--refit_reference{bcolors.ENDC}), written to "
+                             f"{bcolors.UNDERLINE}<output_path>/iteration_N{bcolors.ENDC}. The final map, from the refined network, is written to "
+                             f"{bcolors.ITALIC}--output_path{bcolors.ENDC}. 0 disables it (default).")
+    parser.add_argument("--refine_learning_rate", required=False, type=float, default=None,
+                        help=f"Learning rate of the refinement fine tunes. By default, the one of the network's training.")
+    parser.add_argument("--refine_batch_size", required=False, type=ca.batch_size_or_auto, default=None,
+                        help=f"Batch size of the refinement fine tunes. By default, the one of the network's training.")
+    parser.add_argument("--refine_config", required=False, type=str, default=None,
+                        help=f"{bcolors.UNDERLINE}run_config.json{bcolors.ENDC} of the network's training, whose parameters the refinement fine tunes reuse. "
+                             f"By default, the one next to the network folder (written by the training in its {bcolors.ITALIC}--output_path{bcolors.ENDC}).")
     ca.add_output_path(parser)
     ca.add_ssd_scratch_folder(parser)
     ca.add_logging_args(parser, landscape=False, checkpoint=False)
     args = ca.parse_with_config(parser)
+    if args.refine_iterations > 0:
+        return refine(args)
 
     batch_size = 8 if args.batch_size == "auto" else int(args.batch_size)
     ctf_type = None if args.ctf_type in (None, "None") else args.ctf_type
@@ -291,20 +360,23 @@ def main():
     deapod = splat_deapodization(xsize)
 
     # Motion model: latents and refined poses once, the field from the latents in every pass
-    knn_idx = knn_w = None
+    knn_idx = knn_w = smoothers = None
     latents = rot_refine = shift_refine = None
     if args.motion_correction is not None:
-        model = NeuralNetworkCheckpointer.load(args.motion_correction)
-        model.eval()
-        graphdef_mc, state_mc = nnx.split(model)
-        model_xsize = model.xsize
-        del model
+        motion_models = []
+        for path in args.motion_correction:
+            model = NeuralNetworkCheckpointer.load(path)
+            model.eval()
+            motion_models.append(nnx.split(model))
+            model_xsize = model.xsize
+            del model
 
         print(f"{bcolors.OKCYAN}\n###### Encoding particles with the motion model... ######{bcolors.ENDC}")
         # Stored by label: the streamed loader does not return particles in metadata order
         for x, labels in tqdm(image_batches(), total=int(np.ceil(n_particles / batch_size)), file=sys.stdout,
                               ascii=" >=", colour="green", bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}"):
-            z, r, s = encode_particles(graphdef_mc, state_mc, jnp.asarray(x))
+            outs = [encode_particles(graphdef_mc, state_mc, jnp.asarray(x)) for graphdef_mc, state_mc in motion_models]
+            z, r, s = (np.stack([np.asarray(o[k]) for o in outs])[labels % len(outs), np.arange(len(labels))] for k in range(3))
             if latents is None:
                 latents = np.zeros((n_particles, z.shape[-1]), np.float32)
                 rot_refine = np.zeros((n_particles, 3, 3), np.float32)
@@ -312,11 +384,22 @@ def main():
             latents[labels], rot_refine[labels], shift_refine[labels] = np.asarray(z), np.asarray(r), np.asarray(s)
         shift_refine = shift_refine * (xsize / model_xsize)
 
-        _, source = decode_fields(graphdef_mc, state_mc, jnp.asarray(latents[:1]), xsize)
-        knn_idx, knn_w = symmetry_field_operator([source], np.asarray(vox[:n_vox]), sym)
+        # Two networks: one operator over both point sets, and each particle's field is zero on the other network's points
+        sources = [np.asarray(decode_fields(graphdef_mc, state_mc, jnp.asarray(latents[:1]), xsize)[1]) for graphdef_mc, state_mc in motion_models]
+        knn_idx, knn_w = symmetry_field_operator(sources, np.asarray(vox[:n_vox]), sym)
+        smoothers = [build_field_smoother(source, args.field_smoothing / args.sr) for source in sources] if args.field_smoothing > 0 else None
+        if args.remove_mean_field:
+            # Average field of each network over the particles it moves
+            mean_fields = []
+            for m, (graphdef_mc, state_mc) in enumerate(motion_models):
+                own = np.flatnonzero(np.arange(n_particles) % len(motion_models) == m)
+                total = sum(np.asarray(decode_fields(graphdef_mc, state_mc, jnp.asarray(latents[own[s:s + batch_size]]), xsize)[0]).sum(0)
+                            for s in range(0, own.shape[0], batch_size))
+                mean_fields.append(jnp.asarray(total / own.shape[0], jnp.float32))
+            print(f"{bcolors.OKGREEN}Mean field removed: {', '.join(f'{float(jnp.sqrt(jnp.mean(jnp.sum(mf ** 2, -1)))) * args.sr:.2f}' for mf in mean_fields)} A RMS{bcolors.ENDC}")
         knn_idx = jnp.pad(knn_idx, ((0, n_pad - n_vox), (0, 0)))
         knn_w = jnp.pad(knn_w, ((0, n_pad - n_vox), (0, 0)))
-        print(f"{bcolors.OKGREEN}Motion field carried from {source.shape[0]} model points to {n_vox} voxels; "
+        print(f"{bcolors.OKGREEN}Motion field carried from {' + '.join(str(source.shape[0]) for source in sources)} model points to {n_vox} voxels; "
               f"refined poses: {np.rad2deg(np.mean(np.arccos(np.clip((np.trace(rot_refine, axis1=1, axis2=2) - 1) / 2, -1, 1)))):.2f} deg mean, "
               f"{np.sqrt(np.mean(shift_refine ** 2)):.2f} px RMS shift{bcolors.ENDC}")
 
@@ -330,7 +413,12 @@ def main():
             rr, ss, fields = np.tile(np.eye(3, dtype=np.float32), (batch_size, 1, 1)), np.zeros((batch_size, 2), np.float32), None
         else:
             rr, ss = rot_refine[labels_p], shift_refine[labels_p]
-            fields, _ = decode_fields(graphdef_mc, state_mc, jnp.asarray(latents[labels_p]), xsize)
+            fields = [decode_fields(graphdef_mc, state_mc, jnp.asarray(latents[labels_p]), xsize)[0] for graphdef_mc, state_mc in motion_models]
+            if args.remove_mean_field:
+                fields = [f - mf[None] for f, mf in zip(fields, mean_fields)]
+            if smoothers is not None:
+                fields = [apply_knn_field(f, *smoother) for f, smoother in zip(fields, smoothers)]
+            fields = jnp.concatenate([f * jnp.asarray(labels_p % len(fields) == m, f.dtype)[:, None, None] for m, f in enumerate(fields)], axis=1)
             fields = symmetry_copy_fields(fields, sym)
         rotations, shifts, ctf = batch_geometry(md_columns, jnp.asarray(labels_p), jnp.asarray(rr), jnp.asarray(ss), sym,
                                                 args.sr, xsize, ctf_type)
