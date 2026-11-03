@@ -213,7 +213,8 @@ def refine(args):
                          f"training with --refine_config.")
     hax = [sys.executable, "-c", "from hax.cli import main; main()"]
     modart_config = os.path.join(args.output_path, "run_config.json")
-    tune = ((["--learning_rate", str(args.refine_learning_rate)] if args.refine_learning_rate is not None else []) +
+    tune = ((["--epochs", str(args.refine_epochs)] if args.refine_epochs is not None else []) +
+            (["--learning_rate", str(args.refine_learning_rate)] if args.refine_learning_rate is not None else []) +
             (["--batch_size", str(args.refine_batch_size)] if args.refine_batch_size is not None else []))
 
     def modart(net, out):
@@ -286,6 +287,8 @@ def main():
                              f"{bcolors.ITALIC}--reload{bcolors.ENDC} and {bcolors.ITALIC}--refit_reference{bcolors.ENDC}), written to "
                              f"{bcolors.UNDERLINE}<output_path>/iteration_N{bcolors.ENDC}. The final map, from the refined network, is written to "
                              f"{bcolors.ITALIC}--output_path{bcolors.ENDC}. 0 disables it (default).")
+    parser.add_argument("--refine_epochs", required=False, type=int, default=None,
+                        help=f"Epochs of each refinement fine tune. By default, the ones of the network's training.")
     parser.add_argument("--refine_learning_rate", required=False, type=float, default=None,
                         help=f"Learning rate of the refinement fine tunes. By default, the one of the network's training.")
     parser.add_argument("--refine_batch_size", required=False, type=ca.batch_size_or_auto, default=None,
