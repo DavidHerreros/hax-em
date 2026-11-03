@@ -32,6 +32,7 @@ cuda12 = ["jax[cuda12]==0.10.1", "cuml-cu12==25.12.*", "cupy-cuda12x>13.6.0,<=14
 # Future: add "jztree[cuda12]==1.1.0"
 cuda13 = ["jax[cuda13]==0.10.1", "cuml-cu13==25.12.*", "cupy-cuda13x>13.6.0,<=14.0.1"]
 # Future: add "jztree[cuda13]==1.1.0"
+gui = ["hax-em-gui>=0.1.0"]
 
 [tool.setuptools.packages.find]
 where = ["."]

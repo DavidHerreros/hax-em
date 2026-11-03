@@ -275,6 +275,9 @@ def main():
     parser.add_argument("--remove_mean_field", action="store_true",
                         help=f"Subtract each network's particle-average motion field, so the map is reconstructed in the frame of the network's reference. It removes a "
                              f"static deformation the network may learn (e.g. to sharpen a blurred reference by moving its points), which otherwise distorts the map.")
+    parser.add_argument("--poses_refined_by", required=False, type=str, default=None,
+                        help=f"Network whose pose refinement the input poses already include (e.g. the particles written by its {bcolors.ITALIC}predict{bcolors.ENDC}). "
+                             f"MoDART removes it before applying the refinement of {bcolors.ITALIC}--motion_correction{bcolors.ENDC}, so it is not applied twice.")
     parser.add_argument("--iterations", required=False, type=int, default=10,
                         help=f"Conjugate gradient iterations, one pass over the particles each (default {bcolors.ITALIC}10{bcolors.ENDC}). More iterations recover finer detail and also fit more noise.")
     parser.add_argument("--regularization", required=False, type=float, default=0.0,
@@ -373,6 +376,11 @@ def main():
             motion_models.append(nnx.split(model))
             model_xsize = model.xsize
             del model
+        if args.poses_refined_by is not None:
+            model = NeuralNetworkCheckpointer.load(args.poses_refined_by)
+            model.eval()
+            pose_model, pose_xsize = nnx.split(model), model.xsize
+            del model
 
         print(f"{bcolors.OKCYAN}\n###### Encoding particles with the motion model... ######{bcolors.ENDC}")
         # Stored by label: the streamed loader does not return particles in metadata order
@@ -380,6 +388,11 @@ def main():
                               ascii=" >=", colour="green", bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}"):
             outs = [encode_particles(graphdef_mc, state_mc, jnp.asarray(x)) for graphdef_mc, state_mc in motion_models]
             z, r, s = (np.stack([np.asarray(o[k]) for o in outs])[labels % len(outs), np.arange(len(labels))] for k in range(3))
+            if args.poses_refined_by is not None:
+                # Input poses are R_md R_0, s_md + s_0: undo the refinement of that network
+                _, r0, s0 = encode_particles(*pose_model, jnp.asarray(x))
+                r = np.einsum("bji,bjk->bik", np.asarray(r0), r)
+                s = s - np.asarray(s0) * (model_xsize / pose_xsize)
             if latents is None:
                 latents = np.zeros((n_particles, z.shape[-1]), np.float32)
                 rot_refine = np.zeros((n_particles, 3, 3), np.float32)
