@@ -7,6 +7,8 @@ import math
 import chex
 import dm_pix
 
+from .random_gen import random_rotation_matrices
+
 
 def gradient_loss(s, penalty='l2'):
     dy = jnp.abs(s[:, :, 1:, :, :] - s[:, :, :-1, :, :])
@@ -229,7 +231,7 @@ def correlation_coefficient_loss(x, y):
     y_square_sum = jnp.sum(ym * ym, axis=[1, 2])
     r_den = jnp.sqrt(x_square_sum * y_square_sum)
     r = r_num / (r_den + epsilon)
-    return jnp.mean(1. - r)
+    return jnp.mean(1. - r, axis=-1)
 
 def simae(
     a: chex.Array,
@@ -371,7 +373,7 @@ def triplet_loss(
 
     # Negative term ‑‑ push dissimilar samples apart (only if within margin)
     # loss_neg = jnp.square(jnp.clip(margin - dist_neg, a_min=0.0))
-    loss_neg = jnp.clip(margin - dist_neg, a_min=0.0)
+    loss_neg = jnp.clip(margin - dist_neg, min=0.0)
 
     per_pair = 0.5 * (loss_pos + loss_neg)   # 0.5 is conventional; optional
 
@@ -417,3 +419,417 @@ def sliced_wasserstein_loss(x: jnp.ndarray, x_true: jnp.ndarray, key: jax.random
     loss = jnp.mean((x_proj_sorted - x_true_proj_sorted) ** 2)
 
     return loss
+
+
+def build_fourier_rings(box_size: int) -> tuple[jax.Array, int]:
+    """Build a one-hot ring membership tensor for an rFFT.
+
+    Parameters
+    ----------
+    box_size
+        Image side length in pixels.
+
+    Returns
+    -------
+    rings
+        ``(H, W//2+1, n_rings)`` float32 tensor.  ``rings[y, x, r]`` is
+        1.0 if Fourier coefficient ``(y, x)`` belongs to ring ``r``,
+        else 0.0.
+    n_rings
+        Number of rings = ``box_size // 2 + 1`` (DC through Nyquist).
+
+    The radius assignment matches the original ``build_fourier_rings``
+    exactly: integer-rounded Euclidean radius from DC, with coefficients
+    beyond Nyquist excluded.
+    """
+    H = box_size
+    W = box_size // 2 + 1
+    nyquist = box_size // 2
+    n_rings = nyquist + 1
+
+    fx = np.arange(W)
+    fy = np.where(np.arange(H) <= H // 2,
+                  np.arange(H),
+                  np.arange(H) - H)
+
+    r = np.sqrt(fx[None, :] ** 2 + fy[:, None] ** 2)
+    ring_idx = np.round(r).astype(np.int32)
+
+    # Build one-hot: rings[y, x, r] = 1 iff ring_idx[y, x] == r AND r <= nyquist.
+    # Indices > nyquist are automatically excluded because we only allocate
+    # n_rings slots and use np.where to clip.
+    rings_np = np.zeros((H, W, n_rings), dtype=np.float32)
+    valid = ring_idx <= nyquist
+    yy, xx = np.where(valid)
+    rings_np[yy, xx, ring_idx[yy, xx]] = 1.0
+
+    return jnp.asarray(rings_np), n_rings
+
+
+def ring_correlation_sums(pred: jax.Array, obs: jax.Array, rings: jax.Array) -> jax.Array:
+    """Per-image ring sums (Re(pred·conj(obs)), |pred|^2, |obs|^2) as (B, 3, n_rings), to pool an FRC / residual spectrum over many images."""
+    pred_ft = jnp.fft.rfft2(pred, norm="ortho")
+    obs_ft = jnp.fft.rfft2(obs, norm="ortho")
+    stacked = jnp.stack([(pred_ft * jnp.conj(obs_ft)).real, jnp.abs(pred_ft) ** 2, jnp.abs(obs_ft) ** 2], axis=1)
+    return jnp.tensordot(stacked, rings, axes=[[2, 3], [0, 1]])
+
+
+def validated_ring_cutoff(sums_het, sums_consensus, n_images, rings, minpx, n_sigma=3.0, min_gain=0.05):
+    """Last ring where the heterogeneous prediction explains held-out images better than the consensus (never below ``minpx``)."""
+    residual = lambda s: s[2] - 2.0 * s[0] + s[1]
+    n_coeffs = n_images * np.asarray(rings.sum(axis=(0, 1)))
+    # Residual drop in units of its chance level (noise power / sqrt(coefficients))
+    gain = np.asarray(residual(sums_consensus) - residual(sums_het)) * np.sqrt(n_coeffs) / np.maximum(np.asarray(residual(sums_het)), 1e-12)
+    # Significant is not enough with many images: the drop must also be a fraction of what the consensus explains
+    explained_consensus = np.maximum(np.asarray(2.0 * sums_consensus[0] - sums_consensus[1]), 0.0)
+    ok = (gain >= n_sigma) & (np.asarray(residual(sums_consensus) - residual(sums_het)) >= min_gain * explained_consensus)
+    # Two consecutive rings must pass, so a lone chance ring cannot set the cutoff
+    passed = np.flatnonzero(ok[1:] & ok[:-1])
+    return max(minpx, int(passed[-1]) + 1) if passed.size else minpx
+
+
+def preprocess_particles(
+        images: jax.Array,
+        apply_mean_subtract: bool = True,
+) -> jax.Array:
+    """Convert real particle images to their rFFT for FRC computation."""
+    if apply_mean_subtract:
+        images = images - images.mean(axis=(-2, -1), keepdims=True)
+    return jnp.fft.rfft2(images, norm="ortho")
+
+
+def frc_loss(
+        pred_ft: jax.Array,
+        obs_ft: jax.Array,
+        rings: jax.Array,
+        band_mask: jax.Array,
+        eps: float = 1e-3,
+) -> jax.Array:
+    """Compute the negative mean FRC over the precomputed band.
+
+    Parameters
+    ----------
+    pred_ft, obs_ft
+        Complex (B, H, W//2+1) rFFT tensors.
+    rings
+        One-hot ring tensor (H, W//2+1, n_rings) from
+        ``build_fourier_rings``.
+    band_mask
+        Precomputed (n_rings,) float mask: 1.0 inside the band, 0.0
+        outside.  Built once at ``FRCLoss`` construction time.
+    eps
+        Relative floor on the per-ring power (as a fraction of the peak observed
+        ring power) used to stabilize the denominator. Prevents the FRC gradient
+        from exploding when a ring has near-zero predicted power, which would
+        otherwise drive downstream coordinates to NaN. Scale-invariant.
+
+    Returns
+    -------
+    scalar loss = -mean over batch of (mean over band of FRC).
+    """
+    # |pred_ft|^2 and |obs_ft|^2 via real/imag parts — direct, no complex mul.
+    pred_r, pred_i = pred_ft.real, pred_ft.imag
+    obs_r, obs_i = obs_ft.real, obs_ft.imag
+
+    pred_sq = pred_r * pred_r + pred_i * pred_i  # (B, H, W//2+1)
+    obs_sq = obs_r * obs_r + obs_i * obs_i  # (B, H, W//2+1)
+    cross = pred_r * obs_r + pred_i * obs_i  # (B, H, W//2+1) — Re(pred · conj(obs))
+
+    # Stack the three reductions, do one tensordot.
+    # stacked: (3, B, H, W//2+1) → contract axes (2,3) with rings axes (0,1).
+    stacked = jnp.stack([cross, pred_sq, obs_sq], axis=0)
+    # Result: (3, B, n_rings)
+    reduced = jnp.tensordot(stacked, rings, axes=[[2, 3], [0, 1]])
+
+    cross_r = reduced[0]
+    pred_sq_r = reduced[1]
+    obs_sq_r = reduced[2]
+
+    # Per-ring FRC
+    floor = eps * jnp.max(obs_sq_r, axis=-1, keepdims=True)
+    denom = jnp.sqrt(jnp.maximum(pred_sq_r, floor) * jnp.maximum(obs_sq_r, floor)) + 1e-12
+    frc = jnp.clip(cross_r / denom, -1.0, 1.0)  # (B, n_rings)
+
+    # Mean over band, then mean over batch
+    band_count = jnp.maximum(band_mask.sum(), 1.0)
+    per_batch_frc = (frc * band_mask[None, :]).sum(axis=1) / band_count
+    return -jnp.mean(per_batch_frc)
+
+
+class FRCLoss:
+    """FRC loss wrapper to simplify its call.
+
+    Internally, computed the optimal bands and stores them so they don't need to be passed during the call
+    """
+
+    def __init__(
+            self,
+            box_size: int,
+            apix: float,
+            min_resolution_A: float = 30.0,
+            max_resolution_A: float = 8.0,
+            apply_mean_subtract: bool = True,
+    ):
+        minpx, maxpx = recommended_band(
+            box_size=box_size, apix=apix,
+            min_resolution_A=min_resolution_A,
+            max_resolution_A=max_resolution_A,
+        )
+
+        self.box_size = box_size
+        self.minpx = minpx
+        self.maxpx = maxpx
+        self.apply_mean_subtract = apply_mean_subtract
+        self.rings, self.n_rings = build_fourier_rings(box_size)
+
+        assert 0 <= minpx < maxpx < self.n_rings, (
+            f"minpx={minpx}, maxpx={maxpx} must satisfy "
+            f"0 <= minpx < maxpx < {self.n_rings}"
+        )
+
+        # Precompute the band mask once — same closed-closed semantics
+        # [minpx, maxpx] as the original (using <= on both ends).
+        self.ring_ids = jnp.arange(self.n_rings)
+        band_mask_np = ((np.arange(self.n_rings) >= minpx) & (np.arange(self.n_rings) <= maxpx)).astype(np.float32)
+        self.band_mask = jnp.asarray(band_mask_np)
+
+    def _band_mask(self, freq_alpha):
+        """Band mask, optionally annealed.
+
+        ``freq_alpha`` in [0, 1] ramps the upper ring from ``minpx`` (coarse) up
+        to ``maxpx`` (full band). Accepts a traced scalar so this works inside
+        ``jit``.
+        """
+        return dynamic_band_mask(self.ring_ids, self.minpx, self.maxpx, freq_alpha)
+
+    def __call__(self, pred_real: jax.Array, obs_real: jax.Array, freq_alpha=1.0) -> jax.Array:
+        pred_ft = preprocess_particles(pred_real,
+                                       apply_mean_subtract=self.apply_mean_subtract)
+        obs_ft = preprocess_particles(obs_real,
+                                      apply_mean_subtract=self.apply_mean_subtract)
+        return self.call_complex(pred_ft, obs_ft, freq_alpha)
+
+    def call_complex(self, pred_ft: jax.Array, obs_ft: jax.Array, freq_alpha=1.0) -> jax.Array:
+        return frc_loss(pred_ft, obs_ft, self.rings, self._band_mask(freq_alpha))
+
+
+def recommended_band(
+        box_size: int,
+        apix: float,
+        min_resolution_A: float = 30.0,
+        max_resolution_A: float = 8.0,
+) -> tuple[int, int]:
+    minpx = int(round(box_size * apix / min_resolution_A))
+    maxpx = int(round(box_size * apix / max_resolution_A))
+    minpx = max(1, minpx)
+    maxpx = min(box_size // 2 - 1, maxpx)
+    assert minpx < maxpx, (
+        f"computed minpx={minpx} >= maxpx={maxpx}; check inputs"
+    )
+    return minpx, maxpx
+
+
+def dynamic_band_mask(ring_ids: jax.Array, minpx: int, maxpx: int, freq_alpha=1.0) -> jax.Array:
+    """Soft band mask with an annealed upper limit.
+
+    Rings below ``minpx`` are always excluded. The upper limit ramps linearly
+    from ``minpx`` (``freq_alpha=0``) up to ``maxpx`` (``freq_alpha=1``), with a
+    1-ring-wide soft edge so the newly admitted shell fades in smoothly instead
+    of switching on abruptly (which would otherwise cause a loss/grad jump).
+    ``freq_alpha`` may be a traced scalar, so this is ``jit``-safe.
+
+    With ``freq_alpha=1.0`` this reproduces the closed-closed ``[minpx, maxpx]``
+    hard mask exactly.
+    """
+    freq_alpha = jnp.clip(jnp.asarray(freq_alpha, dtype=jnp.float32), 0.0, 1.0)
+    cur_max = minpx + freq_alpha * (maxpx - minpx)
+    lower = (ring_ids >= minpx).astype(jnp.float32)
+    # Soft upper edge: 1 well inside the band, linearly to 0 one ring past cur_max.
+    upper = jnp.clip(cur_max - ring_ids.astype(jnp.float32) + 1.0, 0.0, 1.0)
+    return lower * upper
+
+
+def chamfer_distance(x, y):
+    # x: (N, D), y: (M, D) — N and M can differ
+    diff = x[:, None, :] - y[None, :, :]      # (N, M, D)
+    d2 = jnp.sum(diff ** 2, axis=-1)          # (N, M) squared distances
+    x_to_y = jnp.min(d2, axis=1)              # (N,) nearest y for each x
+    y_to_x = jnp.min(d2, axis=0)              # (M,) nearest x for each y
+    return jnp.mean(x_to_y) + jnp.mean(y_to_x)
+
+
+def soft_spherical_occupancy(directions, bin_directions, kappa):
+    """Soft histogram of unit directions over equal-area spherical bins.
+
+    Args:
+        directions: (N, 3) unit vectors.
+        bin_directions: (K, 3) unit vectors marking the bin centers.
+        kappa: von Mises-Fisher-like concentration of the soft assignment.
+
+    Returns:
+        (K,) mean occupancy, summing to one.
+    """
+    logits = jnp.asarray(kappa, dtype=directions.dtype) * jnp.einsum(
+        "nd,kd->nk", directions, bin_directions)
+    return jnp.mean(jax.nn.softmax(logits, axis=-1), axis=0)
+
+
+def candidate_coverage_loss(directions, bin_directions, memory_bank, bank_count, key,
+                            kappa=32.0, bank_samples=1024, bank_mix=0.5, eps=1e-8):
+    """Computes uniformity loss based on the relative occupancy of a set of random (uniform) directions over a sphere
+    partition into a set of equal area patches defined by bin_directions. The memory bank represent the set of
+    directions to be compared to the uniform  distribution. Basically, this loss promotes that memory bank directions
+    uniformly occupy the whole projection sphere.
+    """
+    rotation_key, sample_key = jax.random.split(key)
+    n_bins = bin_directions.shape[0]
+    rotation = random_rotation_matrices(1, rotation_key)[0].astype(directions.dtype)
+    bins = jnp.einsum("ij,nj->ni", rotation, bin_directions)
+    current_occupancy = soft_spherical_occupancy(directions, bins, kappa)
+
+    occupancy = current_occupancy
+    if bank_samples > 0:
+        valid_count = jnp.maximum(jnp.asarray(bank_count, dtype=jnp.int32), 1)
+        indices = jax.random.randint(
+            sample_key, (bank_samples,), minval=0, maxval=valid_count)
+        historical = jax.lax.stop_gradient(memory_bank[indices])
+        historical_occupancy = soft_spherical_occupancy(historical, bins, kappa)
+        effective_mix = jnp.asarray(bank_mix, directions.dtype) * (
+            jnp.asarray(bank_count) > 0).astype(directions.dtype)
+        occupancy = ((1.0 - effective_mix) * current_occupancy
+                     + effective_mix * historical_occupancy)
+
+    occupancy = occupancy / jnp.maximum(jnp.sum(occupancy), eps)
+    return jnp.sum(occupancy * jnp.log(jnp.maximum(occupancy * n_bins, eps)))
+
+
+def latent_variance_covariance_loss(latent, minimum_std, bank=None, bank_count=None):
+    """
+    Computes a set of losses at latent level to avoid the latent space from collapsing towards the consensus
+    structure (i.e. promotes that the heterogeneous latent space represents "something" always.
+
+    Two losses are computed:
+
+    - Variance loss: For each latent dimension, promotes that the variance of each dimensional component is not driven
+    towards zero. This prevents that any latent dimensions becomes "dead". The variance is computed at the batch size
+    level
+    - Covariance loss: Computes the off-diagonal elements of the covariance matrix defined by the batch of latent
+    vectors and forces them to be driven towards zero. Thanks to this, latent dimensions are driven to be decorrelated,
+    allowing them to spread and represent independent structural information (i.e. no dimensions carries information
+    that is just a copy of another dimension)
+
+    When a bank is given, it uses its samples to improve the statistical significance of the losses (otherwise, they
+    restricted to the number of elements in the batch. Since this might be small, the losses might become extremely noisy)
+    """
+    latent_f32 = latent.astype(jnp.float32)
+    if bank is None:
+        total = jnp.asarray(latent.shape[0], dtype=jnp.float32)
+        mean = jnp.mean(latent_f32, axis=0)
+        centered = latent_f32 - mean
+        covariance = centered.T @ centered / jnp.maximum(total - 1.0, 1.0)
+        variance = jnp.mean(jnp.square(centered), axis=0)
+    else:
+        bank_f32 = jax.lax.stop_gradient(bank.astype(jnp.float32))
+        valid = (jnp.arange(bank.shape[0]) < bank_count).astype(jnp.float32)[:, None]
+        total = latent.shape[0] + jnp.sum(valid)
+        mean = (jnp.sum(latent_f32, axis=0) + jnp.sum(bank_f32 * valid, axis=0)) / total
+        centered = latent_f32 - mean
+        bank_centered = (bank_f32 - mean) * valid
+        covariance = (centered.T @ centered + bank_centered.T @ bank_centered) / jnp.maximum(total - 1.0, 1.0)
+        variance = (jnp.sum(jnp.square(centered), axis=0)
+                    + jnp.sum(jnp.square(bank_centered), axis=0)) / total
+
+    std = jnp.sqrt(variance + 1e-6)
+    variance_loss = jnp.mean(jnp.square(jax.nn.relu(minimum_std - std)))
+    off_diagonal = covariance - jnp.diag(jnp.diag(covariance))
+    covariance_loss = jnp.mean(jnp.square(off_diagonal))
+    return variance_loss, covariance_loss, jnp.mean(std)
+
+
+def geometry_prior_losses(coords, values, neighbor_indices, sigma):
+    """Based on a set of precomputed nearest neighbor indices, this function computes two losses from coords and values:
+
+     - Spacing loss: Penalizes the nearest neighbors of a point that is farther than 2*sigma distance. This promotes
+     that Gaussians are render as a continuous mass. Also, it penalizes neighbors being at a distance smaller than
+     0.7*sigma, as they would be rendered as a single clump of mass (i.e. Gaussian splatting losses expressivity)
+
+     - Smoothness loss: Makes the amplitude of the closes neighbors to a point close to a given point. Thus, it imposes
+     smoothness at the level of amplitudes between neighbors
+     """
+    positions = coords[0]
+    amplitudes = values[0]
+    neighbor_positions = positions[neighbor_indices]  # (N, k, 3)
+    distances = jnp.sqrt(jnp.sum(jnp.square(
+        positions[:, None, :] - neighbor_positions), axis=-1) + 1e-12)
+    sigma = jax.lax.stop_gradient(jnp.mean(sigma))
+
+    edge_weights = jnp.sqrt(amplitudes[:, None] * amplitudes[neighbor_indices] + 1e-12)
+    edge_weights = jax.lax.stop_gradient(edge_weights / (jnp.mean(edge_weights) + 1e-12))
+    gap = jax.nn.relu(distances[:, 0] - 2.0 * sigma) / sigma
+    crowd = jax.nn.relu(0.7 * sigma - distances) / sigma
+    spacing_loss = (jnp.mean(edge_weights[:, 0] * jnp.square(gap))
+                    + jnp.mean(edge_weights * jnp.square(crowd)))
+
+    amplitude_scale = jax.lax.stop_gradient(jnp.mean(amplitudes) + 1e-12)
+    smoothness_loss = jnp.mean(edge_weights * jnp.square(
+        (amplitudes[:, None] - amplitudes[neighbor_indices]) / amplitude_scale))
+    return spacing_loss, smoothness_loss
+
+
+def support_loss(coords, values, center, radius, sigma):
+    """Penalizes coordinates moving away from a sphere containing the Gaussians covering the signal"""
+    positions = coords[0]
+    amplitudes = values[0]
+    distances = jnp.sqrt(jnp.sum(jnp.square(positions - center[None, :]), axis=-1) + 1e-12)
+    sigma = jax.lax.stop_gradient(jnp.mean(sigma))
+    outside = jax.nn.relu(distances - radius) / sigma
+    total_mass = jax.lax.stop_gradient(jnp.sum(amplitudes) + 1e-12)
+    return jnp.sum(amplitudes * outside) / total_mass
+
+
+def whitened_reconstruction_loss(predicted, target, whitening_filter):
+    """Noise-whitened MSE so every frequency shell carries comparable gradient"""
+    predicted_white = jnp.real(jnp.fft.ifft2(jnp.fft.fft2(predicted) * whitening_filter))
+    target_white = jnp.real(jnp.fft.ifft2(jnp.fft.fft2(target) * whitening_filter))
+    scale = jnp.sqrt(jnp.mean(jnp.square(target_white), axis=(-2, -1), keepdims=True)) + 1e-8
+    return jnp.mean(jnp.square((predicted_white - target_white) / scale), axis=(-2, -1))
+
+
+def match_per_image_contrast(pred, target, mask=None, mode="relative"):
+    if mode == "off":
+        return pred
+
+    p = jax.lax.stop_gradient(pred)
+    t = jax.lax.stop_gradient(target)
+    axes = (-2, -1)
+
+    if mask is None:
+        sum_pp = jnp.sum(p * p, axis=axes, keepdims=True)
+        sum_pt = jnp.sum(p * t, axis=axes, keepdims=True)
+    else:
+        w = jnp.broadcast_to(mask, p.shape)
+        sum_pp = jnp.sum(w * p * p, axis=axes, keepdims=True)
+        sum_pt = jnp.sum(w * p * t, axis=axes, keepdims=True)
+
+    # A flat or empty projection carries no scale information; leave those images alone.
+    ok = sum_pp > 1e-12 * jnp.mean(sum_pp)
+    a = jnp.where(ok, sum_pt / jnp.where(ok, sum_pp, 1.0), 1.0)
+
+    if mode == "relative":
+        a = a / jnp.maximum(jnp.mean(a), 1e-6)
+
+    return a * pred
+
+
+def explained_variance(pred, target, relative=False):
+    """Per-image variance the best-scaled prediction explains (detached): what the signal is worth in MSE units; relative=True gives R^2."""
+    p = jax.lax.stop_gradient(pred)
+    t = jax.lax.stop_gradient(target)
+    axes = (-2, -1)
+    p = p - jnp.mean(p, axis=axes, keepdims=True)
+    t = t - jnp.mean(t, axis=axes, keepdims=True)
+    var_t = jnp.mean(t * t, axis=axes)
+    explained = jnp.square(jnp.mean(p * t, axis=axes)) / (jnp.mean(p * p, axis=axes) + 1e-12)
+    # Noise alone correlates by chance: remove that bias
+    explained = jnp.maximum(explained - var_t / (p.shape[-2] * p.shape[-1]), 0.0)
+    return explained / (var_t + 1e-12) if relative else explained

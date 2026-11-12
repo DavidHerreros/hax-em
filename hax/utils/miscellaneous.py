@@ -13,8 +13,8 @@ from functools import partial
 import numpy as np
 from sklearn.neighbors import KDTree
 
-from hax.generators import NumpyGenerator
 from hax.utils.loggers import bcolors
+from hax.utils.fourier_filters import low_pass_3d_analytic
 
 
 # def estimate_noise_stddev(images, patch_size):
@@ -137,6 +137,11 @@ def estimate_noise_stddev(images, radius_fraction=0.5):
     return means, stds
 
 def filter_latent_space(space, thr=1.0, k=10, return_ids=False, batch_size=64):
+    # Imported lazily to avoid a circular import: hax.generators imports
+    # hax.utils.loggers, so hax.utils must not import hax.generators at module
+    # load time (the cycle is otherwise only masked by import order).
+    from hax.generators import NumpyGenerator
+
     # Prepare data loader
     data_loader = NumpyGenerator(space).return_grain_dataset(batch_size=batch_size, preShuffle=False, shuffle=False,
                                                              num_epochs=1, num_workers=0)
@@ -340,6 +345,112 @@ def estimate_envelopes(
     # vectorize over the batch
     vmapped = jax.jit(jax.vmap(per_image, in_axes=(0,0)))
     return vmapped(imgs, ctf)                     # [B, P, Q, 1]
+
+
+def sharpen_gaussian_envelope(volume, sigma, reg=0.02):
+    """
+    Helper function only used when generating the resulting consensus/heterogeneity maps. Since generated volumes
+    low-passed by default with a known sigma (needed by Gaussian-splatting), we can treat this blurring as a B-factor.
+
+    Since learned Gaussian positions may carry additional information compared to the blurred map, this function
+    computes analytically the previous envelope to sharpen the map
+    """
+    shape = volume.shape
+    fz = jnp.fft.fftfreq(shape[0])
+    fy = jnp.fft.fftfreq(shape[1])
+    fx = jnp.fft.rfftfreq(shape[2])
+    f_sq = (fz[:, None, None] ** 2 + fy[None, :, None] ** 2
+            + fx[None, None, :] ** 2)
+    sigma_sq = jnp.square(jnp.asarray(sigma, jnp.float32)).reshape(())
+    envelope = jnp.exp(-2.0 * jnp.pi ** 2 * sigma_sq * f_sq)
+    gain = (1.0 + reg) * envelope / (jnp.square(envelope) + reg)
+    return jnp.fft.irfftn(jnp.fft.rfftn(volume) * gain, s=shape)
+
+
+def estimate_particle_extent(images, threshold=0.1, margin=1.15):
+    """Estimate the particle radius in pixels from raw images alone"""
+    x = np.asarray(images, np.float32)
+    if x.ndim == 4:
+        x = x[..., 0]
+    x = (x - x.mean(axis=(1, 2), keepdims=True)) / (x.std(axis=(1, 2), keepdims=True) + 1e-8)
+    variance = x.var(axis=0)
+
+    h, w = variance.shape
+    yy, xx = np.indices((h, w))
+    r = np.sqrt((yy - h // 2) ** 2 + (xx - w // 2) ** 2).astype(np.int32)
+    n_shells = int(r.max()) + 1
+    profile = np.bincount(r.ravel(), weights=variance.ravel(), minlength=n_shells)
+    counts = np.bincount(r.ravel(), minlength=n_shells)
+    profile = profile / np.maximum(counts, 1)
+
+    max_radius = min(h, w) // 2
+    if max_radius < 8:
+        return None
+    profile = profile[:max_radius]
+    outer = profile[int(0.85 * max_radius):]
+    noise_floor = np.median(outer)
+    excess = profile - noise_floor
+    # Refuse rather than hallucinate: the variance peak must stand well clear
+    # of the outer-shell scatter (robust MAD scale) to count as a particle.
+    noise_scale = 1.4826 * np.median(np.abs(outer - noise_floor))
+    peak = excess.max()
+    if peak <= 5.0 * max(noise_scale, 1e-12):
+        return None
+    above = np.flatnonzero(excess > threshold * peak)
+    if above.size == 0:
+        return None
+    if above.max() >= int(0.85 * max_radius):
+        # The variance excess reaches into the outer shells the noise floor
+        # was measured from: there is no clean particle boundary inside the
+        # box, so any radius here would be a whole-box hallucination.
+        return None
+    radius = float(above.max()) * margin
+    return float(np.clip(radius, 4.0, 0.95 * max_radius))
+
+
+def equalize_masses(masses, gamma, dust_fraction=0.02):
+    """Gamma-compress Gaussian masses for the tracing map"""
+    masses = np.asarray(masses, np.float32)
+    positive = masses[masses > 0.0]
+    if not positive.size:
+        return None
+    mean_mass = float(positive.mean())
+    return np.where(masses > dust_fraction * mean_mass,
+                    mean_mass * (masses / mean_mass) ** gamma,
+                    0.0).astype(np.float32)
+
+
+def splat_cloud_volumes(coords, values, volume_size, filter=True, sigma=1.0):
+    grids = jnp.zeros((values.shape[0], volume_size, volume_size, volume_size))
+
+    bposf = jnp.floor(coords)
+    bposi = bposf.astype(jnp.int32)
+    bposf = coords - bposf
+
+    bamp0 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+    bamp1 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+    bamp2 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+    bamp3 = values * (1.0 - bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
+    bamp4 = values * (1.0 - bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
+    bamp5 = values * (bposf[:, :, 0]) * (1.0 - bposf[:, :, 1]) * (bposf[:, :, 2])
+    bamp6 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (1.0 - bposf[:, :, 2])
+    bamp7 = values * (bposf[:, :, 0]) * (bposf[:, :, 1]) * (bposf[:, :, 2])
+
+    bamp = jnp.concat([bamp0, bamp1, bamp2, bamp3, bamp4, bamp5, bamp6, bamp7], axis=1)
+    bposi = jnp.concat([bposi, bposi + jnp.array((1, 0, 0)), bposi + jnp.array((0, 1, 0)), bposi + jnp.array((0, 0, 1)),
+                        bposi + jnp.array((0, 1, 1)), bposi + jnp.array((1, 0, 1)), bposi + jnp.array((1, 1, 0)), bposi + jnp.array((1, 1, 1))], axis=1)
+
+    def scatter_volume(vol, bpos_i, bamp_i):
+        return vol.at[bpos_i[..., 2], bpos_i[..., 1], bpos_i[..., 0]].add(bamp_i)
+
+    grids = jax.vmap(scatter_volume, in_axes=(0, 0, 0))(grids, bposi, bamp)
+
+    # Filter volume
+    if filter:
+        grids = jax.vmap(low_pass_3d_analytic, in_axes=(0, None))(grids, sigma)
+
+    return grids
+
 
 @jax.jit
 def sparse_finite_3D_differences(values, inds, vol_dim):
@@ -622,3 +733,53 @@ def positional_encoding(coords: jax.Array, enc_dim: int, DD: int) -> jax.Array:
     # Flatten the last two dimensions: shape (n, 3 * enc_dim * 2)
     new_shape = x.shape[:-2] + (-1,)
     return jnp.reshape(x, new_shape)
+
+
+def soft_circular_mask(size, radius=0.5, edge_px=3.0, dtype=jnp.float32):
+    """Inscribed circular mask with a raised-cosine edge"""
+    axis = jnp.arange(size, dtype=jnp.float32) - 0.5 * (size - 1)
+    yy, xx = jnp.meshgrid(axis, axis, indexing="ij")
+    r = jnp.sqrt(xx * xx + yy * yy)
+    r_out = radius * size
+    r_in = r_out - edge_px
+    edge = 0.5 * (1.0 + jnp.cos(jnp.pi * (r - r_in) / jnp.maximum(r_out - r_in, 1e-6)))
+    return jnp.where(r <= r_in, 1.0, jnp.where(r >= r_out, 0.0, edge)).astype(dtype)
+
+def _small_saveable(prim, *avals, **params):
+    """Checkpoint policy: keep tiny intermediates (free) instead of rematerializing them, which can leave XLA degenerate fusions."""
+    return prim.name not in ("broadcast_in_dim", "iota", "fft", "convert_element_type") and all(
+        getattr(a, "size", 0) <= 4096 and not jnp.issubdtype(getattr(a, "dtype", jnp.float32), jnp.complexfloating) for a in avals)
+
+
+def tilt_mask(labels):
+    """Tomo stacks pad missing tilts with label -1: returns (mask, labels) with padded rows remapped to the particle's first tilt."""
+    if labels.ndim < 2:
+        return None, labels
+    mask = labels >= 0
+    return mask, jnp.where(mask, labels, labels[:, :1])
+
+
+def tilt_mean(fn, x, *args, mask=None):
+    """Mean of fn over the tilt axis of tomo stacks (B, T, ...) via a checkpointed scan, so T is never materialized; SPA calls fn once."""
+    if x.ndim != 5:
+        return fn(x, *args)
+    args = (x,) + args
+    w = jnp.ones(x.shape[:2], jnp.float32) if mask is None else mask.astype(jnp.float32)  # (B, T) tilt weights
+    bcast = lambda v, o: v.mean() if o.ndim == 0 else v.reshape((-1,) + (1,) * (o.ndim - 1))
+    shapes = jax.eval_shape(fn, *[a[:, 0] for a in args])
+    zeros = jax.tree.map(lambda s: jnp.zeros(s.shape, jnp.result_type(s.dtype, jnp.float32)), shapes)  # fp32 accumulator
+    body = jax.checkpoint(lambda acc, t: (jax.tree.map(lambda a, o: a + o * bcast(w[:, t], o), acc, fn(*[a[:, t] for a in args])), None),
+                          policy=_small_saveable)
+    total, _ = jax.lax.scan(body, zeros, jnp.arange(x.shape[1]))
+    return jax.tree.map(lambda s, t: (t / bcast(w.sum(1), t)).astype(s.dtype), shapes, total)
+
+
+def per_particle(a, like):
+    """Insert singleton tilt axes so a per-particle ``(B, ...)`` array broadcasts against a per-tilt ``(B, T, ...)`` one."""
+    return jnp.expand_dims(a, tuple(range(1, 1 + like.ndim - a.ndim)))
+
+
+def nested_dropout_mask(key, shape, group, p):
+    """Keeps a geometric-length prefix of every group of latent dims (Rippel et al. 2014)"""
+    keep = jax.random.geometric(key, p, shape[:-1] + (shape[-1] // group,))
+    return (jnp.arange(shape[-1]) % group < jnp.repeat(keep, group, axis=-1)).astype(jnp.float32)

@@ -11,3 +11,7 @@ toolkit/*.egg-info
 
 # Build files
 build
+
+# Claude
+CLAUDE.md
+PLAN*.md

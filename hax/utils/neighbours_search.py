@@ -1,0 +1,109 @@
+import jax
+from jax import numpy as jnp
+from functools import partial
+
+
+MORTON_BITS = 10
+
+
+def _spread_bits(v):
+    # Insert two zero bits between the bits of a 10-bit integer
+    v = (v | (v << 16)) & 0x030000FF
+    v = (v | (v << 8)) & 0x0300F00F
+    v = (v | (v << 4)) & 0x030C30C3
+    v = (v | (v << 2)) & 0x09249249
+    return v
+
+
+def morton_codes(points, shift=0.0):
+    """Z-order codes of points (N, 3), after normalizing them to the unit cube and shifting by a cell fraction"""
+    lower = jnp.min(points, axis=0)
+    extent = jnp.maximum(jnp.max(points, axis=0) - lower, 1e-6)
+    cells = 2 ** MORTON_BITS
+    grid = (points - lower) / extent * (cells - 1) + shift
+    grid = jnp.clip(jnp.floor(grid), 0, cells - 1).astype(jnp.uint32)
+    return (_spread_bits(grid[:, 0]) | (_spread_bits(grid[:, 1]) << 1)
+            | (_spread_bits(grid[:, 2]) << 2))
+
+
+def _window_candidates(points, valid, k, window, shift):
+    n = points.shape[0]
+    order = jnp.argsort(morton_codes(points, shift))
+    sorted_points = points[order]
+    offsets = jnp.concatenate([jnp.arange(-window, 0), jnp.arange(1, window + 1)])
+    candidates = jnp.clip(jnp.arange(n)[:, None] + offsets[None, :], 0, n - 1)
+    distances = jnp.sum(jnp.square(sorted_points[:, None, :] - sorted_points[candidates]), axis=-1)
+    original = order[candidates]
+    reject = (original == order[:, None]) | ~valid[original]
+    distances = jnp.where(reject, jnp.inf, distances)
+    best, idx = jax.lax.top_k(-distances, k)
+    # Back to the original order
+    unsorted = jnp.zeros((n, k), jnp.int32).at[order].set(jnp.take_along_axis(original, idx, axis=1))
+    unsorted_dist = jnp.zeros((n, k), distances.dtype).at[order].set(-best)
+    return unsorted, unsorted_dist
+
+
+@partial(jax.jit, static_argnames=("k", "window", "n_shifts"))
+def approximate_knn(points, values=None, k=6, window=32, n_shifts=3):
+    """Approximate k nearest neighbours of a point cloud (N, 3) via Morton-sorted sliding windows with shifted
+    sorting (shifts of 1.5 mean point spacings). Points with values <= 0 are never returned as neighbours.
+    Returns indices (N, k)."""
+    points = jax.lax.stop_gradient(points)
+    valid = (jnp.ones(points.shape[0], bool) if values is None
+             else jax.lax.stop_gradient(values) > 0.0)
+    spacing_cells = 2 ** MORTON_BITS / points.shape[0] ** (1.0 / 3.0)
+    indices, distances = [], []
+    for s in range(n_shifts):
+        idx, dist = _window_candidates(points, valid, k, window, 1.5 * s * spacing_cells)
+        indices.append(idx)
+        distances.append(dist)
+    if n_shifts == 1:
+        return indices[0]
+    indices = jnp.concatenate(indices, axis=1)
+    distances = jnp.concatenate(distances, axis=1)
+    # Drop duplicates found by several shifts, then keep the k closest
+    duplicate = (indices[:, :, None] == indices[:, None, :]) & (jnp.arange(indices.shape[1])[None, None, :] < jnp.arange(indices.shape[1])[None, :, None])
+    distances = jnp.where(jnp.any(duplicate, axis=-1), jnp.inf, distances)
+    _, best = jax.lax.top_k(-distances, k)
+    return jnp.take_along_axis(indices, best, axis=1)
+
+
+def build_knn_field_operator(source_coords, target_coords, k=6, h=None):
+    """Normalised Gaussian k-NN weights carrying a field from source points to target points"""
+    import numpy as np
+    from scipy.spatial import cKDTree
+
+    k = int(min(k, source_coords.shape[0]))
+    dist, idx = cKDTree(np.asarray(source_coords, np.float32)).query(np.asarray(target_coords, np.float32), k=k, workers=-1)
+    dist, idx = dist.reshape(dist.shape[0], k), idx.reshape(idx.shape[0], k)
+    h = max(float(np.median(dist[:, 0])) if h is None else float(h), 1e-3)
+    w = np.exp(-0.5 * (dist / h) ** 2)
+    w = w / np.maximum(w.sum(axis=1, keepdims=True), 1e-12)
+    return jnp.asarray(idx, jnp.int32), jnp.asarray(w, jnp.float32)
+
+
+def build_field_smoother(points, sigma, max_neighbours=512):
+    """Local-linear Gaussian smoothing of a field on points, as k-NN weights: affine (hence rigid) fields pass unchanged"""
+    import numpy as np
+    from scipy.spatial import cKDTree
+
+    points = np.asarray(points, np.float64)
+    tree = cKDTree(points)
+    k = int(min(max_neighbours, points.shape[0], tree.query_ball_point(points, 2.5 * sigma, return_length=True).max()))
+    dist, idx = tree.query(points, k=k, distance_upper_bound=2.5 * sigma, workers=-1)
+    dist, idx = dist.reshape(-1, k), idx.reshape(-1, k)
+    missing = idx >= points.shape[0]
+    idx = np.where(missing, np.arange(points.shape[0])[:, None], idx)
+    w = np.where(missing, 0.0, np.exp(-0.5 * (dist / sigma) ** 2))
+
+    # Weighted affine fit around each point, evaluated at the point (tiny ridge on the slopes for sparse neighbourhoods)
+    x = np.concatenate([np.ones(idx.shape + (1,)), (points[idx] - points[:, None]) / sigma], axis=-1)
+    gram = np.einsum("nk,nki,nkj->nij", w, x, x) + np.diag([0.0, 1e-6, 1e-6, 1e-6])
+    a = np.linalg.solve(gram, np.broadcast_to(np.eye(4)[0], (points.shape[0], 4))[..., None])[..., 0]
+    return jnp.asarray(idx, jnp.int32), jnp.asarray(w * np.einsum("nj,nkj->nk", a, x), jnp.float32)
+
+
+@jax.jit
+def apply_knn_field(field_source, idx, weights):
+    """(B, S, C) source field to (B, T, C) target field"""
+    return jnp.einsum("tk,btkc->btc", weights, field_source[:, idx, :])
