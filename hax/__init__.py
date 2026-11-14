@@ -25,7 +25,7 @@ whatever they need.
 
 import importlib
 
-__version__ = '1.1.0'
+__version__ = '1.1.1'
 
 # Subpackages previously flattened into the ``hax`` namespace via
 # ``from .X import *``. Order is significant: it mirrors the original sequence
