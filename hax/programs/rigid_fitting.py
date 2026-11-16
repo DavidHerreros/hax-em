@@ -780,8 +780,16 @@ def main():
     downfactor_bio = 2.0 * (topo.mass_kda / 50.0) ** (1 / 3)
     downfactor_comp = (np.prod(vol_orig.shape) / 4_000_000.0) ** (1 / 3)
     downfactor = float(np.max([downfactor_bio / apix, downfactor_comp]))
-    downfactor = float(np.clip(downfactor, 2.0, 4.0))
-    print(f"[INFO] Auto-Configured Downsample Factor: {downfactor:.2f}")
+
+    rg = float(jnp.sqrt(jnp.sum(topo.atom_weights[:, None] * topo.all_coords ** 2) / jnp.sum(topo.atom_weights)))
+    downfactor_min = max(1.0, min(2.0, rg / (8.0 * apix)))
+    downfactor = float(np.clip(downfactor, downfactor_min, 4.0))
+    print(f"[INFO] Auto-Configured Downsample Factor: {downfactor:.2f} (lower limit {downfactor_min:.2f}, Rg {rg:.1f} A)")
+
+    batch_size = args.batch_size
+    if downfactor < 2.0:
+        batch_size = max(1, int(args.batch_size * (downfactor / 2.0) ** 3))
+        print(f"[INFO] Finer search grid for a small piece: rotation batch {args.batch_size} -> {batch_size}")
 
     engine = RigidEngine(topo, vol_orig, apix, args.out_dir)
     if not args.is_aligned:
@@ -789,7 +797,7 @@ def main():
         vol_s_flip = jnp.flip(vol_s_orig, axis=0) if args.check_flip else None
 
         engine.global_grid_search(vol_s_orig, vol_s_flip, topk_nms=args.topk_nms, n_rots=args.n_rots,
-                                  batch_size=args.batch_size, check_flip=args.check_flip)
+                                  batch_size=batch_size, check_flip=args.check_flip)
         engine.save("final_rigid", is_aligned=args.is_aligned)
 
         engine.torque_polishing(vol_s_orig, vol_s_flip, n_polish=args.n_polish, polish_iters=args.polish_iters)
